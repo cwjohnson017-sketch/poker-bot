@@ -115,6 +115,27 @@ def test_incomplete_allin_raise():
     assert out["payoffs"] == [-450, 450]
 
 
+def test_short_blind_edge_cases():
+    """Blind edge cases follow the Rust engine's rule choices."""
+    d = deck("AsAh", "7c2d", "KdQc3h4s9c")
+    # big blind posts 60 all-in: the small blind still faces the full big blind
+    e = VecNLHE(1, GameConfig(stacks=[20000, 60]), "cpu", seed=0)
+    out = e.replay_check(d, [C], button=0)
+    first = out["legal"][0]
+    assert first["current_player"] == 0 and first["can_fold"]
+    assert (first["call_amount"], first["min_raise_to"], first["max_raise_to"]) == (50, 0, 0)
+    assert out["terminal"] and out["street"] == 3 and out["payoffs"] == [60, -60]
+    assert e.replay_check(d, [F], button=0)["payoffs"] == [-50, 50]
+    # small blind all-in from posting, big blind faces no bet: ends at the deal
+    e = VecNLHE(1, GameConfig(stacks=[40, 20000]), "cpu", seed=0)
+    out = e.replay_check(d, [], button=0)
+    assert out["terminal"] and out["street"] == 3 and out["payoffs"] == [40, -40]
+    # small blind completes all-in for less than the big blind: no big blind option
+    e = VecNLHE(1, GameConfig(stacks=[80, 20000]), "cpu", seed=0)
+    out = e.replay_check(d, [C], button=0)
+    assert out["terminal"] and out["street"] == 3 and out["payoffs"] == [80, -80]
+
+
 def test_illegal_replays_raise(env):
     d = deck("AsAh", "7c2d")
     with pytest.raises(ValueError):

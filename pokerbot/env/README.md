@@ -51,27 +51,51 @@ live on that device. There are no `.cuda()` calls and no CPU-only ops in
 
 ## Rules and chip accounting
 
-These follow `docs/INTERFACES.md` and match the independent scalar oracle in
-`tests/env/scalar_rules.py` on thousands of random hands:
+The Rust engine (`poker_engine`, rule choices in `engine/README.md`) is the
+source of truth. `tests/test_cross_env_engine.py` plays a few thousand random
+hands on it (deep, unequal, short and random stacks, antes, blinds that put
+players all-in, `sb == bb`, `sb == 0`) and checks that `replay_check` and a
+batched `step_concrete` give the same legal info before every action
+(current player, street, pot, can_fold, can_check, call_amount,
+min_raise_to, max_raise_to), payoffs, board and terminal street. The scalar
+oracle `tests/env/scalar_rules.py` follows the same rules.
 
 * The deck is dealt as P0 hole, P1 hole, flop, turn, river (seat order).
+  `button` picks the seat that posts the small blind.
 * The button posts the small blind and acts first preflop. The other seat
   acts first after the flop. Antes go into the pot but not the street bets.
-* `min_raise_to = max_bet + max(last full raise increment this street, BB)`.
-  The preflop increment starts at BB. `max_raise_to` is the actor's own
-  all-in. An all-in below `min_raise_to` is legal. It does not change the
-  increment. A raise is legal only if the actor has more than the call
-  amount and the opponent still has chips behind.
-* A betting round closes once each player has folded, is all-in, or has acted
-  since the last raise with the largest bet matched. If at most one player
-  can still bet, the board is run out and the hand is shown down in the
-  same `step`.
+  A player who cannot cover the ante or blind posts what they have and is
+  all-in.
+* The current bet (`LegalInfo.max_bet`) is the largest street bet, and
+  preflop never less than the full big blind. Facing a big blind that is
+  all-in for less, the small blind still calls up to the full big blind
+  (and may fold); the excess comes back at showdown.
+* `min_raise_to = current bet + max(last full raise increment this street,
+  BB)`. The increment starts at BB on every street. `max_raise_to` is the
+  actor's all-in total (`street bet + stack`), even when it exceeds what the
+  opponent can call. An all-in below `min_raise_to` is legal and does not
+  change the increment. A raise is legal only if the actor's all-in total is
+  above the current bet and the opponent still has chips behind. Heads-up,
+  the TDA re-opening rule never matters: an incomplete raise is always
+  all-in, so nobody can raise after it.
+* A seat is done for the round when it has folded, is all-in, or has matched
+  the current bet and either acted since the last raise or is the only
+  player left who can bet: a lone player acts only when facing a bet. The
+  round closes when both seats are done. If at most one player can still
+  bet, the board is run out and the hand is shown down in the same `step`.
+* The same rule is applied right after the blinds. The hand ends at the deal
+  when both players are all-in, or when the small blind is all-in and the
+  big blind faces no bet. When only the big blind is all-in, the small
+  blind still acts (call or fold, no raise).
+* `street` is 3 after any showdown (run-outs and hands decided at the deal
+  included) and stays at the fold street after a fold.
 * Payoffs are net chip changes. On a fold, the folder loses its whole
   contribution. At showdown, the better hand wins `min(contribution)`: the
   uncalled excess goes back. A tie pays 0/0, since heads-up pots split
-  evenly.
-* When both players are all-in from the blinds, the hand is resolved at the
-  deal. When only one is, the other player still acts.
+  evenly (no odd chips).
+* Terminal `stacks` are the final stacks, `start + payoff`. The Rust engine
+  instead keeps the chips behind at the end (final stack there is
+  `stacks + contributed + payoffs`). Use payoffs to compare.
 
 ## Abstract actions (`actions.py`)
 
@@ -118,13 +142,13 @@ the payoffs, the visible board and the legal info before each action.
 |---|---|---|
 | `deck` | `[n, 52]` uint8 | the deal; `cards` = `deck[:, :9]` as long |
 | `button` | `[n]` long | button seat (alternates per slot on each reset unless given) |
-| `stacks` | `[n, 2]` long | chips behind; after the hand, `start + payoff` |
+| `stacks` | `[n, 2]` long | chips behind; after the hand, `start + payoff` (Rust keeps chips behind) |
 | `street_bets` | `[n, 2]` long | chips committed this street |
 | `contrib` | `[n, 2]` long | chips committed this hand (incl. antes); `pot = contrib.sum(1)` |
 | `street` | `[n]` long | 0..3 (3 after a showdown, including run-outs) |
 | `actor` | `[n]` long | seat to act, -1 when finished |
 | `folded`, `all_in`, `acted` | `[n, 2]` bool | per-seat flags (`acted`: since the last raise on this street) |
-| `last_raise` | `[n]` long | last full raise increment this street |
+| `last_raise` | `[n]` long | last full raise increment this street (BB at the start of each street) |
 | `n_raises` | `[n]` long | voluntary raises this street |
 | `hist_tok`, `hist_amt`, `hist_len` | `[n, 24]`, `[n, 24]`, `[n]` long | action tokens (0 = pad), chips added per action, count |
 | `done` | `[n]` bool | hand finished |
