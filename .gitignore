@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Rust
+target/
+
+# Data, caches, checkpoints, logs
+data/
+cache/
+*.npy
+*.npz
+checkpoints/
+*.pt
+*.ckpt
+runs/
+wandb/
+logs/
+hand_histories/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

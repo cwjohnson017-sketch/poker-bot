@@ -1,0 +1,28 @@
+# Example match config: python scripts/play_match.py --config configs/match.yaml
+# Command-line flags override the values here.
+
+engine: auto            # auto | reference | rust
+
+game:                   # ACPC heads-up no-limit: 50/100 blinds, 200bb stacks
+  num_players: 2
+  stacks: [20000, 20000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+match:
+  a: always_call        # registry names: always_call, always_raise, random, equity, human
+  b: equity
+  hands: 2000           # total hands (a duplicate match plays hands / 2 deals)
+  duplicate: true
+  seed: 0
+  history: null         # path for the hand-history text file, or null
+
+agents:                 # constructor arguments per agent name
+  equity:
+    raise_threshold: 0.70
+    call_threshold: 0.45
+    samples: 200
+    raise_fraction: 0.75
+  always_raise:
+    fraction: 1.0
