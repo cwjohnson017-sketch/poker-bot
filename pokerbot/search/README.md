@@ -10,6 +10,7 @@ and for preflop play.
 | `combos.py` | canonical order of the 1326 hole combos (`combo_index`, `combo_cards`), card-conflict tables, `blocked_sum` |
 | `abstract.py` | scalar abstract actions matching `pokerbot.env.actions` exactly, pseudo-harmonic mapping, `CardView`, `make_state` |
 | `blueprint.py` | `Blueprint` protocol, `UniformBlueprint`, `TabularBlueprintFromCallable`, `policy_matrix`, `range_reach`, the `search:` registry |
+| `adapters.py` | `TabularBlueprint` (MCCFR strategy file) and `NeuralBlueprint` (Deep CFR run), both with a batched `policy_combos` |
 | `tree.py` | `TreeBuilder` / `build_tree` -> `SubgameTree` (flat tensors), node budget |
 | `showdown.py` | O(n) range-vs-range showdown with card removal (`ShowdownTables`), fold kernel, dense reference |
 | `leaf.py` | depth-limit leaf values from blueprint rollouts with `k` biased continuation strategies |
@@ -215,17 +216,78 @@ River subgames of a few dozen nodes run at about 5-10 ms per iteration.
   integer compares per flop solve). The Python side is not: rollout
   generation, gadget rollouts and blueprint queries.
 * **With a real blueprint**, rollouts query it for every combo at every
-  rollout node. Several thousand leaves make this the bottleneck unless the
-  blueprint implements a vectorised `policy_combos`.
+  rollout node (see the measurement below). Both adapters implement a
+  vectorised `policy_combos`; the tabular one is then dominated by bucketing
+  the fresh turn and river boards of the rollouts, which is CPU work in Rust
+  that a GPU does not speed up.
 * **If a decision runs over budget**, lower these in order:
   `leaf.max_total_rollouts`, `tree.max_nodes` (10k is a good flop value),
   `solver.max_runouts`, `tree.chance_cards`.
 * **Turn and river** trees are much smaller (a turn tree at 20k nodes has
   no leaves). The 1 s budget there is mostly iterations.
 
+### With the tabular blueprint (`search:blueprint:<strategy file>`)
+
+Measured by `tests/search/test_adapters.py::test_flop_decision_timing_tabular_blueprint`
+(marked `slow`; run with `-s`): `configs/mccfr_small.yaml` trained for 20k
+iterations, a 100 bb flop after a 2.5x open and call, default search config,
+CPU, `min_iterations: 1`, on this shared 4-core container.
+
+| Step | Result |
+|---|---|
+| Tree | 14,604 nodes, 1,323 depth-limit leaves, 0.1 s |
+| Leaf rollouts | 33 s: 10,584 rollout rows (2 rollouts x 4 continuations per leaf), **25 ms per leaf** |
+| Blueprint queries | 7,084 `policy_combos` calls, 17.8 s, 2.5 ms per call on average |
+| All-in matrices, gadget rollouts | about 6 s and 2 s |
+| Iterations | 1.5 s each |
+| Decision total | 43 s (against a 2 s budget) |
+
+Where the time goes (cProfile of the same decision): the leaf rollouts. In
+them, `CardAbstraction.buckets_batch` for every new turn or river runout
+board is about 14 s (about 8 ms per cold board of 1,326 combos; a board seen
+before is a cached lookup, and a query on it costs 0.2 to 0.7 ms), the rollout
+loop itself about 12 s of Python and small-tensor overhead, and
+`combos.valid_mask` on each rollout's full board about 5.5 s. So the
+bottleneck is the per-rollout work on fresh boards, not the lookups. To fit
+the budget: lower `leaf.max_total_rollouts` (the time is linear in it),
+`tree.max_nodes` (fewer leaves), or precompute turn and river bucket tables
+(`cards.tables`) so bucketing is a table lookup. A neural blueprint costs
+about 23 ms per `policy_combos` call with the tiny test network (one forward
+pass per net over 1,326 rows, plus the cached own-reach passes), so leaf
+rollouts with it would take minutes on this CPU; it needs the GPU and a small
+`max_total_rollouts`.
+
 ## Plugging in a blueprint
 
-Anything with `spec` (an `ActionSpec`) and `policy(state, player)` works.
+The two trained blueprints plug in from the registry:
+
+```
+python scripts/play_match.py --a search:blueprint:runs/mccfr_small/strategy.bin --b equity
+python scripts/play_match.py --a search:neural:runs/deepcfr_tiny --b equity
+```
+
+* `search:blueprint:<strategy file>` -> `TabularBlueprint`
+  (`pokerbot.blueprint.mccfr.policy.TabularPolicy`). The public history is
+  replayed into the training game with the pseudo-harmonic translation
+  (`u = 0.5`, cached per history prefix). `policy_combos` buckets all 1,326
+  combos of the board with one `CardAbstraction.buckets_batch` call (built
+  from the strategy's own card config, cached per board) and looks up each
+  distinct bucket's infoset once. `spec` is the training action list.
+  Actions that are illegal at the real stacks move their mass to check/call,
+  and when the abstract game stops tracking the hand the row is check/call,
+  as in `BlueprintAgent`.
+* `search:neural:<run dir>` -> `NeuralBlueprint`
+  (`pokerbot.blueprint.deepcfr.range_policy.NeuralRangePolicy`).
+  `policy_combos` encodes the public state once, writes each combo's hole
+  cards into the batch and runs one forward pass per net. The SD-CFR own-reach
+  weights come from one pass per earlier own decision, cached per history
+  prefix and board prefix.
+* Rows of combos that share a card with the board are zero. Per-agent
+  options: `blueprint: {...}` goes to the blueprint factory (e.g.
+  `{last_n: 8}` for a neural run), the rest to the search config.
+
+
+Any other blueprint: anything with `spec` (an `ActionSpec`) and `policy(state, player)` works.
 `policy` returns `{abstract_index: prob}`, a length-`A` sequence or a
 tensor, for the actor at a scalar `GameState`. It reads the actor's cards
 with `state.hole_cards(player)`. The search may pass a `CardView`: a
@@ -244,15 +306,16 @@ Optional extras:
 ```python
 from pokerbot.search import SearchAgent, register_blueprint, search_config
 
-class MCCFRBlueprint:            # adapter around the tabular BlueprintAgent
+class MyBlueprint:
     def __init__(self, path):
-        self.agent = BlueprintAgent.load(path)
-        self.spec = self.agent.spec
-    def policy(self, state, player):
-        return self.agent.action_probs(state, player)   # {abstract index: prob}
+        self.spec = ...                     # the ActionSpec its indices refer to
+    def policy(self, state, player):        # {abstract index: prob} for state.hole_cards(player)
+        ...
+    def policy_combos(self, state, player): # optional: [1326, A] tensor
+        ...
 
-register_blueprint("blueprint", MCCFRBlueprint)          # -> search:blueprint:<path>
-agent = SearchAgent(MCCFRBlueprint("runs/mccfr.bin"), search_config())
+register_blueprint("mine", lambda arg, **kw: MyBlueprint(arg))   # -> search:mine:<path>
+agent = SearchAgent(MyBlueprint("runs/x"), search_config())
 ```
 
 From the match runner: `python scripts/play_match.py --a search:uniform --b random`.
@@ -281,6 +344,11 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
   masked match runner, unsafe mode with cached roots, and the
   `search:uniform` registry.
 * (f) `test_timing.py`: prints the CPU flop timing above.
+* `test_adapters.py`: batched `policy_combos` equals per-combo `policy` for
+  both trained blueprints (tabular on and off the training stacks), zero
+  mass on card conflicts, the tabular buckets equal the strategy's own,
+  `search:blueprint:` and `search:neural:` agents play 20 legal hands, and
+  the (slow) tabular timing above.
 * `test_abstract.py`: scalar abstract actions against `pokerbot.env.actions`,
   pseudo-harmonic mapping, `CardView`, `range_reach`.
 
@@ -296,3 +364,5 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
   give an unbiased but noisy game. The solver treats that sampled game as
   exact.
 * Rollout generation and blueprint queries are Python loops on the CPU.
+* The tabular adapter's history replay uses the deterministic pseudo-harmonic
+  split (`u = 0.5`), not the randomized one `BlueprintAgent.act` uses.

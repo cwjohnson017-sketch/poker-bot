@@ -19,6 +19,15 @@ sequence), samples an abstract action, and converts it to a concrete action
 sized against the real pot. When ``abs`` no longer tracks the hand (the
 opponent raised past the abstraction's raise cap, or a bet mapped to an
 all-in that was not one), the agent falls back to check/call.
+
+The agent is also a :class:`~pokerbot.agents.policy.PolicyAgent`:
+``policy(state, seat)`` and the batched ``policy_batch(state, seat, holes)``
+give the blueprint's probabilities over the indices of ``agent.spec`` (the
+training action list) from the public state alone, through
+:class:`~.policy.TabularPolicy`. That replay maps every action with the
+deterministic pseudo-harmonic split (``u = 0.5``), so after an off-tree
+opponent size the policy is the one of the more likely mapping, while
+``act`` with ``mapping="randomized"`` samples the mapping per hand.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ from typing import Any
 import numpy as np
 
 from ...agents.base import BaseAgent
+from .policy import TabularPolicy
 
 
 class BlueprintAgent(BaseAgent):
@@ -59,6 +69,8 @@ class BlueprintAgent(BaseAgent):
         self.mapping = mapping
         self.greedy = greedy
         self.counters: Counter[str] = Counter()
+        self.table = TabularPolicy(self.strategy)
+        self.spec = self.table.spec
         self._reset()
 
     # -- hand bookkeeping ---------------------------------------------------
@@ -115,6 +127,17 @@ class BlueprintAgent(BaseAgent):
                     self._abs.apply(abs_a)
             self._real.apply(a)
         self._seen = len(history)
+
+    # -- PolicyAgent ----------------------------------------------------------
+
+    def policy(self, state: Any, seat: int) -> np.ndarray:
+        """``[A]`` probabilities over ``self.spec`` for ``seat`` holding
+        ``state.hole_cards(seat)`` (stateless; see the module docstring)."""
+        return self.table.probs(state, seat)
+
+    def policy_batch(self, state: Any, seat: int, holes: Any) -> np.ndarray:
+        """``[K, A]`` probabilities for ``K`` hypothetical hole-card pairs."""
+        return self.table.probs_batch(state, seat, holes)
 
     # -- decisions ----------------------------------------------------------
 

@@ -203,17 +203,35 @@ def nearest_abstract(
     kind: torch.Tensor,
     amount: torch.Tensor,
     targets: torch.Tensor,
+    legal: torch.Tensor | None = None,
+    max_raise_to: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Abstract index to record for a concrete action (history tokens only).
 
     Fold/check-call map to their index; a raise maps to the raise-type entry
     whose concrete amount is closest (first on ties). This is not the
     pseudo-harmonic mapping of the abstraction layer.
+
+    With ``legal`` (the ``[n, A]`` mask) the raise candidates are restricted
+    to the legal raise entries of rows that have any, and with
+    ``max_raise_to`` a raise to exactly the actor's all-in maps to the
+    street's ``allin`` entry when the spec has one. Together these give the
+    index :meth:`VecNLHE.step` records for the equivalent abstract action (a
+    sized raise that clamps to the all-in is masked, so ``step`` can only
+    reach that amount through ``allin``).
     """
     akind = tab.kind[street]
     is_r = (akind == K_RAISE_POT) | (akind == K_RAISE_MULT) | (akind == K_ALLIN)
+    if legal is not None:
+        legal_r = is_r & legal
+        is_r = torch.where(legal_r.any(1, keepdim=True), legal_r, is_r)
     dist = torch.where(is_r, (targets - amount[:, None]).abs(), torch.full_like(targets, 2**40))
     r_idx = dist.argmin(1)
+    if max_raise_to is not None:
+        is_allin = akind == K_ALLIN
+        allin_idx = is_allin.long().argmax(1)
+        to_allin = is_allin.any(1) & (amount == max_raise_to)
+        r_idx = torch.where(to_allin, allin_idx, r_idx)
     return torch.where(
         kind == FOLD,
         tab.fold_index[street],

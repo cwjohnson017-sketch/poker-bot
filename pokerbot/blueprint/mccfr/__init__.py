@@ -13,6 +13,7 @@ __all__ = [
     "DEFAULT_ACTIONS",
     "BlueprintAgent",
     "StrategyFile",
+    "TabularPolicy",
     "decode_key",
     "export_strategy",
     "make_key",
@@ -28,4 +29,8 @@ def __getattr__(name: str):
         from .agent import BlueprintAgent
 
         return BlueprintAgent
+    if name == "TabularPolicy":
+        from .policy import TabularPolicy
+
+        return TabularPolicy
     raise AttributeError(name)

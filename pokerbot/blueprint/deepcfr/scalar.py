@@ -9,13 +9,13 @@ this module re-derives the same features in plain Python integers:
   ``pokerbot/env/actions.py`` line by line (exact integer arithmetic, same
   clamping, same dedupe rule).
 * :func:`nearest_abstract` maps a concrete action to an abstract index with
-  the env's rule (fold/check-call to their index, a raise to the raise-type
-  entry with the closest amount, first on ties), restricted to the entries
-  that are legal in the abstraction when any raise entry is legal. On the
-  tree this gives exactly the index ``VecNLHE.step`` records for the
-  abstract action (``step_concrete`` can record a masked sized-raise index
-  for an all-in whose amount a sized raise clamps to; the traversal only
-  ever uses ``step``). Off the tree it is the nearest legal size.
+  the env's rule (fold/check-call to their index, a raise to exactly the
+  all-in to the ``allin`` entry, any other raise to the raise-type entry with
+  the closest amount, first on ties), restricted to the entries that are
+  legal in the abstraction when any raise entry is legal. This is the index
+  ``VecNLHE.step_concrete`` records, and on the tree exactly the index
+  ``VecNLHE.step`` records for the abstract action. Off the tree it is the
+  nearest legal size.
 * :func:`encode_state` rebuilds the history tokens by replaying the public
   action history through the scalar engine (hole cards of the opponent and
   the undealt board are irrelevant to every public quantity, so they are
@@ -165,6 +165,9 @@ def nearest_abstract(
         leg = [i for i in cand if legal[i]]
         if leg:
             cand = leg
+    for i, k in enumerate(kinds):
+        if k == K_ALLIN and targets[i] == amount:
+            return i
     return min(cand, key=lambda i: (abs(targets[i] - amount), i))
 
 

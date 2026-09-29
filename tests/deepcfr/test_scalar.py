@@ -127,3 +127,16 @@ def test_off_tree_bet_maps_to_nearest_legal_size():
     street, is_btn = 1, int(s.history[-1][1] == s.button)
     assert int(feats["hist"][0, 2]) == 1 + (street * 2 + is_btn) * A + 3
     assert float(feats["hist_amt"][0, 2]) == pytest.approx(130 / 20000)
+
+
+def test_allin_maps_to_the_allin_entry_even_when_raises_are_capped():
+    """Mirror of ``VecNLHE.step_concrete``: a raise to exactly the all-in is
+    the ``allin`` token, never a sized raise that clamps to the same amount
+    (legal or not, e.g. past the raise cap)."""
+    sp = ScalarSpec.build(DEFAULT_SPEC)
+    targets = [0, 0, 600, 900, 1100, 1100]  # 1.5 pot clamps to the 1100 all-in
+    legal = [True, True, True, True, False, True]
+    assert nearest_abstract(sp, 1, 2, 1100, targets, legal) == 5
+    capped = [True, True, False, False, False, False]
+    assert nearest_abstract(sp, 1, 2, 1100, targets, capped) == 5
+    assert nearest_abstract(sp, 1, 2, 950, targets, capped) == 3

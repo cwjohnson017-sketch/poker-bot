@@ -200,3 +200,68 @@ def test_sizes_above_stack_become_allin_only():
     # p0: 0.33 -> 564 clamped to the 600 min raise; 0.75 -> 900; 1.5 -> 1500 > stack -> all-in
     assert env.action_amounts()[0, 2:].tolist() == [600, 900, 1100, 1100]
     assert env.legal_mask()[0].tolist() == [True, True, True, True, False, True]
+
+
+def test_step_concrete_records_the_allin_token_like_step():
+    """Regression: ``step_concrete`` recorded the masked 1.5-pot token for an
+    all-in that the 1.5-pot raise clamps to; ``step`` records ``allin``."""
+
+    def flop_env():
+        env = VecNLHE(1, GameConfig(stacks=[1200, 20000]), "cpu", seed=0)
+        env.reset(button=0)
+        for a in (1, 1, 4):  # limp, check, p1 bets 1.5 pot; p0 has 1100 behind
+            env.step(torch.tensor([a]))
+        return env
+
+    a, b = flop_env(), flop_env()
+    a.step(torch.tensor([5]))  # abstract all-in
+    b.step_concrete(torch.tensor([RAISE]), torch.tensor([1100]))
+    assert a.hist_tok.tolist() == b.hist_tok.tolist()
+    assert (int(b.hist_tok[0, 3]) - 1) % b.num_actions == 5
+
+
+def test_step_concrete_token_matches_step_for_every_legal_action():
+    from pokerbot.env.actions import spec_from_lists
+
+    spec = spec_from_lists(
+        [
+            [("fold",), ("check_call",), ("raise_x", 3.0), ("raise", 1.0), ("allin",)],
+            [("fold",), ("check_call",), ("raise", 0.5), ("raise", 1.5), ("allin",)],
+            [("fold",), ("check_call",), ("raise", 1.0), ("raise", 2.0), ("allin",)],
+            [("fold",), ("check_call",), ("raise", 1.0), ("allin",)],
+        ],
+        max_raises=2,
+    )
+    env = VecNLHE(64, GameConfig(stacks=[1500, 4000]), "cpu", seed=3, spec=spec)
+    g = torch.Generator().manual_seed(0)
+    A = env.num_actions
+    checked = 0
+    for _ in range(40):
+        legal = env.legal_mask()
+        amounts = env.action_amounts()
+        live = ~env.done
+        for idx in range(A):
+            ok = legal[:, idx] & live
+            if not bool(ok.any()):
+                continue
+            kind = env.tab.concrete[env.street.clamp(0, 3), idx]
+            amount = torch.where(kind == RAISE, amounts[:, idx], 0)
+            x, y = env.clone(), env.clone()
+            act = torch.where(ok, idx, env.tab.call_index[env.street.clamp(0, 3)])
+            x.step(act)
+            y.step_concrete(torch.where(ok, kind, CHECK_CALL), torch.where(ok, amount, 0))
+            assert torch.equal(x.hist_tok[ok], y.hist_tok[ok])
+            checked += int(ok.sum())
+        w = legal.float() * torch.tensor([0.2, 1.0, 1.0, 1.0, 0.4])
+        env.step(torch.multinomial(w, 1, generator=g).squeeze(1))
+        env.reset(env.done)
+    assert checked > 1000
+    # raise cap reached (two raises on the flop): a concrete all-in has no legal
+    # abstract action, and records the allin token, not a clamped sized raise
+    env = VecNLHE(1, GameConfig(stacks=[1500, 4000]), "cpu", seed=0, spec=spec)
+    env.reset(button=0)
+    for a in (1, 1, 2, 2):  # limp, check; flop: bet 0.5 pot, raise 0.5 pot
+        env.step(torch.tensor([a]))
+    assert not bool(env.legal_mask()[0, 2:].any())
+    env.step_concrete(torch.tensor([RAISE]), env.legal_info().max_raise_to)
+    assert (int(env.hist_tok[0, 4]) - 1) % A == 4

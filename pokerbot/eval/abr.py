@@ -22,9 +22,12 @@ Opponents implement :class:`VecPolicy`: ``act(env, mask) -> LongTensor[n]``
 (abstract action per slot; only ``mask`` slots matter). Provided:
 :class:`UniformRandomVecPolicy`, :class:`CallVecPolicy`, and
 :class:`ScalarVecPolicy`, which runs any scalar ``PolicyAgent`` slot by slot
-(slow; for tests and small checks). A future network policy can implement
-``act`` directly on ``env.obs()``; agents may expose it through a
-``vec_policy(device)`` method, which :func:`make_vec_policy` prefers.
+(slow; for tests and small checks). A network policy can implement ``act``
+directly on ``env.obs()``; agents expose it through a ``vec_policy(device)``
+method, which :func:`make_vec_policy` prefers (the neural blueprint does).
+The envs use the opponent's ``spec`` attribute when it has one
+(``DEFAULT_SPEC`` otherwise): a policy's abstract actions and the history
+tokens it reads are defined by its own action spec.
 """
 
 from __future__ import annotations
@@ -124,6 +127,7 @@ class ScalarVecPolicy:
 
     def __init__(self, agent: Any, seed: int = 0, engine: ModuleType | None = None) -> None:
         self.agent = agent
+        self.spec = getattr(agent, "spec", None)
         self.name = getattr(agent, "name", type(agent).__name__)
         self.rng = np.random.default_rng(seed)
         self.engine = engine or get_engine()
@@ -149,6 +153,14 @@ class ScalarVecPolicy:
             p = policy_vector(self.agent.policy(view, seat), legal_np[i])
             out[i] = int(self.rng.choice(len(p), p=p))
         return out
+
+
+def opponent_spec(opponent: Any, spec: Any = None) -> Any:
+    """The action spec for envs that ``opponent`` plays in: ``spec`` when given,
+    else the opponent's ``spec`` attribute, else ``DEFAULT_SPEC``."""
+    from ..env.actions import DEFAULT_SPEC
+
+    return spec or getattr(opponent, "spec", None) or DEFAULT_SPEC
 
 
 def make_vec_policy(
@@ -377,12 +389,14 @@ def evaluate_br(
     device: torch.device | str = "cpu",
     seed: int = 12345,
     equity_samples: int = 0,
+    spec: Any = None,
 ) -> BREval:
     """Play ``policy_fn(obs) -> actions`` (in seat ``slot % 2``) against
     ``opponent`` for ``hands`` hands in rounds of ``n_envs`` hands. With the
-    same ``seed`` two evaluations see the same deals (common random numbers)."""
+    same ``seed`` two evaluations see the same deals (common random numbers).
+    ``spec`` defaults to the opponent's ``spec`` (else ``DEFAULT_SPEC``)."""
     n = max(2, min(int(n_envs), int(hands)))
-    env = VecNLHE(n, game, device, seed=seed, validate=False)
+    env = VecNLHE(n, game, device, seed=seed, validate=False, spec=opponent_spec(opponent, spec))
     gen = make_generator(seed + 1, env.device)
     if hasattr(opponent, "reseed"):
         opponent.reseed(seed + 2)
@@ -491,7 +505,8 @@ def train_abr(
     dev = resolve_device(device)
     game = game if game is not None else GameConfig()
     torch.manual_seed(cfg.seed)
-    env = VecNLHE(cfg.n_envs, game, dev, seed=cfg.seed, validate=False)
+    spec = opponent_spec(opponent)
+    env = VecNLHE(cfg.n_envs, game, dev, seed=cfg.seed, validate=False, spec=spec)
     gen = make_generator(cfg.seed + 1, dev)
     n = env.n
     br_seat = torch.arange(n, device=dev) % 2
@@ -517,6 +532,7 @@ def train_abr(
         device=dev,
         seed=cfg.seed + 777,
         equity_samples=cfg.equity_samples,
+        spec=spec,
     )
     initial = None
     if cfg.eval_initial:
