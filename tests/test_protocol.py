@@ -2,7 +2,6 @@ import threading
 
 import numpy as np
 import pytest
-from helpers import make_deck
 
 from pokerbot.agents import AlwaysCallAgent, AlwaysRaiseAgent, BaseAgent
 from pokerbot.eval import MaskedState, run_match
@@ -21,6 +20,7 @@ from pokerbot.protocol import (
 )
 from pokerbot.protocol.messages import decode_hello, encode_hello, split_response
 from pokerbot.reference import Action, GameConfig, GameState, cards_from_str
+from tests.helpers import make_deck
 
 pytestmark = pytest.mark.usefixtures("reference_engine")
 

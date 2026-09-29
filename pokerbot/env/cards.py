@@ -9,7 +9,7 @@ button): player 0 hole (2), player 1 hole (2), flop (3), turn (1), river (1).
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -80,7 +80,9 @@ def shuffled_decks(
     """
     if generator is not None:
         device = generator.device
-    keys = torch.randint(0, 2**62, (n, NUM_CARDS), generator=generator, device=device, dtype=torch.long)
+    keys = torch.randint(
+        0, 2**62, (n, NUM_CARDS), generator=generator, device=device, dtype=torch.long
+    )
     return torch.argsort(keys, dim=1, stable=True)
 
 

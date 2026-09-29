@@ -30,8 +30,9 @@ Rules (heads-up, matching the scalar engine contract):
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
@@ -67,9 +68,26 @@ class LegalInfo:
 
 class VecNLHE:
     _STATE = (
-        "deck", "button", "stacks", "street_bets", "contrib", "street", "actor", "folded", "all_in",
-        "acted", "last_raise", "n_raises", "hist_tok", "hist_amt", "hist_len", "done", "payoffs",
-        "ranks", "last_kind", "last_amount",
+        "deck",
+        "button",
+        "stacks",
+        "street_bets",
+        "contrib",
+        "street",
+        "actor",
+        "folded",
+        "all_in",
+        "acted",
+        "last_raise",
+        "n_raises",
+        "hist_tok",
+        "hist_amt",
+        "hist_len",
+        "done",
+        "payoffs",
+        "ranks",
+        "last_kind",
+        "last_amount",
     )
 
     def __init__(
@@ -147,7 +165,9 @@ class VecNLHE:
 
     # ------------------------------------------------------------------ dealing
     @torch.no_grad()
-    def reset(self, mask: torch.Tensor | None = None, button: torch.Tensor | int | None = None) -> None:
+    def reset(
+        self, mask: torch.Tensor | None = None, button: torch.Tensor | int | None = None
+    ) -> None:
         """Deal new hands into the masked slots (all slots when ``mask`` is None).
 
         Without ``button`` each reset slot's button alternates from its
@@ -176,7 +196,9 @@ class VecNLHE:
         btn = btn.to(dev).long()
         cards = decks[:, :9]
         board = cards[:, 4:9]
-        hands = torch.stack([torch.cat([cards[:, 0:2], board], 1), torch.cat([cards[:, 2:4], board], 1)], 1)
+        hands = torch.stack(
+            [torch.cat([cards[:, 0:2], board], 1), torch.cat([cards[:, 2:4], board], 1)], 1
+        )
         ranks = evaluate_batch(hands)  # [k, 2]
 
         start = self.start_stacks.expand(k, 2)
@@ -253,12 +275,25 @@ class VecNLHE:
 
     def _targets(self, info: LegalInfo) -> torch.Tensor:
         return act_mod.raise_targets(
-            self.tab, info.street, info.pot, info.max_bet, info.to_call, info.min_raise_to, info.max_raise_to
+            self.tab,
+            info.street,
+            info.pot,
+            info.max_bet,
+            info.to_call,
+            info.min_raise_to,
+            info.max_raise_to,
         )
 
     def _mask(self, info: LegalInfo, targets: torch.Tensor) -> torch.Tensor:
         return act_mod.legal_mask(
-            self.tab, info.street, info.active, info.to_call, info.raise_ok, self.n_raises, targets, info.max_raise_to
+            self.tab,
+            info.street,
+            info.active,
+            info.to_call,
+            info.raise_ok,
+            self.n_raises,
+            targets,
+            info.max_raise_to,
         )
 
     @torch.no_grad()
@@ -278,7 +313,9 @@ class VecNLHE:
 
     # ------------------------------------------------------------------ stepping
     @torch.no_grad()
-    def step(self, abstract_action: torch.Tensor, validate: bool | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def step(
+        self, abstract_action: torch.Tensor, validate: bool | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply one abstract action per slot for the slot's current actor.
 
         Returns ``(payoffs [n, 2], done [n])``. ``payoffs`` holds the net chip
@@ -320,7 +357,11 @@ class VecNLHE:
         info = self.legal_info()
         in_raise_range = (amount >= info.min_raise_to) & (amount <= info.max_raise_to)
         raise_legal = info.raise_ok & (in_raise_range | (amount == info.max_raise_to))
-        legal = torch.where(kind == FOLD, info.can_fold, torch.where(kind == CHECK_CALL, info.active, (kind == RAISE) & raise_legal))
+        legal = torch.where(
+            kind == FOLD,
+            info.can_fold,
+            torch.where(kind == CHECK_CALL, info.active, (kind == RAISE) & raise_legal),
+        )
         if validate and bool((info.active & ~legal).any()):
             bad = (info.active & ~legal).nonzero().squeeze(1)[:8].tolist()
             raise ValueError(f"illegal concrete action in slots {bad}")
@@ -331,7 +372,9 @@ class VecNLHE:
         self._apply(kind, amount, a_idx, info)
         return self.payoffs.clone(), self.done.clone()
 
-    def _apply(self, kind: torch.Tensor, amount: torch.Tensor, a_idx: torch.Tensor, info: LegalInfo) -> None:
+    def _apply(
+        self, kind: torch.Tensor, amount: torch.Tensor, a_idx: torch.Tensor, info: LegalInfo
+    ) -> None:
         live = info.active
         p = self.actor.clamp(min=0)
         sel = self._seat[None, :] == p[:, None]  # [n, 2] actor one-hot
@@ -339,7 +382,9 @@ class VecNLHE:
         is_call = live & (kind == CHECK_CALL)
         is_raise = live & (kind == RAISE)
         zero = torch.zeros_like(amount)
-        add = torch.where(is_call, info.call_amount, torch.where(is_raise, amount - info.my_bet, zero))
+        add = torch.where(
+            is_call, info.call_amount, torch.where(is_raise, amount - info.my_bet, zero)
+        )
         add2 = sel.long() * add[:, None]
         self.stacks -= add2
         self.street_bets += add2
@@ -414,7 +459,7 @@ class VecNLHE:
         return encode_obs(self, **kwargs)
 
     # ------------------------------------------------------------------ batch utilities
-    def select(self, idx: torch.Tensor) -> "VecNLHE":
+    def select(self, idx: torch.Tensor) -> VecNLHE:
         """New env holding copies of the slots ``idx`` (may repeat, e.g. to fan
         out a frontier). Shares the random generator with ``self``."""
         idx = idx.to(self.device).long()
@@ -424,7 +469,7 @@ class VecNLHE:
             setattr(out, name, getattr(self, name)[idx].clone())
         return out
 
-    def clone(self) -> "VecNLHE":
+    def clone(self) -> VecNLHE:
         out = copy.copy(self)
         for name in self._STATE:
             setattr(out, name, getattr(self, name).clone())
@@ -450,7 +495,9 @@ class VecNLHE:
         deck = [int(c) for c in deck]
         if sorted(deck) != list(range(NUM_CARDS)):
             raise ValueError("deck must be a permutation of 0..51")
-        env = VecNLHE(1, self.config, self.device, 0, self.spec, True, self.history_len, auto_deal=False)
+        env = VecNLHE(
+            1, self.config, self.device, 0, self.spec, True, self.history_len, auto_deal=False
+        )
         dev = self.device
         env._deal(
             torch.zeros(1, dtype=torch.long, device=dev),
@@ -459,12 +506,16 @@ class VecNLHE:
         )
         steps = []
         for a in actions:
-            kind, amount = (a.kind, a.amount) if hasattr(a, "kind") else (a[0], a[1] if len(a) > 1 else 0)
+            kind, amount = (
+                (a.kind, a.amount) if hasattr(a, "kind") else (a[0], a[1] if len(a) > 1 else 0)
+            )
             if bool(env.done[0]):
                 raise ValueError("action after the hand ended")
             steps.append(env.slot_info(0))
             env.step_concrete(
-                torch.tensor([int(kind)], device=dev), torch.tensor([int(amount or 0)], device=dev), validate=True
+                torch.tensor([int(kind)], device=dev),
+                torch.tensor([int(amount or 0)], device=dev),
+                validate=True,
             )
         blen = int(env.board_len[0])
         return {

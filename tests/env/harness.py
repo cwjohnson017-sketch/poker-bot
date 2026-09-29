@@ -9,7 +9,16 @@ from pokerbot.env.vec_env import LegalInfo, VecNLHE
 
 from .scalar_rules import ScalarHand
 
-LEGAL_KEYS = ("current_player", "street", "pot", "can_fold", "can_check", "call_amount", "min_raise_to", "max_raise_to")
+LEGAL_KEYS = (
+    "current_player",
+    "street",
+    "pot",
+    "can_fold",
+    "can_check",
+    "call_amount",
+    "min_raise_to",
+    "max_raise_to",
+)
 
 
 def random_abstract(env: VecNLHE, g: torch.Generator) -> torch.Tensor:
@@ -71,7 +80,9 @@ def _slot_record(env: VecNLHE, i: int, deck_rows, buttons) -> dict:
     return {"deck": deck_rows[i], "button": buttons[i], "actions": [], "legal": []}
 
 
-def play_and_record(env: VecNLHE, steps: int, g: torch.Generator, concrete: bool = False) -> list[dict]:
+def play_and_record(
+    env: VecNLHE, steps: int, g: torch.Generator, concrete: bool = False
+) -> list[dict]:
     """Play random actions, check invariants every step, return finished hands."""
     n = env.n
     decks, buttons = env.deck.long().tolist(), env.button.tolist()
@@ -129,8 +140,15 @@ def play_and_record(env: VecNLHE, steps: int, g: torch.Generator, concrete: bool
 
 def replay_scalar(hand: dict, config) -> None:
     """Replay a recorded hand in the independent scalar rules and compare."""
-    h = ScalarHand(config.stacks, config.small_blind, config.big_blind, config.ante, hand["button"], hand["deck"])
-    for (kind, amount), legal in zip(hand["actions"], hand["legal"]):
+    h = ScalarHand(
+        config.stacks,
+        config.small_blind,
+        config.big_blind,
+        config.ante,
+        hand["button"],
+        hand["deck"],
+    )
+    for (kind, amount), legal in zip(hand["actions"], hand["legal"], strict=False):
         assert not h.terminal
         assert h.legal() == legal, (h.legal(), legal, hand)
         h.apply(kind, amount)

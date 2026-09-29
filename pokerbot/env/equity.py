@@ -42,7 +42,9 @@ def pad_board(board: torch.Tensor | None, n: int, device: torch.device) -> torch
     return board
 
 
-def sample_unknown(known: torch.Tensor, k: int, generator: torch.Generator | None = None) -> torch.Tensor:
+def sample_unknown(
+    known: torch.Tensor, k: int, generator: torch.Generator | None = None
+) -> torch.Tensor:
     """``k`` distinct cards per row, uniformly from cards not in ``known``.
 
     ``known`` is ``[M, K]`` and may contain ``NO_CARD`` padding.
@@ -94,7 +96,7 @@ def equity_river(hole: torch.Tensor, board5: torch.Tensor, max_rows: int = 1 << 
     """Exact equity on a complete board vs all 990 opponent hands, ``[N]`` float."""
     hole, board5 = hole.long(), board5.long()
     n, dev = hole.shape[0], hole.device
-    I, J = _pairs45(dev)
+    ii, jj = _pairs45(dev)
     out = torch.empty(n, dtype=torch.float32, device=dev)
     for s, e in _chunks(n, 990, max_rows):
         m = e - s
@@ -102,7 +104,7 @@ def equity_river(hole: torch.Tensor, board5: torch.Tensor, max_rows: int = 1 << 
         known = torch.cat([h, b], 1)
         used = torch.zeros(m, 52, dtype=torch.long, device=dev).scatter_(1, known, 1)
         remaining = torch.argsort(used, dim=1, stable=True)[:, :45]  # unused cards, ascending
-        opp = torch.stack([remaining[:, I], remaining[:, J]], 2)  # [m, 990, 2]
+        opp = torch.stack([remaining[:, ii], remaining[:, jj]], 2)  # [m, 990, 2]
         vill = torch.cat([opp, b[:, None, :].expand(m, 990, 5)], 2)
         rv = evaluate_batch(vill)  # [m, 990]
         rh = evaluate_batch(known)  # [m]
@@ -138,7 +140,9 @@ def equity_histogram(
     h = hole.repeat_interleave(R, 0)
     eq = equity_river(h, full) if n_opp == 0 else equity_vs_random(h, full, n_opp, generator)
     idx = (eq * bins).long().clamp(0, bins - 1)
-    hist = torch.zeros(n * R, bins, device=dev).scatter_(1, idx[:, None], 1.0).view(n, R, bins).mean(1)
+    hist = (
+        torch.zeros(n * R, bins, device=dev).scatter_(1, idx[:, None], 1.0).view(n, R, bins).mean(1)
+    )
     if return_equity:
         return hist, eq.view(n, R).mean(1)
     return hist

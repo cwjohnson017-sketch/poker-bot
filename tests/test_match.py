@@ -2,7 +2,6 @@ import io
 
 import numpy as np
 import pytest
-from helpers import make_deck
 
 from pokerbot.agents import (
     AlwaysCallAgent,
@@ -21,6 +20,7 @@ from pokerbot.eval import (
     run_match,
 )
 from pokerbot.reference import Action, GameConfig, GameState, cards_from_str
+from tests.helpers import make_deck
 
 pytestmark = pytest.mark.usefixtures("reference_engine")
 

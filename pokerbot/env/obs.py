@@ -34,15 +34,27 @@ if TYPE_CHECKING:
     from .vec_env import VecNLHE
 
 SCALAR_NAMES = (
-    "pot", "stack", "opp_stack", "street_bet", "opp_street_bet", "to_call", "min_raise_to", "max_raise_to",
-    "preflop", "flop", "turn", "river", "is_button", "raises_frac",
+    "pot",
+    "stack",
+    "opp_stack",
+    "street_bet",
+    "opp_street_bet",
+    "to_call",
+    "min_raise_to",
+    "max_raise_to",
+    "preflop",
+    "flop",
+    "turn",
+    "river",
+    "is_button",
+    "raises_frac",
 )
 NUM_SCALARS = len(SCALAR_NAMES)
 
 
 @torch.no_grad()
 def encode_obs(
-    env: "VecNLHE",
+    env: VecNLHE,
     equity_samples: int = 0,
     hist_runouts: int = 0,
     hist_bins: int = 10,
@@ -97,5 +109,7 @@ def encode_obs(
     if equity_samples > 0:
         out["equity"] = equity_vs_random(hole, board, equity_samples, generator)
     if hist_runouts > 0:
-        out["equity_hist"] = equity_histogram(hole, board, hist_runouts, hist_bins, hist_opp_samples, generator)
+        out["equity_hist"] = equity_histogram(
+            hole, board, hist_runouts, hist_bins, hist_opp_samples, generator
+        )
     return out

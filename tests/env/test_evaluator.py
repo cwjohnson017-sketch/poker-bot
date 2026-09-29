@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 import torch
 
-from pokerbot.env.cards import card_from_str, card_to_str, cards_from_str, shuffled_decks, make_generator
+from pokerbot.env.cards import (
+    card_from_str,
+    card_to_str,
+    cards_from_str,
+    make_generator,
+    shuffled_decks,
+)
 from pokerbot.env.evaluator import (
     CATEGORY_SHIFT,
     evaluate5,
@@ -35,7 +41,9 @@ def test_decks_are_permutations():
     # every card appears in every deal position with roughly uniform frequency
     counts = torch.zeros(52, 52)
     d = shuffled_decks(20000, make_generator(4))
-    counts.index_put_((torch.arange(52).expand(20000, 52), d), torch.ones(20000, 52), accumulate=True)
+    counts.index_put_(
+        (torch.arange(52).expand(20000, 52), d), torch.ones(20000, 52), accumulate=True
+    )
     assert counts.min() > 250 and counts.max() < 520
 
 
@@ -93,7 +101,9 @@ def test_scalar_matches_pure_python():
     ref6 = np.array([max(naive5(c) for c in itertools.combinations(h, 5)) for h in six])
     _assert_order_consistent(mine6, ref6)
     five = decks[:1500, :5].tolist()
-    _assert_order_consistent(np.array([evaluate5(h) for h in five]), np.array([naive5(h) for h in five]))
+    _assert_order_consistent(
+        np.array([evaluate5(h) for h in five]), np.array([naive5(h) for h in five])
+    )
 
 
 def test_named_hands():

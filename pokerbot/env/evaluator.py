@@ -18,7 +18,7 @@ Everything is device-agnostic; tables are built once per device and cached.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -67,7 +67,7 @@ def _build_tables() -> dict[str, torch.Tensor]:
         "pop": pop,
         "top": top,
         "straight": straight,
-        "rank_pack": 8 ** r,  # 3-bit count field per rank
+        "rank_pack": 8**r,  # 3-bit count field per rank
         "suit_bit": 1 << (13 * s + r),  # one bit per card in 4 13-bit suit fields
         "shift13": 13 * torch.arange(4, dtype=torch.long),
     }
@@ -103,7 +103,11 @@ def evaluate_batch(cards: torch.Tensor) -> torch.Tensor:
     comp = T["compress"]
 
     def squeeze(x: torch.Tensor) -> torch.Tensor:  # field bits -> 13-bit rank mask
-        return comp[x & _SPREAD5] | (comp[(x >> 15) & _SPREAD5] << 5) | (comp[(x >> 30) & _SPREAD5] << 10)
+        return (
+            comp[x & _SPREAD5]
+            | (comp[(x >> 15) & _SPREAD5] << 5)
+            | (comp[(x >> 30) & _SPREAD5] << 10)
+        )
 
     m1 = squeeze(b0 | b1 | b2)  # count >= 1
     m2 = squeeze(b1 | b2)  # count >= 2

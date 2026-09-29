@@ -101,7 +101,10 @@ class ScalarHand:
         else:
             raise ValueError("bad kind")
         top = max(self.bets)
-        settled = all(self.folded[i] or self.all_in[i] or (self.acted[i] and self.bets[i] == top) for i in (0, 1))
+        settled = all(
+            self.folded[i] or self.all_in[i] or (self.acted[i] and self.bets[i] == top)
+            for i in (0, 1)
+        )
         if not settled:
             self.player = 1 - p
             return

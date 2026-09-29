@@ -76,7 +76,15 @@ def test_every_legal_action_applies():
             acts = torch.where(use, a, call_idx[info.street])
             e.step(acts, validate=True)
             check_invariants(e)
-            is_raise = use & info.active & ((kinds[:, a] == K_RAISE_POT) | (kinds[:, a] == K_RAISE_MULT) | (kinds[:, a] == K_ALLIN))
+            is_raise = (
+                use
+                & info.active
+                & (
+                    (kinds[:, a] == K_RAISE_POT)
+                    | (kinds[:, a] == K_RAISE_MULT)
+                    | (kinds[:, a] == K_ALLIN)
+                )
+            )
             if is_raise.any():
                 p = env.actor[is_raise]
                 bet_after = e.street_bets[is_raise].gather(1, p[:, None]).squeeze(1)
@@ -115,7 +123,9 @@ def test_illegal_actions_raise_or_fall_back_to_call():
     env.step(torch.full((4,), 1))  # SB completes
     assert bool(env.legal_info().can_check.all())  # BB may check
     with pytest.raises(ValueError):
-        env.clone().step(torch.zeros(4, dtype=torch.long), validate=True)  # fold while check is possible
+        env.clone().step(
+            torch.zeros(4, dtype=torch.long), validate=True
+        )  # fold while check is possible
     with pytest.raises(ValueError):
         env.clone().step(torch.full((4,), 99), validate=True)
     a, b = env.clone(), env.clone()
@@ -205,7 +215,12 @@ def test_obs_layout():
     assert torch.equal(o["scalars"][:, 8:12].argmax(1), env.street)
     assert torch.equal(o["hist_mask"].sum(1), env.hist_len)
     assert (o["hist"] < env.vocab_size).all()
-    o2 = env.obs(equity_samples=16, hist_runouts=4, hist_opp_samples=8, generator=torch.Generator().manual_seed(0))
+    o2 = env.obs(
+        equity_samples=16,
+        hist_runouts=4,
+        hist_opp_samples=8,
+        generator=torch.Generator().manual_seed(0),
+    )
     assert o2["equity"].shape == (N,) and o2["equity_hist"].shape == (N, 10)
     assert torch.allclose(o2["equity_hist"].sum(1), torch.ones(N))
 

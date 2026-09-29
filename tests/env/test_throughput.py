@@ -31,10 +31,15 @@ def test_throughput_report():
         env.reset(done)
         t4 = time.perf_counter()
         hands += int(done.sum())
-        t_mask, t_sample, t_step, t_reset = t_mask + t1 - t0, t_sample + t2 - t1, t_step + t3 - t2, t_reset + t4 - t3
+        t_mask, t_sample, t_step, t_reset = (
+            t_mask + t1 - t0,
+            t_sample + t2 - t1,
+            t_step + t3 - t2,
+            t_reset + t4 - t3,
+        )
     total = t_mask + t_sample + t_step + t_reset
     print(
-        f"\nVecNLHE n={n} CPU ({torch.get_num_threads()} threads): {steps * n / total:,.0f} steps/s "
+        f"\nVecNLHE n={n} CPU({torch.get_num_threads()} threads): {steps * n / total:,.0f} steps/s "
         f"(legal_mask + sample + step + reset), {hands / total:,.0f} hands/s; "
         f"step() alone {steps * n / t_step:,.0f} steps/s; time split mask/sample/step/reset = "
         f"{t_mask / total:.0%}/{t_sample / total:.0%}/{t_step / total:.0%}/{t_reset / total:.0%}"

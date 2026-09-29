@@ -2,7 +2,6 @@ from itertools import combinations
 
 import numpy as np
 import pytest
-from helpers import naive_best, naive_rank5
 
 from pokerbot.reference import (
     card_from_str,
@@ -14,6 +13,7 @@ from pokerbot.reference import (
     evaluate_batch,
     hand_category,
 )
+from tests.helpers import naive_best, naive_rank5
 
 
 def test_card_strings_roundtrip():

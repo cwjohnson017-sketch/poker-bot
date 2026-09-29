@@ -1,9 +1,9 @@
 """Hand-written rule scenarios for the reference engine."""
 
 import pytest
-from helpers import make_deck
 
 from pokerbot.reference import CHECK_CALL, RAISE, Action, GameConfig, GameState, cards_from_str
+from tests.helpers import make_deck
 
 F, C, R = Action.fold, Action.check_call, Action.raise_to
 

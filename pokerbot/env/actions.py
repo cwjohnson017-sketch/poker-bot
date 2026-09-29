@@ -32,8 +32,8 @@ The module is self-contained so it can move to ``pokerbot/abstraction``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import torch
 
@@ -42,7 +42,13 @@ FOLD, CHECK_CALL, RAISE = 0, 1, 2
 
 # abstract kind codes used in the tensor tables
 K_INVALID, K_FOLD, K_CHECK_CALL, K_RAISE_POT, K_RAISE_MULT, K_ALLIN = -1, 0, 1, 2, 3, 4
-_KIND_CODES = {"fold": K_FOLD, "check_call": K_CHECK_CALL, "raise": K_RAISE_POT, "raise_x": K_RAISE_MULT, "allin": K_ALLIN}
+_KIND_CODES = {
+    "fold": K_FOLD,
+    "check_call": K_CHECK_CALL,
+    "raise": K_RAISE_POT,
+    "raise_x": K_RAISE_MULT,
+    "allin": K_ALLIN,
+}
 
 AbstractAction = tuple
 
@@ -75,13 +81,20 @@ class ActionSpec:
         a = self.streets[street][index]
         return a[0] if len(a) == 1 else f"{a[0]} {a[1]:g}"
 
-    def tables(self, device: torch.device | str) -> "SpecTables":
+    def tables(self, device: torch.device | str) -> SpecTables:
         return SpecTables.build(self, device)
 
 
 DEFAULT_SPEC = ActionSpec(
     streets=(
-        (("fold",), ("check_call",), ("raise_x", 2.5), ("raise_x", 3.0), ("raise", 1.0), ("allin",)),
+        (
+            ("fold",),
+            ("check_call",),
+            ("raise_x", 2.5),
+            ("raise_x", 3.0),
+            ("raise", 1.0),
+            ("allin",),
+        ),
         (("fold",), ("check_call",), ("raise", 0.33), ("raise", 0.75), ("raise", 1.5), ("allin",)),
         (("fold",), ("check_call",), ("raise", 0.5), ("raise", 1.0), ("allin",)),
         (("fold",), ("check_call",), ("raise", 0.5), ("raise", 1.0), ("raise", 2.0), ("allin",)),
@@ -102,7 +115,7 @@ class SpecTables:
     num_actions: int = field(default=0)
 
     @staticmethod
-    def build(spec: ActionSpec, device: torch.device | str) -> "SpecTables":
+    def build(spec: ActionSpec, device: torch.device | str) -> SpecTables:
         A = spec.num_actions
         kind = torch.full((4, A), K_INVALID, dtype=torch.long)
         param = torch.zeros((4, A), dtype=torch.long)
@@ -119,8 +132,15 @@ class SpecTables:
         tril = torch.ones(A, A, dtype=torch.bool).tril(-1)
         d = torch.device(device)
         return SpecTables(
-            kind.to(d), param.to(d), concrete.to(d), fold_index.to(d), call_index.to(d), tril.to(d),
-            spec.max_raises, spec.dedupe, A,
+            kind.to(d),
+            param.to(d),
+            concrete.to(d),
+            fold_index.to(d),
+            call_index.to(d),
+            tril.to(d),
+            spec.max_raises,
+            spec.dedupe,
+            A,
         )
 
 
@@ -140,9 +160,15 @@ def raise_targets(
     """
     kind = tab.kind[street]
     param = tab.param[street]
-    pot_raise = max_bet[:, None] + torch.div(param * (pot + to_call)[:, None] + 500, 1000, rounding_mode="floor")
+    pot_raise = max_bet[:, None] + torch.div(
+        param * (pot + to_call)[:, None] + 500, 1000, rounding_mode="floor"
+    )
     mult_raise = torch.div(param * max_bet[:, None] + 500, 1000, rounding_mode="floor")
-    raw = torch.where(kind == K_RAISE_POT, pot_raise, torch.where(kind == K_RAISE_MULT, mult_raise, max_raise_to[:, None]))
+    raw = torch.where(
+        kind == K_RAISE_POT,
+        pot_raise,
+        torch.where(kind == K_RAISE_MULT, mult_raise, max_raise_to[:, None]),
+    )
     return torch.minimum(torch.maximum(raw, min_raise_to[:, None]), max_raise_to[:, None])
 
 
@@ -172,7 +198,11 @@ def legal_mask(
 
 
 def nearest_abstract(
-    tab: SpecTables, street: torch.Tensor, kind: torch.Tensor, amount: torch.Tensor, targets: torch.Tensor
+    tab: SpecTables,
+    street: torch.Tensor,
+    kind: torch.Tensor,
+    amount: torch.Tensor,
+    targets: torch.Tensor,
 ) -> torch.Tensor:
     """Abstract index to record for a concrete action (history tokens only).
 
@@ -184,8 +214,14 @@ def nearest_abstract(
     is_r = (akind == K_RAISE_POT) | (akind == K_RAISE_MULT) | (akind == K_ALLIN)
     dist = torch.where(is_r, (targets - amount[:, None]).abs(), torch.full_like(targets, 2**40))
     r_idx = dist.argmin(1)
-    return torch.where(kind == FOLD, tab.fold_index[street], torch.where(kind == CHECK_CALL, tab.call_index[street], r_idx))
+    return torch.where(
+        kind == FOLD,
+        tab.fold_index[street],
+        torch.where(kind == CHECK_CALL, tab.call_index[street], r_idx),
+    )
 
 
-def spec_from_lists(streets: Sequence[Sequence[AbstractAction]], max_raises: int = 4, dedupe: bool = True) -> ActionSpec:
+def spec_from_lists(
+    streets: Sequence[Sequence[AbstractAction]], max_raises: int = 4, dedupe: bool = True
+) -> ActionSpec:
     return ActionSpec(tuple(tuple(tuple(a) for a in s) for s in streets), max_raises, dedupe)

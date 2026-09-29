@@ -84,7 +84,9 @@ def test_histogram():
     assert (h.max(1).values == 1).all()
     # flop: mean of runout equities approximates Monte Carlo equity
     flop = torch.cat([board[:, :3], torch.full((32, 2), NO_CARD)], 1)
-    h, mean_eq = equity_histogram(hole, flop, n_runouts=200, generator=make_generator(9), return_equity=True)
+    h, mean_eq = equity_histogram(
+        hole, flop, n_runouts=200, generator=make_generator(9), return_equity=True
+    )
     mc = equity_vs_random(hole, flop, n_samples=4000, generator=make_generator(10))
     assert torch.allclose(h.sum(1), torch.ones(32))
     assert (mean_eq - mc).abs().max() < 0.06
