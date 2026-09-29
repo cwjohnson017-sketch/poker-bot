@@ -46,7 +46,7 @@ _REGISTRY: dict[str, Callable[..., Any]] = {}
 LAZY_AGENTS: dict[str, str] = {
     "blueprint": "pokerbot.blueprint.mccfr.agent:BlueprintAgent",
     "neural": "pokerbot.blueprint.deepcfr.agent:NeuralBlueprintAgent",
-    "search": "pokerbot.search.agent:SearchAgent",
+    "search": "pokerbot.search.agent:make_search_agent",
     "uniform": "pokerbot.agents.policy:UniformPolicyAgent",
     "fixed": "pokerbot.agents.policy:FixedPolicyAgent",
 }

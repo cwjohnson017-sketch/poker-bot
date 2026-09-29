@@ -1,0 +1,44 @@
+# Real-time search defaults (pokerbot/search, SearchAgent).
+# Sized for an RTX 4070 Ti; see pokerbot/search/README.md for CPU numbers
+# and tuning. Every key is optional; missing keys use the dataclass defaults.
+
+search:
+  device: auto              # auto | cuda | cpu
+  seed: 0
+  time_budget:              # seconds per decision: tree + rollouts + solve
+    flop: 2.0
+    turn: 1.0
+    river: 1.0
+  min_iterations: 10        # always run at least this many, even over budget
+  remove_own_blockers: true # drop combos holding our cards from the opponent range
+  fallback_on_error: true   # play the blueprint if a solve fails
+
+  tree:
+    actions: default        # default = DEFAULT_SPEC (DESIGN.md 5.3), or 4 lists of actions
+    max_raises: 4
+    depth_streets: 1        # current street + 1 (turn and river solves run to the end)
+    max_nodes: 20000        # budget; sizes are dropped deepest-first above it
+    chance_cards: null      # null = every card at chance nodes; int = subsample
+    min_chance_cards: 4
+
+  solver:
+    algorithm: dcfr         # dcfr | cfr+
+    alpha: 1.5
+    beta: 0.0
+    gamma: 2.0
+    iterations: 1000        # cap; the time budget normally stops earlier
+    max_runouts: 48         # all-in run-outs per board before sampling
+    chunk_rows: 4096
+    dtype: float32
+
+  leaf:                     # depth-limit leaves: Pluribus continuation strategies
+    strategies: [blueprint, fold, call, raise]
+    bias: 5.0
+    rollouts: 2             # per leaf
+    max_total_rollouts: 4000
+    explore: 0.25
+
+  gadget:
+    safe: true              # false = unsafe resolving
+    prior_mix: 0.05
+    rollouts: 256           # blueprint rollouts for terminate values without a cached solve
