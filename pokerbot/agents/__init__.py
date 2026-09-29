@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from .base import Agent, BaseAgent, clamp_raise, current_bet, pot_raise_to
@@ -17,7 +18,7 @@ from .policy import (
 )
 from .registry import available_agents, parse_spec, register
 
-AGENTS: dict[str, type] = {
+AGENTS: dict[str, Callable[..., Any]] = {
     "always_call": AlwaysCallAgent,
     "call": AlwaysCallAgent,
     "always_raise": AlwaysRaiseAgent,

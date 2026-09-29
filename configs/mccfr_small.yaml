@@ -1,0 +1,48 @@
+# Small MCCFR blueprint for smoke runs and tests: 100bb heads-up with a
+# reduced action set and 20 postflop buckets. About a minute on 4 cores.
+#
+#   python scripts/train_mccfr.py --config configs/mccfr_small.yaml
+#   python scripts/play_match.py --a blueprint:runs/mccfr_small/strategy.bin --b equity \
+#       --hands 4000 --duplicate --seed 0
+
+engine: rust
+seed: 0
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]   # 100 big blinds
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+mccfr:
+  iterations: 1500000      # total; one iteration = one traversal per player
+  threads: 4
+  log_interval_seconds: 5
+
+  actions:                 # pot fractions are of the pot after calling
+    max_raises: 3          # per street
+    preflop: [fold, check_call, [raise, 0.75], [raise, 1.0], allin]
+    flop:    [fold, check_call, [raise, 0.5], [raise, 1.0], allin]
+    turn:    [fold, check_call, [raise, 0.75], allin]
+    river:   [fold, check_call, [raise, 0.75], allin]
+
+  cards:
+    buckets: [169, 20, 20, 20]   # preflop 169 = lossless classes
+    hs_samples: 64               # Monte Carlo samples for flop/turn hand strength
+    tables: {preflop: null, flop: null, turn: null, river: null}   # .npy per street
+
+  # Linear CFR (Pluribus-style discounting) and pruning, in iterations.
+  lcfr_discount_every: 20000
+  lcfr_stop: 600000
+  prune_start: 300000
+  prune_prob: 0.95
+  prune_threshold: -300.0  # big blinds
+  regret_floor: -310.0
+  shards: 1024
+
+  checkpoint:
+    path: runs/mccfr_small/checkpoint.bin
+    interval_seconds: 600
+  output:
+    strategy: runs/mccfr_small/strategy.bin

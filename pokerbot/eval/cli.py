@@ -23,7 +23,9 @@ from .match import run_duplicate_match, run_match
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--config", help="YAML match config (see configs/match.yaml)")
-    ap.add_argument("--a", help=f"agent A ({', '.join(sorted(AGENTS))})")
+    ap.add_argument(
+        "--a", help=f"agent A ({', '.join(sorted(AGENTS))}; blueprint:path/to/strategy.bin)"
+    )
     ap.add_argument("--b", help="agent B")
     ap.add_argument("--hands", type=int, help="number of hands (duplicate: total hands)")
     ap.add_argument(
@@ -63,10 +65,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     opts = resolve(args)
     engine = get_engine(opts["engine"])
-    config = game_config(opts["game"], engine)
     params = opts["agent_params"]
-    a = make_agent(opts["a"], **(params.get(opts["a"]) or {}))
-    b = make_agent(opts["b"], **(params.get(opts["b"]) or {}))
+    a = make_agent(opts["a"], **(params.get(opts["a"].partition(":")[0]) or {}))
+    b = make_agent(opts["b"], **(params.get(opts["b"].partition(":")[0]) or {}))
+    # A blueprint agent knows the game it was trained for; use it when the
+    # match config does not name one.
+    game = opts["game"] or getattr(a, "default_game", None) or getattr(b, "default_game", None)
+    config = game_config(game, engine)
     if a.name == b.name:
         a.name, b.name = a.name + "_A", b.name + "_B"
     info = run_info(args.config, engine)

@@ -11,11 +11,11 @@ use crate::game::{
     Action, ActionKind, Chips, GameConfig, GameError, GameState, LegalActions, CHECK_CALL, FOLD, MAX_PLAYERS, RAISE,
 };
 
-fn game_err(e: GameError) -> PyErr {
+pub(crate) fn game_err(e: GameError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
-fn to_cards(v: &[i64]) -> PyResult<Vec<Card>> {
+pub(crate) fn to_cards(v: &[i64]) -> PyResult<Vec<Card>> {
     let mut out = Vec::with_capacity(v.len());
     for &c in v {
         if !(0..52).contains(&c) {
@@ -118,7 +118,7 @@ fn card_to_str(card: i64) -> PyResult<String> {
 /// Table configuration.
 #[pyclass(name = "GameConfig", module = "poker_engine", get_all, set_all, eq, skip_from_py_object)]
 #[derive(Clone, PartialEq)]
-struct PyGameConfig {
+pub(crate) struct PyGameConfig {
     num_players: usize,
     stacks: Vec<Chips>,
     small_blind: Chips,
@@ -127,7 +127,17 @@ struct PyGameConfig {
 }
 
 impl PyGameConfig {
-    fn to_rust(&self) -> GameConfig {
+    pub(crate) fn from_rust(c: &GameConfig) -> PyGameConfig {
+        PyGameConfig {
+            num_players: c.num_players,
+            stacks: c.stacks.clone(),
+            small_blind: c.small_blind,
+            big_blind: c.big_blind,
+            ante: c.ante,
+        }
+    }
+
+    pub(crate) fn to_rust(&self) -> GameConfig {
         GameConfig {
             num_players: self.num_players,
             stacks: self.stacks.clone(),
@@ -185,8 +195,8 @@ impl PyGameConfig {
 /// A concrete action. `amount` is the raise-to total for RAISE, else 0.
 #[pyclass(name = "Action", module = "poker_engine", frozen, eq, hash, skip_from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct PyAction {
-    inner: Action,
+pub(crate) struct PyAction {
+    pub(crate) inner: Action,
 }
 
 #[pymethods]
@@ -318,8 +328,8 @@ fn py_bool(b: bool) -> &'static str {
 /// State of one hand. Mutated by `apply`; `child` and `clone` copy.
 #[pyclass(name = "GameState", module = "poker_engine", skip_from_py_object)]
 #[derive(Clone)]
-struct PyGameState {
-    inner: GameState,
+pub(crate) struct PyGameState {
+    pub(crate) inner: GameState,
 }
 
 #[pymethods]
@@ -527,5 +537,6 @@ fn poker_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MAX_PLAYERS", MAX_PLAYERS)?;
     m.add("HAND_CATEGORY_NAMES", eval::CATEGORY_NAMES.to_vec())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    crate::python_mccfr::register(m)?;
     Ok(())
 }
