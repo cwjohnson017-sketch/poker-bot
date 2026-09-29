@@ -13,7 +13,8 @@ from Python:
 | `engine/src/python_mccfr.rs` | PyO3 bindings (`poker_engine.Trainer`, `ActionAbstraction`, `CardAbstraction`, `BlueprintStrategy`, helpers). |
 | `engine/examples/mccfr_bench.rs` | Throughput and betting-tree size benchmark. |
 | `train.py` | YAML config -> trainer config, training loop with logs, checkpoint, export. Entry point `scripts/train_mccfr.py`. |
-| `agent.py` | `BlueprintAgent` (the `Agent` protocol) playing an exported strategy. |
+| `agent.py` | `BlueprintAgent` (the `Agent` and `PolicyAgent` protocols) playing an exported strategy. |
+| `policy.py` | `TabularPolicy`: stateless, batched strategy queries (history replay cache, per-board bucket cache, one lookup per distinct bucket). |
 | `export.py` | Pure-numpy reader of strategy files; key encode/decode. |
 | `br.py` | Best response in the abstract game over sampled deals (an exploitability proxy for small games). |
 | `interfaces.py` | Action-spec normalization, the card-abstraction protocol, `write_bucket_table`. |
@@ -224,6 +225,18 @@ real pot. Missing infosets play uniformly. When the abstract game stops
 tracking the hand, the agent checks or calls; `agent.counters` counts these
 fallbacks. That happens when the opponent re-raises past the raise cap, or
 when a large bet was mapped to an all-in that the real game did not have.
+
+The agent is also a `PolicyAgent` (for LBR and ABR): `agent.spec` is the
+training action list as an `ActionSpec`, and `policy(state, seat)` /
+`policy_batch(state, seat, holes)` return the blueprint's probabilities from
+the public state alone (`TabularPolicy`). That replay translates every
+action, the queried player's own included, with `u = 0.5`, so after an
+off-tree size it can differ from what `act` with the randomized mapping
+plays. The batched path buckets all 1326 combos of a board with one
+`CardAbstraction.buckets_batch` call (built from the strategy's card config,
+cached per board) and looks up each distinct bucket once. Mass on abstract
+actions that are illegal at the real stacks goes to check/call, as in `act`.
+The same class backs `search:blueprint:<path>` (`pokerbot/search/adapters.py`).
 
 ## Tests
 

@@ -244,11 +244,17 @@ class SearchAgent(BaseAgent):
 
 
 def make_search_agent(blueprint_spec: str = "uniform", **kwargs: Any) -> SearchAgent:
-    """Factory behind ``search:<blueprint spec>`` in the match runner.
+    """Factory behind ``search:<blueprint spec>`` in the match runner:
+    ``search:uniform``, ``search:blueprint:<strategy file>`` (tabular MCCFR),
+    ``search:neural:<checkpoint dir>`` (Deep CFR), or a registered prefix.
 
-    ``kwargs`` may hold ``config`` (a YAML path or mapping) and overrides of
-    the ``search:`` section (``time_budget``, ``tree``, ``solver``, ...).
+    ``kwargs`` may hold ``config`` (a YAML path or mapping), ``blueprint``
+    (keyword arguments for the blueprint factory, e.g. ``{last_n: 8}`` for a
+    neural blueprint) and overrides of the ``search:`` section
+    (``time_budget``, ``tree``, ``solver``, ...).
     """
     config = kwargs.pop("config", None)
+    bp_kwargs = dict(kwargs.pop("blueprint", None) or {})
     name = kwargs.pop("name", None) or f"search:{blueprint_spec or 'uniform'}"
-    return SearchAgent(make_blueprint(blueprint_spec or "uniform"), config, name=name, **kwargs)
+    bp = make_blueprint(blueprint_spec or "uniform", **bp_kwargs)
+    return SearchAgent(bp, config, name=name, **kwargs)

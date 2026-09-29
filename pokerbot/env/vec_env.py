@@ -414,7 +414,18 @@ class VecNLHE:
         kind = torch.where(legal, kind, torch.full_like(kind, CHECK_CALL))
         amount = torch.where(kind == RAISE, amount, torch.zeros_like(amount))
         targets = self._targets(info)
-        a_idx = act_mod.nearest_abstract(self.tab, info.street, kind, amount, targets)
+        # the history token ``step`` would record for the equivalent abstract
+        # action (an all-in records the ``allin`` token, never a masked sized
+        # raise that clamps to the same amount)
+        a_idx = act_mod.nearest_abstract(
+            self.tab,
+            info.street,
+            kind,
+            amount,
+            targets,
+            legal=self._mask(info, targets),
+            max_raise_to=info.max_raise_to,
+        )
         self._apply(kind, amount, a_idx, info)
         return self.payoffs.clone(), self.done.clone()
 

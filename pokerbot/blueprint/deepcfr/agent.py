@@ -9,6 +9,13 @@ sizing rule. Opponent actions off the abstraction are mapped to the nearest
 legal abstract size when the history is encoded.
 
 Registered in the agent factory as ``neural:<checkpoint dir>``.
+
+The agent is also a :class:`~pokerbot.agents.policy.PolicyAgent`:
+``policy(state, seat)`` and ``policy_batch(state, seat, holes)`` return the
+same average policy as a function of the public state and a hand (own reach
+recomputed from the history, :class:`~.range_policy.NeuralRangePolicy`), and
+``vec_policy(device)`` returns a :class:`~.vec_policy.NeuralVecPolicy` that
+acts on a ``VecNLHE`` batch directly (for the approximate best response).
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from .checkpoint import read_meta
 from .config import spec_from_dict
 from .features import FeatureConfig
 from .policy import SDCFRPolicy
+from .range_policy import NeuralRangePolicy
 from .scalar import ScalarSpec, encode_state
 
 
@@ -51,6 +59,7 @@ class NeuralBlueprintAgent(BaseAgent):
         self.trained_game: dict[str, Any] | None = None
         self._warned = False
         self.last_probs: np.ndarray | None = None
+        self.range_policy = NeuralRangePolicy(policies, spec, self.features, self.sp)
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, **kwargs: Any) -> NeuralBlueprintAgent:
@@ -100,6 +109,35 @@ class NeuralBlueprintAgent(BaseAgent):
                     stacklevel=2,
                 )
                 self._warned = True
+
+    # -- PolicyAgent ----------------------------------------------------------
+
+    def _query_config(self, state: Any) -> Any:
+        cfg = getattr(state, "config", None)
+        return cfg if cfg is not None else self.config
+
+    def policy(self, state: Any, seat: int) -> np.ndarray:
+        """``[A]`` average policy over ``self.spec`` for ``seat`` holding
+        ``state.hole_cards(seat)`` (stateless: own reach from the history)."""
+        return self.range_policy.probs(state, seat, self._query_config(state))
+
+    def policy_batch(self, state: Any, seat: int, holes: Any) -> np.ndarray:
+        """``[K, A]`` average policy for ``K`` hypothetical hole-card pairs."""
+        return self.range_policy.probs_batch(state, seat, holes, self._query_config(state))
+
+    def policy_all(self, state: Any, seat: int) -> torch.Tensor:
+        """``[1326, A]`` for every combo (canonical order), zero rows for
+        combos that share a card with the board."""
+        return self.range_policy.probs_all(state, seat, self._query_config(state))
+
+    def vec_policy(self, device: torch.device | str = "cpu", seed: int = 0) -> Any:
+        """A ``VecPolicy`` (see :mod:`pokerbot.eval.abr`) playing this blueprint
+        on a ``VecNLHE`` built with ``spec=self.spec``."""
+        from .vec_policy import NeuralVecPolicy
+
+        return NeuralVecPolicy(
+            self.policies, self.spec, self.features, device, seed, self.greedy, self.name
+        )
 
     def act(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
         config = self.config if self.config is not None else state.config

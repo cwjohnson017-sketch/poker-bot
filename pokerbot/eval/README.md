@@ -130,7 +130,10 @@ the hand `state.hole_cards(seat)`. It can optionally implement
 call per decision instead of up to 1,326. Agents that only `act` are wrapped
 by `SampledPolicyAgent`, which calls `act` `--samples` times per hand and
 query and warns once. This is slow and noisy, so use it for small checks
-only. `AlwaysCallAgent` gets its exact policy automatically.
+only. `AlwaysCallAgent` gets its exact policy automatically. Both trained
+blueprints (`blueprint:<strategy file>`, `neural:<run dir>`) implement
+`policy` and `policy_batch` directly, over their own action spec, which LBR
+then uses for its own raise candidates too.
 
 **Outputs.** LBR's win rate in mbb/h with a CI, all-in adjusted and raw. When
 all the money went in before the river, the realized result is replaced by
@@ -179,8 +182,10 @@ evaluated on the same deals (common random numbers). The report gives mbb/h
 abstract actions. Only the `mask` slots, where the opponent is to act, are
 used. `uniform` and `call` are vectorized. Any other spec is built through
 the registry and used via the agent's `vec_policy(device)` method when it
-has one. Neural blueprints should provide that method, running the network
-on `env.obs()`. Otherwise the agent runs through `ScalarVecPolicy`, which
+has one. `neural:<run dir>` provides it (`NeuralVecPolicy`, the SD-CFR
+average on `env.obs()` with per-slot reach tracking). The envs use the
+opponent's `spec` when it has one, so the learner plays in the blueprint's
+action abstraction. Otherwise the agent runs through `ScalarVecPolicy`, which
 rebuilds each slot as a scalar `GameState` and calls `policy()` one slot at
 a time. That path is for tests and small checks, not for the 4070 Ti config.
 

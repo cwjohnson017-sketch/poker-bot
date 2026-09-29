@@ -13,7 +13,9 @@ engines by `NeuralBlueprintAgent`.
 | `trainer.py` | `DeepCFRTrainer`: the CFR loop, checkpoints, resume, logging, evaluation hook |
 | `policy.py` | `SDCFRPolicy`: reach- and iteration-weighted average of the advantage nets |
 | `scalar.py` | one-hand mirror of the env's action mapping and observation encoder, for `GameState`s |
-| `agent.py` | `NeuralBlueprintAgent` (`neural:<run dir>` in `scripts/play_match.py`) |
+| `agent.py` | `NeuralBlueprintAgent` (`neural:<run dir>` in `scripts/play_match.py`); also a `PolicyAgent` (`policy`, `policy_batch`, `policy_all`) with `vec_policy(device)` |
+| `range_policy.py` | `NeuralRangePolicy`: the SD-CFR average as a function of the public state and a hand, batched over all 1326 combos (own reach recomputed from the history) |
+| `vec_policy.py` | `NeuralVecPolicy`: the average policy acting on a `VecNLHE` batch from `env.obs()` (ABR opponent) |
 | `checkpoint.py` | checkpoint layout, `save_net` / `load_net` / `list_checkpoints` |
 | `config.py` | `DeepCFRConfig` (YAML) |
 
@@ -226,10 +228,15 @@ iteration, or 1.8 s for the first iteration including warm-up.
   config. The agent warns when it plays a different one.
 - **Off-tree opponent bets** are mapped to the nearest *legal* abstract size.
   The rule is the one `nearest_abstract` uses: closest amount, first on ties.
-  It is not the pseudo-harmonic mapping. On the tree this gives exactly the
-  index `VecNLHE.step` records. `VecNLHE.step_concrete` can record a masked
-  sized-raise index for an all-in that a sized raise clamps to. Training only
-  uses `step`, so this does not affect training.
+  It is not the pseudo-harmonic mapping. A raise to exactly the all-in is
+  the `allin` index. This is the index `VecNLHE.step_concrete` records, and on
+  the tree exactly the index `VecNLHE.step` records.
+- **Stateless queries.** `policy(state, seat)` and the batched paths
+  recompute the own-reach weights from the history (one forward pass per net
+  per earlier own decision, cached per history prefix in the batched path),
+  so a query costs more than the agent's own incremental tracking. The
+  `NeuralVecPolicy` tracks reach per slot and resets it when a slot's deck
+  changes; it requires the env to use the blueprint's action spec.
 - **The frontier budget is spent in slot order**, so hands later in a batch
   are cut first when the cap binds. Regrets stay unbiased, but deep nodes of
   those hands are under-sampled.

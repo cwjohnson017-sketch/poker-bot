@@ -26,10 +26,11 @@ support the read-only part of the ``GameState`` contract (``board``,
 ``hole_cards``, ``history``, ``street``, ``pot``, ``street_bets``,
 ``stacks``, ``legal_actions()``, ``public_key()``, ``infoset_key()``, ...).
 
-Adapting the real blueprints: wrap the tabular MCCFR ``BlueprintAgent`` or
-the ``NeuralBlueprintAgent`` in a class exposing ``spec`` and ``policy`` (and
-ideally a vectorised ``policy_combos``), then register a factory with
-:func:`register_blueprint` so ``search:<prefix>:<path>`` works from the
+The real blueprints are adapted in :mod:`pokerbot.search.adapters`
+(``TabularBlueprint``, ``NeuralBlueprint``, both with a vectorised
+``policy_combos``) and registered here as ``search:blueprint:<strategy file>``
+and ``search:neural:<checkpoint dir>``. Other blueprints: register a factory
+with :func:`register_blueprint` so ``search:<prefix>:<path>`` works from the
 match runner.
 """
 
@@ -207,27 +208,45 @@ def range_reach(
 
 # -- registry for ``search:<blueprint spec>`` -------------------------------
 
-BlueprintFactory = Callable[[str], Any]
+BlueprintFactory = Callable[..., Any]
+
+
+def _tabular(arg: str, **kwargs: Any) -> Any:
+    from .adapters import tabular_blueprint
+
+    return tabular_blueprint(arg, **kwargs)
+
+
+def _neural(arg: str, **kwargs: Any) -> Any:
+    from .adapters import neural_blueprint
+
+    return neural_blueprint(arg, **kwargs)
+
+
 BLUEPRINTS: dict[str, BlueprintFactory] = {
-    "uniform": lambda arg: UniformBlueprint(),
+    "uniform": lambda arg, **kw: UniformBlueprint(),
+    "blueprint": _tabular,  # search:blueprint:<strategy.bin>
+    "neural": _neural,  # search:neural:<checkpoint dir>
 }
 
 
 def register_blueprint(prefix: str, factory: BlueprintFactory) -> None:
-    """Make ``search:<prefix>[:<arg>]`` build its blueprint with ``factory(arg)``."""
+    """Make ``search:<prefix>[:<arg>]`` build its blueprint with
+    ``factory(arg, **blueprint_kwargs)``."""
     BLUEPRINTS[prefix] = factory
 
 
-def make_blueprint(spec: str) -> Any:
+def make_blueprint(spec: str, **kwargs: Any) -> Any:
     """Build a blueprint from a spec string: ``uniform``, ``<prefix>:<arg>`` for
-    a registered prefix, or any agent name whose agent exposes ``policy``
-    (and ``spec``) or a ``blueprint`` attribute that does."""
+    a registered prefix (``blueprint:<strategy file>``, ``neural:<checkpoint
+    dir>``), or any agent name whose agent exposes ``policy`` (and ``spec``)
+    or a ``blueprint`` attribute that does. ``kwargs`` go to the factory."""
     prefix, _, arg = spec.partition(":")
     if prefix in BLUEPRINTS:
-        return BLUEPRINTS[prefix](arg)
+        return BLUEPRINTS[prefix](arg, **kwargs)
     from ..agents import make_agent
 
-    agent = make_agent(spec)
+    agent = make_agent(spec, **kwargs)
     for obj in (agent, getattr(agent, "blueprint", None)):
         if obj is not None and callable(getattr(obj, "policy", None)):
             if not hasattr(obj, "spec"):
