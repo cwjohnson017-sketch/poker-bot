@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+train = [
+    "tensorboard>=2.14",  # Deep CFR training logs (optional: CSV logging works without it)
+]
 dev = [
     "pytest>=8.0",
     "hypothesis>=6.100",

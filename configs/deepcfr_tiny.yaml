@@ -1,0 +1,72 @@
+# Deep CFR smoke test on the CPU: runs one iteration in a few seconds.
+#   python scripts/train_deepcfr.py --config configs/deepcfr_tiny.yaml
+# Short stacks and a reduced action set keep the traversal trees tiny.
+
+seed: 0
+device: cpu
+threads: 1                 # tiny tensors: more threads only add overhead
+iterations: 2
+out_dir: runs/deepcfr_tiny
+
+game:
+  stacks: [2000, 2000]     # 20bb
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+actions:                   # per street: preflop, flop, turn, river
+  max_raises: 2
+  dedupe: true
+  streets:
+    - [[fold], [check_call], [raise_x, 3.0], [allin]]
+    - [[fold], [check_call], [raise, 0.75], [allin]]
+    - [[fold], [check_call], [raise, 1.0], [allin]]
+    - [[fold], [check_call], [raise, 1.0], [allin]]
+
+features:                  # equity inputs off: fastest traversal
+  equity_samples: 0
+  hist_runouts: 0
+
+network:                   # ~40k parameters
+  card_dim: 16
+  card_hidden: 32
+  hist_type: gru
+  hist_dim: 16
+  hist_hidden: 32
+  width: 64
+
+traversal:
+  traversals_per_iter: 128
+  roots_per_batch: 64
+  max_frontier_nodes: 4096
+  max_depth: 64
+  max_steps: 64
+  record_strategy: false
+  infer_chunk: 4096
+
+memory:
+  capacity: 20000
+  save_every: 1
+
+training:
+  sgd_steps: 30
+  batch_size: 256
+  lr: 0.001
+  grad_clip: 1.0
+  reinit: true
+  bf16: true               # ignored on the CPU
+  prefetch: 0
+  checkpoint_dtype: float32
+
+eval:
+  every: 2
+  deals: 10
+  last_n: 4
+  engine: auto
+  equity:
+    samples: 50
+
+logging:
+  tensorboard: true
+  csv: true
+  print: true

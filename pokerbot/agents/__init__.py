@@ -22,6 +22,10 @@ AGENTS: dict[str, type] = {
 
 def make_agent(name: str, **kwargs: Any) -> Agent:
     """Instantiate an agent by registry name (``always_call``, ``equity``, ...)."""
+    if name.startswith("neural:"):  # neural:<Deep CFR run or checkpoint dir>
+        from ..blueprint.deepcfr.agent import NeuralBlueprintAgent
+
+        return NeuralBlueprintAgent.from_dir(name.split(":", 1)[1], **kwargs)
     try:
         cls = AGENTS[name]
     except KeyError:
