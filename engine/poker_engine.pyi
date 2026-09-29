@@ -1,6 +1,6 @@
 """Type stubs for the `poker_engine` extension module (see engine/README.md)."""
 
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -29,8 +29,8 @@ class GameConfig:
     ante: int
     def __init__(
         self,
-        num_players: Optional[int] = None,
-        stacks: Optional[Sequence[int]] = None,
+        num_players: int | None = None,
+        stacks: Sequence[int] | None = None,
         small_blind: int = 50,
         big_blind: int = 100,
         ante: int = 0,

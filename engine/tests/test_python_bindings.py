@@ -10,9 +10,8 @@ import pickle
 from collections import Counter
 
 import numpy as np
-import pytest
-
 import poker_engine as pe
+import pytest
 from poker_engine import CHECK_CALL, FOLD, RAISE, Action, GameConfig, GameState
 
 # ---------------------------------------------------------------------------
@@ -171,7 +170,13 @@ def test_action_constructors():
 
 def test_config():
     c = GameConfig()
-    assert (c.num_players, c.stacks, c.small_blind, c.big_blind, c.ante) == (2, [20000, 20000], 50, 100, 0)
+    assert (c.num_players, c.stacks, c.small_blind, c.big_blind, c.ante) == (
+        2,
+        [20000, 20000],
+        50,
+        100,
+        0,
+    )
     c6 = GameConfig(num_players=6, stacks=[1000] * 6, small_blind=5, big_blind=10, ante=1)
     assert c6.num_players == 6
     assert GameConfig(stacks=[100, 200, 300]).num_players == 3
@@ -279,8 +284,16 @@ def random_action(s, rng):
 
 def candidate_actions(la, rng):
     out = [Action.fold(), Action.check_call()]
-    for x in {la.min_raise_to - 1, la.min_raise_to, la.min_raise_to + 1, la.max_raise_to - 1, la.max_raise_to,
-              la.max_raise_to + 1, 1, int(rng.integers(1, 2 * max(la.max_raise_to, 1) + 2))}:
+    for x in {
+        la.min_raise_to - 1,
+        la.min_raise_to,
+        la.min_raise_to + 1,
+        la.max_raise_to - 1,
+        la.max_raise_to,
+        la.max_raise_to + 1,
+        1,
+        int(rng.integers(1, 2 * max(la.max_raise_to, 1) + 2)),
+    }:
         if x > 0:
             out.append(Action.raise_to(x))
     return out
@@ -301,7 +314,10 @@ def random_config(rng):
     bb = int(rng.choice([2, 10, 100]))
     sb = int(rng.choice([bb // 2, bb, max(1, bb // 3)]))
     ante = int(rng.integers(1, bb + 1)) if rng.random() < 0.25 else 0
-    stacks = [int(rng.choice([rng.integers(1, 3 * bb + 1), 200 * bb, rng.integers(1, 100 * bb + 1)])) for _ in range(n)]
+    stacks = [
+        int(rng.choice([rng.integers(1, 3 * bb + 1), 200 * bb, rng.integers(1, 100 * bb + 1)]))
+        for _ in range(n)
+    ]
     return GameConfig(num_players=n, stacks=stacks, small_blind=sb, big_blind=bb, ante=ante)
 
 
@@ -382,7 +398,9 @@ def test_determinism_given_same_deck():
         assert s1.history == s2.history
         assert s1.public_key() == s2.public_key()
         assert s1.payoffs() == s2.payoffs()
-        assert s1.board == s2.board == deck[2 * cfg.num_players : 2 * cfg.num_players + len(s1.board)]
+        assert (
+            s1.board == s2.board == deck[2 * cfg.num_players : 2 * cfg.num_players + len(s1.board)]
+        )
         # Replaying the recorded actions on a fresh state gives the same result.
         s3 = GameState.new_hand(cfg, button, deck)
         for a in a1:
