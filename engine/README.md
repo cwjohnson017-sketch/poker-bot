@@ -99,6 +99,25 @@ tabular MCCFR solver:
 - `sim::Rng` (xoshiro256**), `shuffled_deck`, `random_action`,
   `play_random_hand`.
 
+## Solver and abstractions
+
+The tabular MCCFR blueprint (DESIGN.md 5.4) lives in the crate; see
+`pokerbot/blueprint/mccfr/README.md` for the algorithm, key layout and file
+formats. Python API:
+
+| Name | Purpose |
+|---|---|
+| `ActionAbstraction(streets=None, max_raises=4)` | Per-street abstract actions (`"fold"`, `"check_call"`, `("raise", pot_fraction)`, `"allin"`; default = DESIGN.md table). `legal(state)` -> `[(abstract_index, Action)]`, `to_concrete(state, index)`, `translate(abs_state, real_state, action, u)` (pseudo-harmonic), `sequence(state)`, `count_tree(config)`, `pot_fraction(state, raise_to)` |
+| `CardAbstraction(buckets, hs_samples, tables)` | `bucket(street, hole, board)`, `buckets_batch(street, uint8[N, 2+board])`, `num_buckets(street)` |
+| `canonical_index`, `canonical_index_batch`, `canonical_unindex`, `canonical_size`, `preflop_class` | Suit-isomorphic hand indexing (169 / 1,286,792 / 13,960,050 / 123,156,254 classes) |
+| `pseudo_harmonic(a, b, x)`, `hand_strength(hole, board, samples, seed)` | Mapping probability; equity vs a random hand |
+| `Trainer(config)` | `run(iterations, threads)`, `stats(detailed)`, `save` / `Trainer.load`, `export_strategy`, `strategy(state, player)`, `infoset_key`, `lookup`, `entries` |
+| `BlueprintStrategy(path)` | Exported strategy: `action_probs(abs_state, hole, board)`, `lookup(key)`, `game_config`, `action_abstraction()` |
+| `make_infoset_key`, `decode_infoset_key`, `action_from(kind, amount)` | Helpers |
+
+`cargo run --release --example mccfr_bench -- 4 20 100 50` prints the
+abstract betting-tree size and traversal throughput.
+
 ## Rules and conventions
 
 Where the contract leaves a choice open, the engine uses the standard
@@ -226,9 +245,15 @@ engine/
   src/eval.rs       evaluator + naive reference
   src/game.rs       rules: config, actions, state, pots, keys
   src/sim.rs        RNG and random play
+  src/isomorphism.rs  suit-isomorphic canonical hand index
+  src/abstraction.rs  action abstraction, pseudo-harmonic mapping, card buckets
+  src/mccfr.rs      tabular MCCFR solver, checkpoints, strategy files
+  src/npy.rs        minimal .npy reader for bucket tables
   src/python.rs     PyO3 bindings (feature "python")
+  src/python_mccfr.rs  PyO3 bindings for the solver and abstractions
   tests/evaluator.rs            evaluator vs naive, category distributions
   tests/scenarios.rs            hand-written betting scenarios + random invariants
   tests/test_python_bindings.py pytest suite for the bindings
   examples/throughput.rs        speed measurements
+  examples/mccfr_bench.rs       MCCFR traversal throughput, betting-tree sizes
 ```

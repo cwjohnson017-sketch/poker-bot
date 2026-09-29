@@ -1,0 +1,71 @@
+# The real Phase 1 blueprint: heads-up no-limit, 100 big blinds, the action
+# abstraction of DESIGN.md section 5.3, 169 / 1000 / 1000 / 1000 buckets.
+#
+#   python scripts/train_mccfr.py --config configs/mccfr_hunl.yaml --threads 16
+#   python scripts/train_mccfr.py --config configs/mccfr_hunl.yaml --threads 16 \
+#       --resume runs/mccfr_hunl/checkpoint.bin        # continue after a stop
+#
+# Size. The abstract betting tree at 100bb has 92 / 2,568 / 15,024 / 55,364
+# decision nodes (preflop / flop / turn / river), so the tables hold at most
+# 92 * 169 + 72,956 * 1000 ~= 73M infosets. Measured at ~75 bytes per infoset
+# (key, hash-map slot, f32 regrets and strategy sums), plus up to 2x transient
+# growth slack and ~280 MB of lazily filled bucket caches: expect 6-10 GB of
+# RAM for training, ~2.5 GB extra while exporting, and a ~2 GB strategy file.
+# 32 GB leaves room to raise the postflop buckets to ~2,500.
+#
+# Time. On the 4-core development container the solver ran ~4M nodes/s
+# (~15-25k iterations/s) with 50 buckets and 1-2M nodes/s with 1000 buckets
+# while the tables were still growing (another workload was running). Scale
+# roughly linearly with cores: on 16 cores expect ~5-8M nodes/s, i.e. ~25-40k
+# iterations/s, so 3B iterations take ~1-1.5 days. The strategy is usable
+# (clearly beats the rule baselines) much earlier; check it with
+#   python scripts/play_match.py --a blueprint:runs/mccfr_hunl/strategy.bin \
+#       --b equity --hands 20000 --duplicate
+
+engine: rust
+seed: 0
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]   # 100 big blinds
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+mccfr:
+  iterations: 3000000000   # total; one iteration = one traversal per player
+  threads: 16
+  log_interval_seconds: 60
+
+  actions:                 # DESIGN.md 5.3; pot fractions are of the pot after calling
+    max_raises: 4          # per street
+    # 2.5x open / 3x 3-bet are 0.75 / 1.0 pot heads-up preflop.
+    preflop: [fold, check_call, [raise, 0.75], [raise, 1.0], allin]
+    flop:    [fold, check_call, [raise, 0.33], [raise, 0.75], [raise, 1.5], allin]
+    turn:    [fold, check_call, [raise, 0.5], [raise, 1.0], allin]
+    river:   [fold, check_call, [raise, 0.5], [raise, 1.0], [raise, 2.0], allin]
+
+  cards:
+    buckets: [169, 1000, 1000, 1000]
+    hs_samples: 256        # Monte Carlo samples for the default flop/turn hand strength
+    # Per-street .npy tables indexed by poker_engine.canonical_index (from the
+    # abstraction package's equity-histogram k-means) replace the default
+    # hand-strength buckets when set.
+    tables: {preflop: null, flop: null, turn: null, river: null}
+
+  # Pluribus schedule scaled to iterations (~25M iterations = 10 minutes on 16
+  # cores): Linear CFR discounting every "10 minutes" for the first "400",
+  # pruning after "200".
+  lcfr_discount_every: 25000000
+  lcfr_stop: 1000000000
+  prune_start: 500000000
+  prune_prob: 0.95
+  prune_threshold: -300.0  # big blinds
+  regret_floor: -310.0
+  shards: 16384
+
+  checkpoint:
+    path: runs/mccfr_hunl/checkpoint.bin
+    interval_seconds: 3600
+  output:
+    strategy: runs/mccfr_hunl/strategy.bin

@@ -28,9 +28,10 @@ implementations:
 | `pokerbot/engine_select.py` | `get_engine()` returns `poker_engine` when it is built and `pokerbot.reference` otherwise. `POKERBOT_ENGINE=reference\|rust\|auto` overrides the choice. |
 | `pokerbot/agents/` | The `Agent` protocol and the baselines `AlwaysCallAgent`, `AlwaysRaiseAgent`, `RandomAgent`, `EquityThresholdAgent` and `HumanCLIAgent`. |
 | `pokerbot/eval/` | `play_hand`, `run_match` and `run_duplicate_match`, the hole-card masking wrapper, mbb/h with a bootstrap CI (`stats.py`), and hand-history export (`history.py`). |
+| `pokerbot/blueprint/mccfr/` | Tabular MCCFR blueprint: training driver, `BlueprintAgent`, strategy files. The solver is Rust (`engine/src/mccfr.rs`). See [`pokerbot/blueprint/mccfr/README.md`](pokerbot/blueprint/mccfr/README.md). |
 | `pokerbot/protocol/` | ACPC-style line protocol over TCP: the message codec, a match server, and a client. |
 | `configs/` | YAML run configs. See [`configs/README.md`](configs/README.md). |
-| `scripts/` | Entry points: `play_match.py`, `serve_match.py`, `play_client.py`. |
+| `scripts/` | Entry points: `play_match.py`, `serve_match.py`, `play_client.py`, `train_mccfr.py`. |
 | `tests/` | CPU pytest suite. |
 
 ## Setup
@@ -77,9 +78,10 @@ python scripts/play_match.py --a always_call --b equity --hands 2000 --duplicate
 python scripts/play_match.py --config configs/match.yaml --history hands.txt
 ```
 
-The available agents are `always_call`, `always_raise`, `random`, `equity`
-and `human`. A duplicate match plays every deal twice with the same cards,
-once from each seat. Results are in milli-big-blinds per hand. The confidence
+The available agents are `always_call`, `always_raise`, `random`, `equity`,
+`human` and `blueprint:path/to/strategy.bin` (an MCCFR blueprint trained with
+`scripts/train_mccfr.py`; needs the Rust engine). A duplicate match plays
+every deal twice with the same cards, once from each seat. Results are in milli-big-blinds per hand. The confidence
 interval comes from bootstrapping over deals.
 
 To play against a bot yourself over the socket protocol:

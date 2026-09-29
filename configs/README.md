@@ -26,3 +26,5 @@ results lives only on the command line or in someone's shell history.
 | File | Used by | What |
 |---|---|---|
 | `match.yaml` | `scripts/play_match.py --config configs/match.yaml` | Duplicate match between two agents, with per-agent constructor arguments under `agents:`. |
+| `mccfr_small.yaml` | `scripts/train_mccfr.py --config configs/mccfr_small.yaml` | Small MCCFR blueprint (100bb, reduced actions, 20 postflop buckets); about a minute on 4 cores. Smoke runs and tests. |
+| `mccfr_hunl.yaml` | `scripts/train_mccfr.py --config configs/mccfr_hunl.yaml` | The Phase 1 blueprint: 100bb, DESIGN.md action table, 169/1000/1000/1000 buckets; 6-10 GB RAM, 1-1.5 days on 16 cores. |
