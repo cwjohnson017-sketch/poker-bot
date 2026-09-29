@@ -12,6 +12,11 @@ hypothetical hand. :class:`NeuralRangePolicy` recomputes it:
   (:func:`~.scalar.encode_state`), repeats the row and writes each hand's
   two cards into ``cards[:, :2]``. Optional equity features are recomputed
   for the batch (Monte Carlo, with a fixed seed per call).
+* **Off-tree opponent raises.** With ``offtree="harmonic"`` the history
+  encoding maps them with the deterministic pseudo-harmonic split
+  (``u = 0.5``, :func:`~.scalar.harmonic_abstract`), so the encoding stays a
+  function of the public state and the per-prefix cache stays valid; with
+  ``"nearest"`` it records the nearest legal size (the env's rule).
 * **Own reach.** With ``reach_weighted`` the SD-CFR average weights net
   ``t`` by ``t`` times the hand's own reach under net ``t``: the product,
   over the player's earlier decisions in the history, of that net's
@@ -24,7 +29,9 @@ hypothetical hand. :class:`NeuralRangePolicy` recomputes it:
 The single-hand path, :meth:`NeuralRangePolicy.probs`, encodes the actual
 state (and each earlier decision) exactly as
 :class:`~.agent.NeuralBlueprintAgent` does when it acts, so the two paths check
-each other and :meth:`probs` equals the agent's own distribution.
+each other and :meth:`probs` equals the agent's own distribution (with
+``offtree="harmonic"``, whenever the agent's randomized mapping of each
+off-tree opponent raise fell on the ``u = 0.5`` side).
 """
 
 from __future__ import annotations
@@ -42,7 +49,14 @@ from ...env.actions import ActionSpec
 from ...env.obs import NUM_SCALARS
 from .features import FeatureConfig
 from .policy import SDCFRPolicy
-from .scalar import ScalarSpec, encode_state, engine_config, engine_for, nearest_abstract
+from .scalar import (
+    ScalarSpec,
+    check_offtree,
+    encode_state,
+    engine_config,
+    engine_for,
+    nearest_abstract,
+)
 
 RAISE = 2
 BOARD_LEN = (0, 3, 4, 5)
@@ -72,12 +86,14 @@ class NeuralRangePolicy:
         sp: ScalarSpec | None = None,
         seed: int = 0,
         cache_bytes: float = 64e6,
+        offtree: str = "harmonic",
     ) -> None:
         self.policies = list(policies)
         self.spec = spec
         self.sp = sp or ScalarSpec.build(spec)
         self.features = features or FeatureConfig()
         self.seed = int(seed)
+        self.offtree = check_offtree(offtree)
         T = max(len(p) for p in self.policies)
         self.cache_entries = max(8, int(cache_bytes // (T * NUM_COMBOS * 8)))
         self._reach: OrderedDict[tuple, torch.Tensor] = OrderedDict()
@@ -100,6 +116,7 @@ class NeuralRangePolicy:
             self.features.history_len,
             generator=self._gen(),
             sp=self.sp,
+            offtree=self.offtree,
         )
 
     @staticmethod

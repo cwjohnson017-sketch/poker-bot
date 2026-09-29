@@ -5,15 +5,23 @@ engine, or the match runner's masked view) with the scalar mirror of the env
 encoder (:mod:`.scalar`), asks its seat's :class:`~.policy.SDCFRPolicy` for
 the average policy over the abstract actions, samples one (or takes the most
 likely with ``greedy``), and converts it to a concrete action with the env's
-sizing rule. Opponent actions off the abstraction are mapped to the nearest
-legal abstract size when the history is encoded.
+sizing rule.
+
+Opponent raises off the abstraction are mapped to an abstract index when the
+history is encoded. With ``offtree="harmonic"`` (the default) that is the
+pseudo-harmonic mapping of :func:`pokerbot.abstraction.actions.map_offtree`,
+randomized with the ``rng`` passed to ``act`` and drawn once per opponent
+action per hand (kept until ``new_hand``). ``offtree="nearest"`` records the
+nearest legal size, exactly the index ``VecNLHE.step_concrete`` records.
 
 Registered in the agent factory as ``neural:<checkpoint dir>``.
 
 The agent is also a :class:`~pokerbot.agents.policy.PolicyAgent`:
 ``policy(state, seat)`` and ``policy_batch(state, seat, holes)`` return the
 same average policy as a function of the public state and a hand (own reach
-recomputed from the history, :class:`~.range_policy.NeuralRangePolicy`), and
+recomputed from the history, :class:`~.range_policy.NeuralRangePolicy`; with
+``offtree="harmonic"`` it maps off-tree opponent raises deterministically,
+``u = 0.5``, as the tabular policy does), and
 ``vec_policy(device)`` returns a :class:`~.vec_policy.NeuralVecPolicy` that
 acts on a ``VecNLHE`` batch directly (for the approximate best response).
 """
@@ -34,7 +42,7 @@ from .config import spec_from_dict
 from .features import FeatureConfig
 from .policy import SDCFRPolicy
 from .range_policy import NeuralRangePolicy
-from .scalar import ScalarSpec, encode_state
+from .scalar import ScalarSpec, check_offtree, encode_state
 
 
 class NeuralBlueprintAgent(BaseAgent):
@@ -47,6 +55,7 @@ class NeuralBlueprintAgent(BaseAgent):
         features: FeatureConfig | None = None,
         greedy: bool = False,
         name: str | None = None,
+        offtree: str = "harmonic",
     ) -> None:
         super().__init__(name)
         if len(policies) != 2:
@@ -56,10 +65,16 @@ class NeuralBlueprintAgent(BaseAgent):
         self.sp = ScalarSpec.build(spec)
         self.features = features or FeatureConfig()
         self.greedy = greedy
+        self.offtree = check_offtree(offtree)
         self.trained_game: dict[str, Any] | None = None
         self._warned = False
         self.last_probs: np.ndarray | None = None
-        self.range_policy = NeuralRangePolicy(policies, spec, self.features, self.sp)
+        # opponent off-tree raise -> harmonic index drawn this hand (per seat)
+        self._offtree_memo: dict[tuple, int] = {}
+        self.offtree_mapped = 0  # opponent raises mapped with the harmonic rule
+        self.range_policy = NeuralRangePolicy(
+            policies, spec, self.features, self.sp, offtree=self.offtree
+        )
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, **kwargs: Any) -> NeuralBlueprintAgent:
@@ -76,6 +91,7 @@ class NeuralBlueprintAgent(BaseAgent):
         reach_weighted: bool = True,
         greedy: bool = False,
         name: str | None = None,
+        offtree: str = "harmonic",
     ) -> NeuralBlueprintAgent:
         meta = read_meta(path)
         kw = dict(
@@ -92,6 +108,7 @@ class NeuralBlueprintAgent(BaseAgent):
             FeatureConfig.from_dict(meta.get("features")),
             greedy=greedy,
             name=name,
+            offtree=offtree,
         )
         agent.trained_game = meta.get("game")
         return agent
@@ -99,6 +116,8 @@ class NeuralBlueprintAgent(BaseAgent):
     def new_hand(self, seat: int, config: Any) -> None:
         super().new_hand(seat, config)
         self.policies[seat].new_hand()
+        for k in [k for k in self._offtree_memo if k[0] == seat]:
+            del self._offtree_memo[k]
         g = self.trained_game
         if g and not self._warned and config is not None:
             now = (list(config.stacks), config.small_blind, config.big_blind)
@@ -144,6 +163,7 @@ class NeuralBlueprintAgent(BaseAgent):
         gen = None
         if self.features.equity_samples > 0 or self.features.hist_runouts > 0:
             gen = torch.Generator().manual_seed(int(rng.integers(2**62)))
+        n_memo = len(self._offtree_memo)
         feats, info = encode_state(
             state,
             seat,
@@ -153,7 +173,11 @@ class NeuralBlueprintAgent(BaseAgent):
             self.features.history_len,
             generator=gen,
             sp=self.sp,
+            offtree=self.offtree,
+            rng=rng,
+            memo=self._offtree_memo,
         )
+        self.offtree_mapped += len(self._offtree_memo) - n_memo
         pol = self.policies[seat]
         probs = pol.act_probs(feats)[0].double().cpu().numpy()
         probs = np.where(np.asarray(info.legal), np.clip(probs, 0.0, None), 0.0)

@@ -49,7 +49,8 @@ class Recorder:
         # a snapshot: the view wraps the live state, which moves on
         snap = MaskedState(state.clone(), seat, state.config)
         a = self.agent.act(state, seat, rng)
-        self.views.append((snap, seat, getattr(self.agent, "last_probs", None)))
+        memo = dict(getattr(self.agent, "_offtree_memo", {}))  # off-tree draws so far
+        self.views.append((snap, seat, getattr(self.agent, "last_probs", None), memo))
         return a
 
 
@@ -59,7 +60,7 @@ def check_policy_batch(agent, config, hands, seed, per_view, atol):
     run_match([rec, RandomAgent()], config, num_hands=hands, seed=seed, engine=engine)
     rng = np.random.default_rng(seed)
     checked = 0
-    for view, seat, _ in rec.views:
+    for view, seat, _, _ in rec.views:
         board = list(view.board)
         live = np.nonzero(~blocked_mask(board))[0]
         holes = COMBOS[rng.choice(live, per_view, replace=False)]
@@ -84,17 +85,33 @@ def test_tabular_blueprint_policy_batch_matches_policy(small_strategy):
     assert checked > 200
 
 
-def test_neural_blueprint_policy_batch_matches_policy_and_act(tiny_neural_run):
-    agent = make_agent(f"neural:{tiny_neural_run}")
+@pytest.mark.parametrize("offtree", ["nearest", "harmonic"])
+def test_neural_blueprint_policy_batch_matches_policy_and_act(tiny_neural_run, offtree):
+    from pokerbot.blueprint.deepcfr.scalar import encode_state
+
+    agent = make_agent(f"neural:{tiny_neural_run},offtree={offtree}")
     assert isinstance(agent, PolicyAgent) and hasattr(agent, "policy_batch")
+    assert agent.offtree == offtree
     engine = get_engine()
     config = engine_config(engine, agent.trained_game)
     rec, checked = check_policy_batch(agent, config, 8, seed=2, per_view=4, atol=1e-5)
     assert checked > 30
     # the stateless policy equals what the agent sampled from when it acted
-    # (its own reach tracked through the hand by SDCFRPolicy.observe)
-    for view, seat, probs in rec.views:
+    # (its own reach tracked through the hand by SDCFRPolicy.observe). With
+    # "harmonic" the agent draws the mapping of each off-tree opponent raise
+    # while the stateless policy takes the u = 0.5 side: compare the views
+    # where every draw landed on that side (same history tokens).
+    compared = 0
+    for view, seat, probs, memo in rec.views:
+        if offtree == "harmonic":
+            kw = dict(sp=agent.sp, offtree="harmonic")
+            drawn = encode_state(view, seat, config, agent.spec, memo=memo, **kw)[0]["hist"]
+            det = encode_state(view, seat, config, agent.spec, **kw)[0]["hist"]
+            if not torch.equal(drawn, det):
+                continue
         np.testing.assert_allclose(agent.policy(view, seat), probs, atol=1e-5)
+        compared += 1
+    assert compared > len(rec.views) // 2
 
 
 def test_lbr_against_tabular_blueprint_uses_exact_policy(small_strategy):
