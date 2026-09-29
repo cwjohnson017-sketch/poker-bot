@@ -536,13 +536,53 @@ fn run_stats<'py>(py: Python<'py>, t: &Trainer, detailed: bool) -> PyResult<Boun
     Ok(d)
 }
 
-/// Resident set size of this process (Linux), else 0.
+/// Resident set size of this process (Linux; working set on Windows), else 0.
+#[cfg(not(windows))]
 fn rss_bytes() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|s| s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
         .map(|pages| pages * 4096)
         .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn rss_bytes() -> u64 {
+    use std::ffi::c_void;
+
+    /// PROCESS_MEMORY_COUNTERS from psapi.h.
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn K32GetProcessMemoryInfo(process: *mut c_void, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+    }
+
+    let cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+    // SAFETY: the struct is plain integers, so zeroed is valid, and the call
+    // writes at most `cb` bytes into it.
+    unsafe {
+        let mut counters: ProcessMemoryCounters = std::mem::zeroed();
+        counters.cb = cb;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) != 0 {
+            counters.working_set_size as u64
+        } else {
+            0
+        }
+    }
 }
 
 #[pymethods]
