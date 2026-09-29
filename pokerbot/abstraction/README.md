@@ -67,8 +67,10 @@ the call delegates to `ActionAbstraction.translate`. Other contract states
 (the reference engine, the match runner's masked view) use a line-by-line
 Python mirror, and the tests check that the two agree. `abs_state=` passes
 the abstract game's decision point when its pot differs from the real one.
-`NeuralBlueprintAgent` and `SearchAgent` can switch to it from their
-nearest-amount mapping.
+`BlueprintAgent` uses it through the Rust `translate`, and
+`NeuralBlueprintAgent` uses it by default (`offtree="harmonic"`; pass
+`offtree="nearest"` for the nearest-amount token the env records). The search
+agent adds off-tree sizes to its tree instead of mapping them.
 
 ## Canonical index (`isomorphism.py`)
 
