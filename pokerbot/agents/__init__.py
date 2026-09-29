@@ -8,6 +8,14 @@ from .base import Agent, BaseAgent, clamp_raise, current_bet, pot_raise_to
 from .baselines import AlwaysCallAgent, AlwaysRaiseAgent, RandomAgent
 from .equity import EquityThresholdAgent, monte_carlo_equity
 from .human import HumanCLIAgent
+from .policy import (
+    FixedPolicyAgent,
+    PolicyAgent,
+    SampledPolicyAgent,
+    UniformPolicyAgent,
+    as_policy_agent,
+)
+from .registry import available_agents, parse_spec, register
 
 AGENTS: dict[str, type] = {
     "always_call": AlwaysCallAgent,
@@ -21,12 +29,11 @@ AGENTS: dict[str, type] = {
 
 
 def make_agent(name: str, **kwargs: Any) -> Agent:
-    """Instantiate an agent by registry name (``always_call``, ``equity``, ...)."""
-    try:
-        cls = AGENTS[name]
-    except KeyError:
-        raise ValueError(f"unknown agent {name!r}; choose from {sorted(AGENTS)}") from None
-    return cls(**kwargs)
+    """Instantiate an agent from a name or spec string (``always_call``,
+    ``equity:samples=100``, ``blueprint:<checkpoint>``); see ``registry``."""
+    from .registry import make_agent as _make
+
+    return _make(name, **kwargs)
 
 
 __all__ = [
@@ -36,11 +43,19 @@ __all__ = [
     "AlwaysRaiseAgent",
     "BaseAgent",
     "EquityThresholdAgent",
+    "FixedPolicyAgent",
     "HumanCLIAgent",
+    "PolicyAgent",
     "RandomAgent",
+    "SampledPolicyAgent",
+    "UniformPolicyAgent",
+    "as_policy_agent",
+    "available_agents",
     "clamp_raise",
     "current_bet",
     "make_agent",
     "monte_carlo_equity",
+    "parse_spec",
     "pot_raise_to",
+    "register",
 ]

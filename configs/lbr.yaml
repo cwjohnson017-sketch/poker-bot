@@ -1,0 +1,26 @@
+# Local best response against an agent.
+# python scripts/run_lbr.py --config configs/lbr.yaml [--opponent SPEC]
+
+engine: auto
+
+game:
+  num_players: 2
+  stacks: [20000, 20000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+lbr:
+  opponent: always_call
+  hands: 2000
+  seed: 0
+  workers: 4
+  preflop: call           # call (paper default) | fc | full
+  raises: spec            # spec (abstract raise sizes) | fcpa (pot + all-in only)
+  runouts: 64             # flop runouts sampled per equity query (turn/river are exact)
+  samples: 16             # act() samples per policy query for agents without policy()
+  device: cpu
+  threads: 1              # torch threads per worker process
+  out: results/lbr.json
+
+agents: {}

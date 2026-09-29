@@ -39,3 +39,6 @@ hand_histories/
 
 # agent worktrees
 .claude/worktrees/
+
+# Evaluation outputs
+results/

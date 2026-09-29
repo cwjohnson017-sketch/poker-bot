@@ -26,3 +26,7 @@ results lives only on the command line or in someone's shell history.
 | File | Used by | What |
 |---|---|---|
 | `match.yaml` | `scripts/play_match.py --config configs/match.yaml` | Duplicate match between two agents, with per-agent constructor arguments under `agents:`. |
+| `ladder.yaml` | `scripts/run_ladder.py --config configs/ladder.yaml` | Checkpoint ladder: agent list or checkpoint glob, schedule, hands per pair, workers. |
+| `lbr.yaml` | `scripts/run_lbr.py --config configs/lbr.yaml` | Local best response against one opponent spec. |
+| `abr_tiny.yaml` | `scripts/run_abr.py --config configs/abr_tiny.yaml` | Approximate best response, CPU smoke run (~20 s). |
+| `abr_4070ti.yaml` | `scripts/run_abr.py --config configs/abr_4070ti.yaml --opponent <spec>` | Approximate best response sized for one RTX 4070 Ti. |

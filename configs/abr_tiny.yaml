@@ -1,0 +1,42 @@
+# Approximate best response, CPU smoke run (about 10-20 s on a laptop CPU).
+# python scripts/run_abr.py --config configs/abr_tiny.yaml
+# Command-line flags (--opponent, --device, --steps, --n-envs, --eval-hands, --seed)
+# override the values here.
+
+device: auto            # auto | cpu | cuda
+opponent: uniform       # uniform | call | any agent spec (scalar agents use the slow path)
+samples: 16             # act() samples per policy query for agents without policy()
+threads: 1              # torch CPU threads (small kernels: more threads rarely help on CPU)
+
+game:                   # ACPC heads-up no-limit: 50/100 blinds, 200bb stacks
+  num_players: 2
+  stacks: [20000, 20000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+abr:
+  seed: 0
+  n_envs: 256             # hands played in lockstep
+  train_steps: 400        # env steps (each advances every live hand by one decision)
+  buffer_size: 100000
+  batch_size: 256
+  updates_per_step: 1
+  learning_starts: 1000   # transitions before the first update
+  lr: 0.0005
+  gamma: 1.0
+  target_update: 100      # updates between target-network syncs
+  grad_clip: 10.0
+  eps_start: 1.0
+  eps_end: 0.05
+  eps_decay_steps: 300
+  hidden: [128, 128]
+  card_dim: 32
+  hist_dim: 32
+  equity_samples: 32      # Monte Carlo equity feature (0 = off)
+  reward_scale_bb: 20.0   # rewards are chips / (big blind * this)
+  eval_hands: 4096
+  eval_envs: 1024
+  eval_initial: true      # also evaluate the untrained learner (baseline)
+  eval_every: 0
+  log_every: 50
