@@ -22,6 +22,10 @@ AGENTS: dict[str, type] = {
 
 def make_agent(name: str, **kwargs: Any) -> Agent:
     """Instantiate an agent by registry name (``always_call``, ``equity``, ...)."""
+    if name.startswith("search:"):  # real-time search over a blueprint spec
+        from ..search.agent import make_search_agent
+
+        return make_search_agent(name.split(":", 1)[1], **kwargs)
     try:
         cls = AGENTS[name]
     except KeyError:
