@@ -54,7 +54,10 @@ def play_env(cfg, n, seed):
 
 @pytest.mark.parametrize("engine_name", ENGINES)
 @pytest.mark.parametrize("stacks", [[20000, 20000], [3000, 7000]])
-def test_scalar_encoder_matches_env(engine_name, stacks):
+@pytest.mark.parametrize("offtree", ["nearest", "harmonic"])
+def test_scalar_encoder_matches_env(engine_name, stacks, offtree):
+    """``"nearest"`` is the env's rule; abstract play is all on-tree, where
+    ``"harmonic"`` must record the same tokens."""
     engine = importlib.import_module(engine_name)
     cfg = GameConfig(stacks=stacks)
     ecfg = engine_config(engine, cfg)
@@ -69,7 +72,7 @@ def test_scalar_encoder_matches_env(engine_name, stacks):
                 s.apply(engine.Action(kind, amt if kind == 2 else 0))
             seat = s.current_player
             view = MaskedState(s, seat, ecfg, rng) if checked % 2 else s
-            got, info = encode_state(view, seat, ecfg, DEFAULT_SPEC)
+            got, info = encode_state(view, seat, ecfg, DEFAULT_SPEC, offtree=offtree, rng=rng)
             for key, want in feats.items():
                 assert torch.equal(got[key][0], want), (i, k, key, got[key][0], want)
             max_len = max(max_len, k)

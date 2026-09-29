@@ -16,6 +16,13 @@ this module re-derives the same features in plain Python integers:
   ``VecNLHE.step_concrete`` records, and on the tree exactly the index
   ``VecNLHE.step`` records for the abstract action. Off the tree it is the
   nearest legal size.
+* :func:`harmonic_abstract` is the alternative for **opponent** off-tree
+  raises (``offtree="harmonic"``): the pseudo-harmonic mapping of
+  :func:`pokerbot.abstraction.actions.map_offtree` between the neighbouring
+  legal abstract sizes, randomized with an ``rng`` (the acting agent) or
+  deterministic with ``u = 0.5`` (the stateless range policy). The seat's
+  own actions, on-tree sizes, folds, calls, and raises made when no abstract
+  raise is legal keep the :func:`nearest_abstract` index.
 * :func:`encode_state` rebuilds the history tokens by replaying the public
   action history through the scalar engine (hole cards of the opponent and
   the undealt board are irrelevant to every public quantity, so they are
@@ -58,6 +65,7 @@ _KIND_CODES = {
     "allin": K_ALLIN,
 }
 _RAISE_KINDS = (K_RAISE_POT, K_RAISE_MULT, K_ALLIN)
+OFFTREE_MODES = ("harmonic", "nearest")
 
 
 @dataclass(frozen=True)
@@ -171,6 +179,44 @@ def nearest_abstract(
     return min(cand, key=lambda i: (abs(targets[i] - amount), i))
 
 
+def check_offtree(offtree: str) -> str:
+    if offtree not in OFFTREE_MODES:
+        raise ValueError(f"offtree must be one of {OFFTREE_MODES}, got {offtree!r}")
+    return offtree
+
+
+def harmonic_abstract(
+    spec: ActionSpec,
+    sp: ScalarSpec,
+    state: Any,
+    action: Any,
+    info: DecisionInfo,
+    rng: np.random.Generator | None = None,
+) -> int | None:
+    """Pseudo-harmonic index of an off-tree raise ``action`` at ``state``.
+
+    Returns None (keep :func:`nearest_abstract`) unless ``action`` is a raise
+    whose amount is not the target of a legal abstract raise and some
+    abstract raise is legal. Otherwise the index is
+    :func:`~pokerbot.abstraction.actions.map_offtree`'s, randomized with
+    ``rng`` or deterministic (``u = 0.5``) without one.
+    """
+    if int(action.kind) != RAISE:
+        return None
+    amount = int(action.amount)
+    street = info.street
+    raises = [i for i, (k, _) in enumerate(sp.rows[street]) if k in _RAISE_KINDS and info.legal[i]]
+    if not raises or any(info.targets[i] == amount for i in raises):
+        return None
+    from ...abstraction.actions import map_offtree
+
+    mode = "deterministic" if rng is None else "randomized"
+    idx = map_offtree(spec, state, action, rng, mode)
+    if idx is None or sp.rows[street][idx][0] not in _RAISE_KINDS:
+        return None
+    return int(idx)
+
+
 # ---------------------------------------------------------------------------- engines
 
 
@@ -251,8 +297,27 @@ class HistoryRecord:
     n_raises: int  # voluntary raises on the current street
 
 
-def replay_history(state: Any, config: Any, sp: ScalarSpec, seat: int) -> HistoryRecord:
-    """Rebuild the env's history tokens by replaying ``state.history`` in the engine."""
+def replay_history(
+    state: Any,
+    config: Any,
+    sp: ScalarSpec,
+    seat: int,
+    spec: ActionSpec | None = None,
+    offtree: str = "nearest",
+    rng: np.random.Generator | None = None,
+    memo: dict | None = None,
+) -> HistoryRecord:
+    """Rebuild the env's history tokens by replaying ``state.history`` in the engine.
+
+    With ``offtree="harmonic"`` (needs ``spec``) the opponent's off-tree
+    raises get :func:`harmonic_abstract` indices (randomized with ``rng``).
+    ``memo`` keeps the index drawn for each history position, so a hand's
+    earlier opponent actions keep their mapping at later decisions; the
+    caller clears it between hands.
+    """
+    harmonic = check_offtree(offtree) == "harmonic"
+    if harmonic and spec is None:
+        raise ValueError('offtree="harmonic" needs the ActionSpec')
     engine = engine_for(config)
     cfg = engine_config(engine, config)
     button = int(state.button)
@@ -270,13 +335,22 @@ def replay_history(state: Any, config: Any, sp: ScalarSpec, seat: int) -> Histor
     A = sp.num_actions
     tokens, amounts = [], []
     n_raises, street = 0, 0
-    for st, player, action in state.history:
+    for pos, (st, player, action) in enumerate(state.history):
         st, player = int(st), int(player)
         if st != street:
             street, n_raises = st, 0
         info = decision_info(sim, sp, n_raises)
         kind, amount = int(action.kind), int(getattr(action, "amount", 0) or 0)
-        idx = nearest_abstract(sp, st, kind, amount, info.targets, info.legal)
+        idx = None
+        if harmonic and player != seat and kind == RAISE:
+            key = (seat, pos, amount)
+            idx = None if memo is None else memo.get(key)
+            if idx is None:
+                idx = harmonic_abstract(spec, sp, sim, action, info, rng)
+                if memo is not None and idx is not None:
+                    memo[key] = idx
+        if idx is None:
+            idx = nearest_abstract(sp, st, kind, amount, info.targets, info.legal)
         if kind == CHECK_CALL:
             add = min(info.to_call, info.stacks[player])
         elif kind == RAISE:
@@ -301,8 +375,15 @@ def encode_state(
     history_len: int = HISTORY_LEN,
     generator: torch.Generator | None = None,
     sp: ScalarSpec | None = None,
+    offtree: str = "nearest",
+    rng: np.random.Generator | None = None,
+    memo: dict | None = None,
 ) -> tuple[dict[str, torch.Tensor], DecisionInfo]:
     """Features ``[1, ...]`` for ``seat`` to act in ``state`` (mirror of ``encode_obs``).
+
+    ``offtree``, ``rng`` and ``memo`` choose how the opponent's off-tree
+    raises are tokenised (see :func:`replay_history`); the default
+    ``"nearest"`` is exactly the env's ``step_concrete`` rule.
 
     Returns the canonical feature dict (see :mod:`.features`) on the CPU and
     the decision's :class:`DecisionInfo` (for mapping abstract actions to
@@ -310,7 +391,7 @@ def encode_state(
     """
     sp = sp or ScalarSpec.build(spec)
     features = features or FeatureConfig()
-    rec = replay_history(state, config, sp, seat)
+    rec = replay_history(state, config, sp, seat, spec, offtree, rng, memo)
     info = decision_info(state, sp, rec.n_raises)
     if info.player != seat:
         raise ValueError(f"seat {seat} is not to act (current player {info.player})")

@@ -226,11 +226,18 @@ iteration, or 1.8 s for the first iteration including warm-up.
 - **Blinds and stacks are baked in.** Features are fractions of the starting
   stack, but the abstraction and the training distribution use one game
   config. The agent warns when it plays a different one.
-- **Off-tree opponent bets** are mapped to the nearest *legal* abstract size.
-  The rule is the one `nearest_abstract` uses: closest amount, first on ties.
-  It is not the pseudo-harmonic mapping. A raise to exactly the all-in is
-  the `allin` index. This is the index `VecNLHE.step_concrete` records, and on
-  the tree exactly the index `VecNLHE.step` records.
+- **Off-tree opponent bets** get a history token chosen by the `offtree`
+  option of `NeuralBlueprintAgent` (`neural:<dir>,offtree=nearest`) and
+  `NeuralRangePolicy`. The default `"harmonic"` uses the pseudo-harmonic
+  mapping of `pokerbot.abstraction.actions.map_offtree` between the
+  neighbouring legal sizes: randomized with the `act` rng, drawn once per
+  opponent action per hand, in the agent; deterministic (`u = 0.5`) in the
+  stateless `policy` / `policy_batch` / `policy_all` path, as the tabular
+  policy does. `"nearest"` records the nearest *legal* size (`nearest_abstract`:
+  closest amount, first on ties), the index `VecNLHE.step_concrete` records.
+  Either way, own actions, on-tree sizes and folds/calls are unchanged; a
+  raise to exactly the all-in is the `allin` index; and on the tree the
+  token is the one `VecNLHE.step` records.
 - **Stateless queries.** `policy(state, seat)` and the batched paths
   recompute the own-reach weights from the history (one forward pass per net
   per earlier own decision, cached per history prefix in the batched path),
