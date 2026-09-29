@@ -6,25 +6,43 @@ masked tensor ops over all slots (finished slots are left untouched), with
 no Python branching on tensor values unless ``validate`` is on. See
 ``pokerbot/env/README.md`` for the tensor layouts.
 
-Rules (heads-up, matching the scalar engine contract):
+Rules (heads-up). The Rust engine ``poker_engine`` (``engine/README.md``) is
+the source of truth; ``tests/test_cross_env_engine.py`` checks legal info,
+payoffs, board and terminal street against it on thousands of random hands.
 
 * Deck rows are permutations of 0..51 dealt as P0 hole, P1 hole, flop,
   turn, river (seat order, not button order).
 * The button posts the small blind and acts first preflop; the other seat
   acts first on the flop, turn and river. Antes go to the pot, not to the
-  street bets.
-* A raise is legal when the actor has more chips than the call and the
-  opponent still has chips behind. ``min_raise_to = max_bet +
+  street bets. A player who cannot cover the ante or blind posts what they
+  have and is all-in.
+* The current bet (``max_bet`` in ``LegalInfo``) is the largest street bet,
+  and preflop at least the full big blind even when the big blind posted
+  less: facing a short all-in big blind, the small blind still calls up to
+  the full big blind (the excess comes back at showdown).
+* A raise is legal when the actor's all-in total is above the current bet
+  and the opponent still has chips behind. ``min_raise_to = current bet +
   max(last full raise increment on this street, big blind)``;
-  ``max_raise_to`` is the actor's all-in. An all-in for less than a full
-  raise does not change the min-raise increment.
-* The betting round closes when each player has folded, is all-in, or has
-  acted since the last raise and matched the largest bet. When it closes
-  with at most one player able to bet, the board is run out and the hand
-  goes to showdown in the same step.
+  ``max_raise_to`` is the actor's all-in total (``street bet + stack``) even
+  when the opponent cannot match it. An all-in below ``min_raise_to`` is
+  legal and does not change the increment. (Heads-up a short all-in never
+  re-opens anything: the raiser is all-in, so nobody can raise again.)
+* A seat is done for the round when it has folded, is all-in, or has
+  matched the current bet and either acted since the last raise or is the
+  only player left who can bet (a lone player acts only when facing a bet).
+  When both seats are done the round closes; with at most one player able
+  to bet the board is run out and the hand is shown down in the same step.
+  The same rule applies right after the blinds, so a hand can end at the
+  deal (both all-in, or the small blind all-in facing no bet).
+* ``street`` is 3 after any showdown (including run-outs and hands that end
+  at the deal) and stays at the current street after a fold.
 * Payoffs are net chip changes: a fold loses the folder's contribution;
   at showdown the better hand wins ``min(contributions)`` (the uncalled
   excess goes back), ties split evenly (always an even pot heads-up).
+* Terminal ``stacks`` differ from the Rust engine by convention: here they
+  are the final stacks ``start + payoff``; the Rust engine keeps the chips
+  behind (its final stack is ``stacks + contributed + payoffs``). ``pot``
+  and ``contrib`` keep their end-of-hand values in both.
 """
 
 from __future__ import annotations
@@ -210,9 +228,15 @@ class VecNLHE:
         stacks = stacks - blind
         all_in = stacks == 0
         zeros_k = torch.zeros(k, dtype=torch.long, device=dev)
-        # button acts first preflop unless already all-in from the blind
-        btn_allin = all_in.gather(1, btn[:, None]).squeeze(1)
-        actor = torch.where(btn_allin, 1 - btn, btn)
+        # The button acts first preflop unless it has nothing to decide: it is
+        # all-in, or it is the only player with chips and faces no bet. The
+        # hand ends at the deal when neither player has anything to decide.
+        folded_k = torch.zeros(k, 2, dtype=torch.bool, device=dev)
+        settled = self._settled(
+            blind, self._current_bet(blind, zeros_k), folded_k, all_in, folded_k
+        )
+        btn_settled = settled.gather(1, btn[:, None]).squeeze(1)
+        actor = torch.where(btn_settled, 1 - btn, btn)
 
         self.deck[idx] = decks.to(torch.uint8)
         self.button[idx] = btn
@@ -234,10 +258,33 @@ class VecNLHE:
         self.ranks[idx] = ranks
         self.last_kind[idx] = -1
         self.last_amount[idx] = zeros_k
-        # both players all-in from the blinds: nothing to decide, run it out
-        both = torch.zeros(self.n, dtype=torch.bool, device=dev)
-        both[idx] = all_in.all(1)
-        self._showdown(both)
+        # nothing to decide after the blinds (e.g. both all-in): run it out
+        closed = torch.zeros(self.n, dtype=torch.bool, device=dev)
+        closed[idx] = settled.all(1)
+        self._showdown(closed)
+
+    # ------------------------------------------------------------------ round state
+    def _current_bet(self, street_bets: torch.Tensor, street: torch.Tensor) -> torch.Tensor:
+        """``[k]`` street bet level everyone must match. Preflop it is at least
+        the full big blind, even when the big blind posted less (all-in)."""
+        top = street_bets.max(1).values
+        return torch.where(street == 0, torch.clamp(top, min=self.bb), top)
+
+    @staticmethod
+    def _settled(
+        street_bets: torch.Tensor,
+        cur_bet: torch.Tensor,
+        folded: torch.Tensor,
+        all_in: torch.Tensor,
+        acted: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[k, 2]`` seats with nothing left to do in this betting round:
+        folded, all-in, or matched the current bet and either acted since the
+        last raise or are the only player left who can bet (a lone player
+        only acts when facing a bet)."""
+        lone = ((~folded & ~all_in).sum(1) <= 1)[:, None]
+        matched = street_bets >= cur_bet[:, None]
+        return folded | all_in | (matched & (acted | lone))
 
     # ------------------------------------------------------------------ legality
     @torch.no_grad()
@@ -246,10 +293,9 @@ class VecNLHE:
         p = self.actor.clamp(min=0)[:, None]
         o = 1 - p
         my_bet = self.street_bets.gather(1, p).squeeze(1)
-        opp_bet = self.street_bets.gather(1, o).squeeze(1)
         my_stack = self.stacks.gather(1, p).squeeze(1)
         opp_stack = self.stacks.gather(1, o).squeeze(1)
-        max_bet = torch.maximum(my_bet, opp_bet)
+        max_bet = self._current_bet(self.street_bets, self.street)
         to_call = max_bet - my_bet
         call_amount = torch.minimum(to_call, my_stack)
         raise_ok = active & (my_stack > to_call) & (opp_stack > 0)
@@ -412,8 +458,8 @@ class VecNLHE:
         self.last_amount = torch.where(live, amount, self.last_amount)
 
         # betting round closure
-        max_bet = self.street_bets.max(1, keepdim=True).values
-        settled = self.folded | self.all_in | (self.acted & (self.street_bets == max_bet))
+        cur_bet = self._current_bet(self.street_bets, self.street)
+        settled = self._settled(self.street_bets, cur_bet, self.folded, self.all_in, self.acted)
         closed = live & ~is_fold & settled.all(1)
         can_bet = (~self.folded & ~self.all_in).sum(1)
         runout = closed & (can_bet <= 1)
@@ -424,7 +470,7 @@ class VecNLHE:
         ns = next_street[:, None]
         self.street_bets = torch.where(ns, 0, self.street_bets)
         self.acted = self.acted & ~ns
-        self.last_raise = torch.where(next_street, 0, self.last_raise)
+        self.last_raise = torch.where(next_street, self.bb, self.last_raise)
         self.n_raises = torch.where(next_street, 0, self.n_raises)
         self.actor = torch.where(live, torch.where(closed, 1 - self.button, 1 - p), self.actor)
 

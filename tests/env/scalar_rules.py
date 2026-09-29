@@ -1,8 +1,11 @@
 """Independent, straightforward scalar heads-up NLHE rules (test oracle only).
 
 Written separately from the tensor code to catch vectorization bugs; it
-follows the contract in docs/INTERFACES.md with the same rule reading as
-``pokerbot.env.vec_env`` (see that module's docstring).
+follows the contract in docs/INTERFACES.md and the rule choices of the Rust
+engine (engine/README.md), as ``pokerbot.env.vec_env`` does (see that
+module's docstring): preflop the bet to match is always the full big blind,
+and a player who is the only one left able to bet acts only when facing a
+bet.
 """
 
 from __future__ import annotations
@@ -40,10 +43,21 @@ class ScalarHand:
                 self.all_in[p] = True
         self.last_raise = bb
         self.player = button
-        if self.all_in[button]:
+        if self._settled(button):
             self.player = 1 - button
-        if all(self.all_in):
+        if self._settled(0) and self._settled(1):
             self._showdown()
+
+    def current_bet(self):
+        top = max(self.bets)
+        return max(top, self.bb) if self.street == 0 else top
+
+    def _settled(self, i):
+        """Nothing left to do for seat ``i`` in this betting round."""
+        if self.folded[i] or self.all_in[i]:
+            return True
+        lone = sum(1 for j in (0, 1) if not self.folded[j] and not self.all_in[j]) <= 1
+        return self.bets[i] >= self.current_bet() and (self.acted[i] or lone)
 
     def board(self):
         n = {0: 0, 1: 3, 2: 4, 3: 5}[self.street]
@@ -52,7 +66,7 @@ class ScalarHand:
     def legal(self):
         p = self.player
         o = 1 - p
-        to_call = max(self.bets) - self.bets[p]
+        to_call = self.current_bet() - self.bets[p]
         raise_ok = self.stacks[p] > to_call and self.stacks[o] > 0
         return {
             "current_player": p,
@@ -61,7 +75,7 @@ class ScalarHand:
             "can_fold": to_call > 0,
             "can_check": to_call == 0,
             "call_amount": min(to_call, self.stacks[p]),
-            "min_raise_to": max(self.bets) + max(self.last_raise, self.bb) if raise_ok else 0,
+            "min_raise_to": self.current_bet() + max(self.last_raise, self.bb) if raise_ok else 0,
             "max_raise_to": self.bets[p] + self.stacks[p] if raise_ok else 0,
         }
 
@@ -92,7 +106,7 @@ class ScalarHand:
             lo, hi = lg["min_raise_to"], lg["max_raise_to"]
             if lo == 0 or not (lo <= amount <= hi or amount == hi):
                 raise ValueError("bad raise")
-            prev_max = max(self.bets)
+            prev_max = self.current_bet()
             if amount - prev_max >= max(self.last_raise, self.bb):
                 self.last_raise = amount - prev_max
             self._put(p, amount - self.bets[p])
@@ -100,12 +114,7 @@ class ScalarHand:
             self.acted[1 - p] = False
         else:
             raise ValueError("bad kind")
-        top = max(self.bets)
-        settled = all(
-            self.folded[i] or self.all_in[i] or (self.acted[i] and self.bets[i] == top)
-            for i in (0, 1)
-        )
-        if not settled:
+        if not (self._settled(0) and self._settled(1)):
             self.player = 1 - p
             return
         can_bet = sum(1 for i in (0, 1) if not self.folded[i] and not self.all_in[i])
