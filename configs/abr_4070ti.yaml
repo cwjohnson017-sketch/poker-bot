@@ -1,0 +1,45 @@
+# Approximate best response on one RTX 4070 Ti (12 GB). Weekly / release-candidate run.
+# python scripts/run_abr.py --config configs/abr_4070ti.yaml --opponent neural:<checkpoint> \
+#     --log-dir runs/abr/<name> --out results/abr_<name>.json --checkpoint runs/abr/<name>/q.pt
+#
+# The opponent should expose a vectorized policy (an agent with vec_policy(device)),
+# otherwise every opponent decision goes through the scalar engine one slot at a
+# time, which is far too slow at this batch size. Budget and sizes are first
+# guesses to be tuned on the box; see pokerbot/eval/README.md.
+
+device: cuda
+opponent: uniform       # replace with the frozen policy under test
+samples: 16
+
+game:
+  num_players: 2
+  stacks: [20000, 20000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+abr:
+  seed: 0
+  n_envs: 16384
+  train_steps: 40000
+  buffer_size: 4000000    # about 0.4 GB of transitions on the GPU
+  batch_size: 4096
+  updates_per_step: 2
+  learning_starts: 200000
+  lr: 0.0002
+  gamma: 1.0
+  target_update: 1000
+  grad_clip: 10.0
+  eps_start: 1.0
+  eps_end: 0.02
+  eps_decay_steps: 15000
+  hidden: [512, 512, 256]
+  card_dim: 64
+  hist_dim: 64
+  equity_samples: 64
+  reward_scale_bb: 20.0
+  eval_hands: 200000      # CI half-width roughly 30-60 mbb/h against a blueprint
+  eval_envs: 16384
+  eval_initial: true
+  eval_every: 10000
+  log_every: 200

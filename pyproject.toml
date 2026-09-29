@@ -25,6 +25,9 @@ dev = [
     "ruff>=0.5",
     "maturin>=1.5",
 ]
+logging = [
+    "tensorboard>=2.14",
+]
 
 [tool.setuptools.packages.find]
 include = ["pokerbot*"]

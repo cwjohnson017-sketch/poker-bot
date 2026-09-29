@@ -53,6 +53,11 @@ class NeuralBlueprintAgent(BaseAgent):
         self.last_probs: np.ndarray | None = None
 
     @classmethod
+    def from_checkpoint(cls, path: str | Path, **kwargs: Any) -> NeuralBlueprintAgent:
+        """Registry entry point (``neural:<run dir>``); same as :meth:`from_dir`."""
+        return cls.from_dir(path, **kwargs)
+
+    @classmethod
     def from_dir(
         cls,
         path: str | Path,

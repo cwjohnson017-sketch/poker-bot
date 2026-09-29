@@ -1,0 +1,30 @@
+# Checkpoint ladder over the rule baselines (template for checkpoint ladders).
+# python scripts/run_ladder.py --config configs/ladder.yaml
+# For a training run, point `checkpoints` at the checkpoint glob and use
+# schedule: newest (every new checkpoint vs its k predecessors and the anchors).
+
+engine: auto
+
+game:
+  num_players: 2
+  stacks: [20000, 20000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+ladder:
+  agents: [always_call, always_raise, random, equity]
+  # checkpoints: "runs/mccfr/ckpt_*.pkl"
+  # kind: blueprint
+  anchors: []
+  schedule: all           # all | previous | newest
+  k: 5
+  hands: 2000             # per pair (duplicate: hands / 2 deals, both seatings)
+  workers: 4
+  seed: 0
+  out: results/ladder.json
+  on_illegal: raise       # raise | fold
+
+agents:                   # constructor arguments per agent name
+  equity:
+    samples: 100
