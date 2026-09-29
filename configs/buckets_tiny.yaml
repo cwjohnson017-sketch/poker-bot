@@ -1,0 +1,22 @@
+# Card-bucket smoke run on the CPU: 256 random canonical classes per street,
+# 8 buckets each, about 10 seconds. The tables are full length (as the engine
+# requires) but only the 256 computed entries are real buckets; the rest are
+# padded with `index % buckets`. For plumbing tests only.
+#
+#   python scripts/build_buckets.py --config configs/buckets_tiny.yaml
+
+seed: 0
+
+buckets:
+  out_dir: data/abstraction/buckets_tiny
+  device: cpu
+  max_rows: 2097152
+  weighted: true
+  canonical_cache: null      # compute representatives on the fly
+  feature_cache: false
+  limit: 256
+
+  streets:
+    flop:  {buckets: 8, bins: 10, runouts: 16, iters: 20, chunk: 256}
+    turn:  {buckets: 8, bins: 10, runouts: 0, iters: 20, chunk: 64}
+    river: {buckets: 8, iters: 20, chunk: 1024}

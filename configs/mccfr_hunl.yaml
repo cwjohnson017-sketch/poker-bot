@@ -48,9 +48,17 @@ mccfr:
   cards:
     buckets: [169, 1000, 1000, 1000]
     hs_samples: 256        # Monte Carlo samples for the default flop/turn hand strength
-    # Per-street .npy tables indexed by poker_engine.canonical_index (from the
-    # abstraction package's equity-histogram k-means) replace the default
-    # hand-strength buckets when set.
+    # Per-street .npy tables indexed by poker_engine.canonical_index replace
+    # the default hand-strength buckets when set (paths relative to the repo
+    # root). Build them with the equity-histogram / EMD k-means of
+    # pokerbot/abstraction (about 1.3 h on the 4070 Ti):
+    #   python scripts/build_buckets.py --config configs/buckets_hunl.yaml --device cuda
+    # then use (bucket counts must match the tables' 1000 per street):
+    # tables: {preflop: null,
+    #          flop: data/abstraction/buckets_hunl/flop.npy,
+    #          turn: data/abstraction/buckets_hunl/turn.npy,
+    #          river: data/abstraction/buckets_hunl/river.npy}
+    # A blueprint trained on tables needs the same files at play time.
     tables: {preflop: null, flop: null, turn: null, river: null}
 
   # Pluribus schedule scaled to iterations (~25M iterations = 10 minutes on 16
