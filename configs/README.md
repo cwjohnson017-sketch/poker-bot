@@ -26,3 +26,5 @@ results lives only on the command line or in someone's shell history.
 | File | Used by | What |
 |---|---|---|
 | `match.yaml` | `scripts/play_match.py --config configs/match.yaml` | Duplicate match between two agents, with per-agent constructor arguments under `agents:`. |
+| `deepcfr_tiny.yaml` | `scripts/train_deepcfr.py --config configs/deepcfr_tiny.yaml` | Deep CFR smoke test on the CPU (20bb, reduced action set, tiny nets; about 1 s per iteration). |
+| `deepcfr_4070ti.yaml` | `scripts/train_deepcfr.py --config configs/deepcfr_4070ti.yaml` | The neural blueprint run on one RTX 4070 Ti, with VRAM, RAM and time estimates in the header. |
