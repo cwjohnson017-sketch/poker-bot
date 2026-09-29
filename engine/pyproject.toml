@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "poker_engine"
+version = "0.1.0"
+description = "No-Limit Texas Hold'em rules engine and hand evaluator (Rust + PyO3)"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+features = ["python", "pyo3/extension-module"]
+module-name = "poker_engine"
