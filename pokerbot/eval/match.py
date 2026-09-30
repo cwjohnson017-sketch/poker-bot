@@ -2,7 +2,9 @@
 
 Agents only ever see a :class:`~pokerbot.eval.masking.MaskedState` for their
 own seat. Results are reported from the first agent's point of view in
-mbb/hand with a bootstrap confidence interval.
+mbb/hand with a bootstrap confidence interval. Heads-up matches can also
+report a luck-adjusted win rate (``luck_adjust=True``, :mod:`.luck`): all-in
+EV plus street control variates, unbiased and with a narrower interval.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import numpy as np
 
 from ..engine_select import engine_name, get_engine, to_engine_action
 from .history import HandHistoryWriter
+from .luck import luck_adjusted
 from .masking import MaskedState
 from .stats import WinRate, win_rate
 
@@ -81,6 +84,8 @@ class MatchResult:
     ``samples[i]`` is A's chip result for sample unit ``i``: one hand in a
     plain match, one deal (two hands, both seatings) in a duplicate match.
     ``b_samples`` holds the chip results of everyone else in the same units.
+    ``adjusted`` holds A's luck-adjusted results in the same units (None
+    unless the match was run with ``luck_adjust=True``).
     """
 
     names: list[str]
@@ -93,7 +98,9 @@ class MatchResult:
     n_boot: int = 2000
     seed: int = 0
     seat_payoffs: np.ndarray | None = None
+    adjusted: np.ndarray | None = None
     stats: WinRate = field(init=False)
+    adjusted_stats: WinRate | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.stats = win_rate(
@@ -104,6 +111,15 @@ class MatchResult:
             self.n_boot,
             rng=self.seed,
         )
+        if self.adjusted is not None:
+            self.adjusted_stats = win_rate(
+                self.adjusted,
+                self.big_blind,
+                self.hands_per_sample,
+                self.confidence,
+                self.n_boot,
+                rng=self.seed,
+            )
 
     @property
     def hands(self) -> int:
@@ -127,7 +143,10 @@ class MatchResult:
 
     def summary(self) -> str:
         kind = "duplicate" if self.duplicate else "plain"
-        return f"{self.names[0]} vs {' / '.join(self.names[1:])} ({kind}): {self.stats}"
+        out = f"{self.names[0]} vs {' / '.join(self.names[1:])} ({kind}): {self.stats}"
+        if self.adjusted_stats is not None:
+            out += f"\n  luck-adjusted: {self.adjusted_stats}"
+        return out
 
 
 def run_match(
@@ -140,22 +159,36 @@ def run_match(
     confidence: float = 0.95,
     n_boot: int = 2000,
     on_illegal: str = "raise",
+    luck_adjust: bool = False,
+    adjust_device: str = "cpu",
+    adjust_samples: int = 2048,
 ) -> MatchResult:
     """Agents keep their seats; the button rotates every hand; each hand gets a
-    fresh shuffled deck from ``seed``. Works for 2..9 seats."""
+    fresh shuffled deck from ``seed``. Works for 2..9 seats; ``luck_adjust``
+    (heads-up only) adds the luck-adjusted result of :mod:`.luck`, with
+    ``adjust_samples`` Monte Carlo runouts for preflop equities."""
     engine = engine or get_engine()
     n = config.num_players
+    if luck_adjust and n != 2:
+        raise ValueError("luck adjustment is heads-up only")
     names = _names(agents)
     writer = HandHistoryWriter(history, config, names, engine_name(engine)) if history else None
     deck_rng = np.random.default_rng(seed)
     pay = np.zeros((num_hands, n), dtype=np.int64)
+    records = []
     for h in range(num_hands):
         deck = deck_rng.permutation(52)
         rng = np.random.default_rng((seed, h))
         state = play_hand(config, agents, h % n, deck, rng, engine, on_illegal)
         pay[h] = state.payoffs()
+        if luck_adjust:
+            records.append((h % n, deck, state))
         if writer:
             writer.write(state, h)
+    adjusted = None
+    if luck_adjust:
+        adj = luck_adjusted(records, config, engine, adjust_samples, seed, adjust_device)
+        adjusted = adj[:, 0]
     return MatchResult(
         names=names,
         big_blind=config.big_blind,
@@ -167,6 +200,7 @@ def run_match(
         n_boot=n_boot,
         seed=seed,
         seat_payoffs=pay,
+        adjusted=adjusted,
     )
 
 
@@ -181,11 +215,15 @@ def run_duplicate_match(
     confidence: float = 0.95,
     n_boot: int = 2000,
     on_illegal: str = "raise",
+    luck_adjust: bool = False,
+    adjust_device: str = "cpu",
+    adjust_samples: int = 2048,
 ) -> MatchResult:
     """Heads-up duplicate match: every deal is played twice with the same deck
     and button, once with A in seat 0 and once with A in seat 1, so each agent
     holds each hand in each position. ``num_deals`` deals = ``2 * num_deals``
-    hands. Both plays of a deal use the same agent RNG seed."""
+    hands. Both plays of a deal use the same agent RNG seed. ``luck_adjust``
+    adds A's luck-adjusted result per deal (:mod:`.luck`)."""
     if config.num_players != 2:
         raise ValueError("duplicate matches are heads-up only")
     engine = engine or get_engine()
@@ -195,6 +233,7 @@ def run_duplicate_match(
     a_res = np.zeros(num_deals, dtype=np.int64)
     b_res = np.zeros(num_deals, dtype=np.int64)
     seat_pay = np.zeros((num_deals, 2, 2), dtype=np.int64)
+    records = []
     for d in range(num_deals):
         deck = deck_rng.permutation(52)
         button = d % 2
@@ -206,9 +245,16 @@ def run_duplicate_match(
             a_seat = 0 if g == 0 else 1
             a_res[d] += p[a_seat]
             b_res[d] += p[1 - a_seat]
+            if luck_adjust:
+                records.append((button, deck, state))
             if writer:
                 seat_names = names if g == 0 else names[::-1]
                 writer.write(state, 2 * d + g, seat_names)
+    adjusted = None
+    if luck_adjust:
+        adj = luck_adjusted(records, config, engine, adjust_samples, seed, adjust_device)
+        adj = adj.reshape(num_deals, 2, 2)  # [deal, seating, seat]
+        adjusted = adj[:, 0, 0] + adj[:, 1, 1]  # A is seat 0, then seat 1
     return MatchResult(
         names=names,
         big_blind=config.big_blind,
@@ -220,4 +266,5 @@ def run_duplicate_match(
         n_boot=n_boot,
         seed=seed,
         seat_payoffs=seat_pay,
+        adjusted=adjusted,
     )

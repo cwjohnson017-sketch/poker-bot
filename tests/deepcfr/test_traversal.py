@@ -173,6 +173,115 @@ def test_capped_traversal_with_deterministic_rollouts_is_exact():
     assert res.stats["nodes"] >= 8
 
 
+def brute_force_rb(state, p, config, spec, policies, scale, out, E, beta, start):
+    """``brute_force`` with the variance-reduced leaf values: all-ins called
+    before the river score ``stake * (2 E - 1)``, and every new street adds
+    ``-beta * 2c * (E_new - E_old)`` to the value of the edge that dealt it.
+    ``E`` is the root's per-street equity (from the traversal under test)."""
+    engine = get_engine()
+    cur = state.current_player
+    feats, info = encode_state(state, cur, config, spec)
+    probs = policies[cur](feats)[0].double()
+    sp = ScalarSpec.build(spec)
+
+    def edge(nxt):
+        if nxt.is_terminal:
+            if not any(nxt.folded) and state.street < 3:
+                stake = min(start[q] - nxt.stacks[q] for q in (0, 1))
+                return stake * (2 * E[state.street] - 1) / scale
+            return nxt.payoffs()[p] / scale
+        v = brute_force_rb(nxt, p, config, spec, policies, scale, out, E, beta, start)
+        if nxt.street != state.street:
+            c = start[p] - nxt.stacks[p]
+            v -= beta * 2 * c * (E[nxt.street] - E[state.street]) / scale
+        return v
+
+    if cur != p:
+        (nz,) = torch.nonzero(probs > 0, as_tuple=True)
+        assert len(nz) == 1, "opponent must be deterministic for the exact check"
+        return edge(state.child(abstract_to_action(engine, info, sp, int(nz[0]))))
+    child = np.zeros(len(info.legal))
+    for a, ok in enumerate(info.legal):
+        if ok:
+            child[a] = edge(state.child(abstract_to_action(engine, info, sp, a)))
+    v = float((probs.numpy() * child).sum())
+    key = tuple(int(t) for t in feats["hist"][0] if t != 0)
+    out[key] = (v, child, np.asarray(info.legal))
+    return v
+
+
+def run_case_rb(stacks, seeds, traverser, pol_tr, pol_opp, beta, **caps):
+    cfg = GameConfig(stacks=stacks)
+    engine = get_engine()
+    ecfg = engine_config(engine, cfg)
+    rng = np.random.default_rng(seeds)
+    decks = [rng.permutation(52).tolist() for _ in range(4)]
+    buttons = [0, 1, 0, 1]
+    policies = [None, None]
+    policies[traverser] = pol_tr
+    policies[1 - traverser] = pol_opp
+    tcfg = TraversalConfig(allin_equity=True, chance_cv=beta, preflop_equity_samples=64, **caps)
+    tr = FrontierTraverser(cfg, SMALL_SPEC, tcfg, "cpu", seed=0)
+    env = deal_env(decks, buttons, cfg, SMALL_SPEC)
+    res = tr.traverse(traverser, policies, iteration=3, roots=env)
+    assert res.root_equity is not None and res.root_equity.shape == (4, 4)
+    scale = float(cfg.big_blind)
+    for r in range(4):
+        state = engine.GameState.new_hand(ecfg, buttons[r], decks[r])
+        E = res.root_equity[r].double().numpy()
+        nodes: dict = {}
+        v_root = brute_force_rb(
+            state, traverser, ecfg, SMALL_SPEC, policies, scale, nodes, E, beta, list(stacks)
+        )
+        assert float(res.root_value[r]) == pytest.approx(v_root, abs=1e-4)
+        sel = (res.node_root == r).nonzero().squeeze(1)
+        got = {tuple(int(t) for t in res.samples["hist"][i] if t != 0): i for i in sel.tolist()}
+        compare = {k: nodes[k] for k in got} if caps else nodes
+        assert set(got) == set(compare)
+        for key, (v, child, legal) in compare.items():
+            i = got[key]
+            assert float(res.node_value[i]) == pytest.approx(v, abs=1e-4)
+            np.testing.assert_allclose(res.edge_value[i].numpy()[legal], child[legal], atol=1e-4)
+            regret = np.where(legal, child - v, 0.0)
+            np.testing.assert_allclose(
+                res.samples["target"][i].float().numpy(), regret, atol=2e-2, rtol=2e-3
+            )
+    return res, env
+
+
+@pytest.mark.parametrize(("traverser", "beta"), [(0, 1.0), (1, 1.0), (0, 0.5)])
+def test_variance_reduced_backup_matches_brute_force(traverser, beta):
+    net = small_net(3)
+    res, env = run_case_rb(
+        [1000, 1000], 13 + traverser, traverser, NetPolicy(net), rule_policy, beta
+    )
+    assert res.stats["allin_leaves"] > 0
+    # the corrections change the values, never the sampled play
+    policies = [rule_policy, rule_policy]
+    policies[traverser] = NetPolicy(net)
+    plain = FrontierTraverser(GameConfig(stacks=[1000, 1000]), SMALL_SPEC, seed=0)
+    base = plain.traverse(traverser, policies, 3, env)
+    assert base.stats["nodes"] == res.stats["nodes"]
+    assert not torch.allclose(base.root_value, res.root_value)
+
+
+def test_variance_reduced_backup_deeper_stacks():
+    net = small_net(4)
+    opp = lambda f: rule_policy(f, no_fold=True)  # noqa: E731
+    res, _ = run_case_rb([5000, 5000], 17, 0, NetPolicy(net), opp, 1.0)
+    assert res.stats["nodes"] > 40 and res.stats["allin_leaves"] > 0
+
+
+def test_variance_reduced_backup_with_caps_and_step_limit():
+    # frontier, depth and step caps force rollouts; with a deterministic
+    # traverser the rolled-out values (and their corrections) are exact
+    opp = lambda f: rule_policy(f, no_fold=True)  # noqa: E731
+    res, _ = run_case_rb(
+        [5000, 5000], 5, 1, rule_policy, opp, 1.0, max_frontier_nodes=12, max_depth=3, max_steps=5
+    )
+    assert res.stats["cut_slots"] > 0 and res.stats["frontier_steps"] > 5
+
+
 def test_strategy_samples_and_stats():
     cfg = GameConfig(stacks=[1500, 1500])
     tcfg = TraversalConfig(record_strategy=True)

@@ -28,6 +28,17 @@ Everything that says whether a bot got better lives here (DESIGN.md 5.7).
   CI half-width shrinks as `1/sqrt(hands)`: going from 20k to 200k hands cuts it
   by about 3.2x. Read the half-width off a short run first, then size the
   real one.
+* **Luck adjustment** (`luck.py`; `run_match` / `run_duplicate_match` with
+  `luck_adjust=True`; `play_match.py --adjust`; `match.luck_adjust` in a
+  config): heads-up results are also reported with card luck removed. A hand
+  that ends in a called all-in before the river scores its equity, and each
+  new street subtracts `2c * (E_new - E_old)`, the change in seat 0's
+  check-down value (`c` chips in per player, `E` the equity against the other
+  hand given the board so far). Both terms have zero mean, so the adjusted
+  win rate estimates the same quantity with a narrower interval. These are
+  the chance terms of AIVAT; its action terms are not implemented. Equities
+  are shared by the two seatings of a duplicate deal, so mirror matches
+  still cancel exactly.
 
 ## Agent specs
 

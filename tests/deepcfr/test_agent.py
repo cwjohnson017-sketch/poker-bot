@@ -84,6 +84,41 @@ def test_sdcfr_average_is_reach_weighted():
     assert len(last) == 1
 
 
+def test_sdcfr_sampled_net_mixture_is_the_average():
+    pol = SDCFRPolicy([(1, FixedNet([1.0, -1.0])), (3, FixedNet([1.0, 1.0]))])
+    rng = np.random.default_rng(0)
+    draws = np.array([pol.sample_index(rng) for _ in range(4000)])
+    assert abs(draws.mean() - 0.75) < 0.03  # net of iteration 3 has weight 3 / 4
+    feats = {"legal": torch.ones(1, 2, dtype=torch.bool)}
+    assert torch.allclose(pol.net_probs(feats, 0)[0], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(pol.net_probs(feats, 1)[0], torch.tensor([0.5, 0.5]))
+    # at the root, drawing a net per hand plays exactly the average policy
+    w = torch.softmax(pol.log_w, 0).float()
+    mix = w[0] * pol.net_probs(feats, 0)[0] + w[1] * pol.net_probs(feats, 1)[0]
+    assert torch.allclose(mix, pol.act_probs(feats)[0])
+
+
+def test_neural_agent_sample_net_keeps_one_net_per_hand(tmp_path):
+    run = make_run(tmp_path)
+    engine = get_engine()
+    config = game_config({}, engine)
+    agent = make_agent(f"neural:{run},sample_net=true")
+    assert isinstance(agent, NeuralBlueprintAgent) and agent.sample_net
+    drawn = []
+    orig = agent.policies[0].sample_index
+
+    def spy(rng):
+        drawn.append(orig(rng))
+        return drawn[-1]
+
+    agent.policies[0].sample_index = spy
+    res = run_match([agent, RandomAgent()], config, 60, seed=4, engine=engine)
+    assert res.hands == 60  # on_illegal="raise": all actions legal
+    # seat 0 draws at most once per hand, whatever the number of decisions
+    assert 0 < len(drawn) <= 60 and set(drawn) <= {0, 1, 2}
+    assert abs(agent.last_probs.sum() - 1) < 1e-9
+
+
 def test_agent_greedy_is_deterministic(tmp_path):
     run = make_run(tmp_path, iters=1)
     engine = get_engine()

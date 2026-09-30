@@ -31,8 +31,11 @@ For iteration `t = 1, 2, ...` and each seat `p` in 0, 1:
    `roots_per_batch`. Seat `p` branches on every legal abstract action. The
    opponent samples one action from its current policy. Chance is sampled once
    per root, because the deck is fixed at the deal. The current policy of a
-   seat is regret matching on its latest advantage net. Before a seat has a
-   net, its policy is uniform over the legal actions. Every node where `p`
+   seat is regret matching on its latest advantage net; when no legal action
+   has a positive advantage it plays the best one (`fallback: argmax`, the
+   paper's rule: uniform play there was about 50% more exploitable in its
+   ablation). Before a seat has a net, its policy is uniform over the legal
+   actions. Leaf values can be variance-reduced (below). Every node where `p`
    branches adds one sample to `p`'s advantage memory: features, legal mask,
    instantaneous regrets `r(a) = v(a) - sum_b sigma(b) v(b)` in value units,
    and the iteration `t`. Seat 1's traversal already uses the net seat 0
@@ -65,6 +68,7 @@ The loop state is an env holding the live slots, plus these per-slot tensors:
 | `root [n]` long | root hand index |
 | `cut [n]` bool | slot is being rolled out (no more branching or samples) |
 | `depth [n]` long | branching nodes on the slot's path |
+| `corr [n]` float | chance control-variate corrections since the slot's last branching node |
 
 One frontier step, the only Python loop:
 
@@ -79,18 +83,40 @@ One frontier step, the only Python loop:
    All other slots keep one copy with a sampled action. Opponents sample from
    their own policy. Cut and depth-capped traverser slots sample from the
    traverser's policy, which is outcome sampling.
-4. `env.step(actions)`. Finished slots write `payoff[p] / value_scale` into
-   their owner edge. A slot with owner -1 writes its root value instead. The
-   finished slots are then dropped with a second `select`.
+4. `env.step(actions)`. Finished slots write `payoff[p] / value_scale` (plus
+   `corr`) into their owner edge. A slot with owner -1 writes its root value
+   instead. The finished slots are then dropped with a second `select`.
 
-If slots are still live after `max_steps`, they finish with `rollout()`.
+If slots are still live after `max_steps`, every slot is cut and they play on
+as rollouts.
 
 **Backup.** Each edge receives exactly one value: a leaf payoff or the value
 of the next branching node below it. Child nodes are always created at a later
 frontier step than their parents. One reverse pass over the steps computes
 `v(node) = sum_a sigma(a) v(node, a)` for all nodes of that step as one tensor
-op and writes the results into the parent edges. Regrets are
-`edge_value - node_value`, masked to the legal actions.
+op and writes the results into the parent edges (plus the corrections the
+node's slot collected on the way down). Regrets are `edge_value - node_value`,
+masked to the legal actions.
+
+**Variance reduction** (`traversal.allin_equity`, `traversal.chance_cv`).
+The regret targets are dominated by sampling noise, much of it from the board.
+Both players' hands and the board are fixed at the root, so the traverser's
+equity against the opponent's actual hand is computed once per root for every
+street, `E_0..E_3` (`street_equities`: exact on the flop, turn and river,
+`preflop_equity_samples` Monte Carlo runouts preflop).
+
+* `allin_equity`: a hand that ends in a called all-in before the river is
+  scored `stake * (2 E_s - 1)` instead of the pre-dealt runout.
+* `chance_cv: beta`: a slot that moves to a new street with `c` chips in per
+  player adds `-beta * 2c * (E_new - E_old)` to `corr`, a check-down control
+  variate. `E_old` is the exact expectation of `E_new` over the dealt cards
+  (unbiased preflop), so the correction has mean zero.
+
+Both leave every regret target unbiased. Measured on the 100bb run's
+iteration-33 nets over 1024 roots per seat, they cut the mean squared regret
+target by 73% preflop, 51% on the flop, 34% on the turn and 0 on the river (21%
+overall; the all-in part alone: 67%, 46%, 28%). The cost is about 34M hand
+evaluations per 8192 roots.
 
 **Why the caps keep regrets unbiased.** A cut slot plays on by sampling the
 traverser's current policy. Its payoff is therefore an unbiased single-sample
@@ -112,7 +138,9 @@ widest step is on the flop or turn.
 uses the scalar engine and the scalar feature encoder on the same decks. The
 traverser policy is a random net and the opponent is deterministic. Every node
 value, child value and regret must match. The same check runs with the
-frontier and depth caps forcing rollouts, using a deterministic traverser.
+frontier and depth caps forcing rollouts, using a deterministic traverser, and
+again with `allin_equity` and `chance_cv` against a brute force that applies
+the same equity values and corrections on the scalar engine.
 
 ## Tensor layouts
 
@@ -196,6 +224,8 @@ values under `p0/` and `p1/`.
 | `cut_slots` | Frontier cap hits. Many cuts mean fewer regret samples deep in the hand. Raise `max_frontier_nodes` or lower `roots_per_batch`. |
 | `max_frontier` | Must stay at or below `max_frontier_nodes`. |
 | `regret_abs_mean` | Mean absolute regret in value units. It should shrink slowly as the strategy converges. |
+| `allin_leaves` | Leaves scored by all-in equity (`allin_equity`). Zero means the feature is off. |
+| `val_r2_preflop` ... `val_r2_river`, `val_r2_all` | Iteration-weighted R^2 of the new net on the held-out samples (`memory.holdout`): `1 - MSE / mean square target`, so predicting zero scores 0. The targets are mostly noise, so values are low (on the first 100bb run, about 0.02 preflop and 0.6 on the river), but a change to the network, loss or inputs that lowers them is fitting worse. Compare runs on these, not on `loss`. |
 | `traversal_s`, `train_s`, `slot_steps_per_s` | Throughput. Training should dominate once the memories are full. |
 
 `eval.csv` and the TensorBoard tags `eval/mbb_vs_equity` and
@@ -204,6 +234,14 @@ The current average strategy plays `EquityThresholdAgent` and the average
 strategy of the previous evaluation. `vs_equity` should turn and stay clearly
 positive. `vs_previous` should hover at or above zero. A significantly
 negative `vs_previous` is a red flag for the run (DESIGN.md 5.7).
+
+Every evaluation plays the same deals (`eval.seed`), so results of different
+iterations are paired. With `eval.sample_net` each hand is played by one net
+drawn with probability proportional to its iteration, which is the SD-CFR
+average in distribution at one forward pass per decision. With
+`eval.luck_adjust` the `mbb_adj` columns (TensorBoard `eval/mbb_adj_vs_*`)
+report the same matches with all-in EV and chance corrections
+(`pokerbot.eval.luck`): unbiased, with a narrower interval.
 
 ## Measured on this container's CPU
 
@@ -249,12 +287,14 @@ iteration, or 1.8 s for the first iteration including warm-up.
   those hands are under-sampled.
 - **One chance sample per root.** All branches of a root share the board.
   This is unbiased and correlates the child values of a node.
-- **Evaluation is small.** It uses `last_n` nets per seat and a few hundred
-  duplicate deals. It shows trends, not adoption-grade results. The DESIGN.md
-  adoption rule needs a 200k-hand match.
+- **Evaluation is small.** It uses `last_n` nets per seat and about a
+  thousand duplicate deals. It shows trends, not adoption-grade results. The
+  DESIGN.md adoption rule needs a 200k-hand match.
 - **SD-CFR play cost grows with the number of nets.** The agent runs one
-  forward pass per net per decision. Use `last_n`, or run on the GPU, for
-  long runs.
+  forward pass per net per decision. Use `sample_net=true`
+  (`neural:<dir>,sample_net=true`: one net per hand, the same strategy in
+  distribution), `last_n`, or the GPU for long runs. Range queries
+  (`policy_all`, search) still need every net.
 - **Untested on CUDA.** This container has no GPU. The code has no
   CPU-only paths and does no per-element host work, but the VRAM and time
   estimates in `configs/deepcfr_4070ti.yaml` are calculations, not

@@ -8,9 +8,9 @@ opponent: uniform       # uniform | call | any agent spec (scalar agents use the
 samples: 16             # act() samples per policy query for agents without policy()
 threads: 1              # torch CPU threads (small kernels: more threads rarely help on CPU)
 
-game:                   # ACPC heads-up no-limit: 50/100 blinds, 200bb stacks
+game:                   # heads-up no-limit, 50/100 blinds, 100bb (the blueprints' game)
   num_players: 2
-  stacks: [20000, 20000]
+  stacks: [10000, 10000]
   small_blind: 50
   big_blind: 100
   ante: 0
