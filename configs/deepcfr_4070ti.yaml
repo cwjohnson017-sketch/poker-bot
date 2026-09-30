@@ -24,8 +24,8 @@ threads: null              # CPU threads for torch host ops (null = default)
 iterations: 600
 out_dir: runs/deepcfr_4070ti
 
-game:                      # ACPC heads-up no-limit, 200bb
-  stacks: [20000, 20000]
+game:                      # 100bb, the game of the tabular blueprint (mccfr_hunl.yaml)
+  stacks: [10000, 10000]
   small_blind: 50
   big_blind: 100
   ante: 0
