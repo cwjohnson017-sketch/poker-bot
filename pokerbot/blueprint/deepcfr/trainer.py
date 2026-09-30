@@ -121,6 +121,9 @@ class _Prefetcher:
         return item
 
 
+_WIDEN = (torch.uint16, torch.uint32, torch.uint64)
+
+
 class _ChunkSampler:
     """Minibatches sliced on the device from large chunks of the memory.
 
@@ -153,6 +156,9 @@ class _ChunkSampler:
             for _ in range(n):
                 idx = np.sort(rng.integers(0, len(mem), size=self.rows))
                 host = mem.gather_compact(idx)
+                # CUDA cannot index unsigned 16/32/64-bit tensors (the iteration
+                # column is stored as uint16): widen them on the host
+                host = {k: v.long() if v.dtype in _WIDEN else v for k, v in host.items()}
                 self.q.put({k: v.to(self.device) for k, v in host.items()})
         except Exception as e:  # surfaced in the training thread
             self.q.put(e)

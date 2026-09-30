@@ -125,10 +125,10 @@ def test_real_bucket_tables_if_built():
     if not (path / "features" / "river_equity.npy").exists():
         pytest.skip("bucket build not present")
     t = StrengthTables(path)
-    hole = np.array([cards_from_str("AsKs"), cards_from_str("7c2d")])
+    hole = np.array([cards_from_str("AsKs"), cards_from_str("7c4d")])
     board = np.array([cards_from_str("QsJsTs3h2h")] * 2)
     f = t.lookup(hole, board, np.array([3, 3]))
-    assert f[0, 0] > 0.99 and f[1, 0] < 0.3  # royal flush vs seven high
+    assert f[0, 0] > 0.99 and f[1, 0] < 0.2  # royal flush vs queen-high (no pair)
     b3 = np.array([cards_from_str("QsJs3h") + [NO_CARD] * 2] * 2)
     flop = t.lookup(hole, b3, np.array([1, 1]))
     assert abs(flop[0, 1:].sum() - 1) < 1e-4 and flop[0, 0] > flop[1, 0]
