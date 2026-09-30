@@ -8,20 +8,26 @@ The legal mask is *not* applied inside the network; callers mask (see
 Architecture:
 
 * **Card branch.** Each of the 7 card slots gets ``rank_emb + suit_emb +
-  slot_emb`` (zeroed for undealt cards); the slots are summed per group
-  (hole, flop, turn, river), the four group vectors concatenated and fed
-  through a 2-layer MLP.
+  slot_emb`` (plus ``card_emb``, one of 52, with ``card_embedding=True`` as
+  in the Deep CFR paper; without it the sum per group cannot tell which rank
+  carries which suit) (zeroed for undealt cards); the slots are summed per
+  group (hole, flop, turn, river), the four group vectors concatenated and
+  fed through a 2-layer MLP.
 * **History branch.** Token embedding + position embedding + a linear
   projection of the chips-added amount, then a GRU (packed by length, the
-  final hidden state is the summary) or, with ``hist_type="transformer"``, a
-  small transformer encoder with a learned summary token.
+  final hidden state is the summary), with ``hist_type="transformer"`` a
+  small transformer encoder with a learned summary token, or with
+  ``hist_type="mlp"`` a 2-layer MLP over the flattened fixed slots (the
+  paper's bet encoding: no sequential loop, runs under bf16 autocast).
 * **Scalars.** Pot/stack/bet fractions, street one-hot etc. (plus optional
   equity features) through one linear layer.
 * **Trunk.** 3-layer MLP of width ``width`` (residual + LayerNorm after the
   first layer) and a linear output head.
 
-The GRU always runs in fp32 (autocast disabled around it); everything else
-follows the caller's autocast (bf16 on CUDA in training and traversal).
+The GRU always runs in fp32 (autocast disabled around it) and needs a host
+sync for its packed lengths; everything else, including the ``"mlp"``
+history branch, follows the caller's autocast (bf16 on CUDA in training and
+traversal).
 """
 
 from __future__ import annotations
@@ -46,7 +52,7 @@ class NetConfig:
     num_scalars: int = NUM_SCALARS
     card_dim: int = 64
     card_hidden: int = 768
-    hist_type: str = "gru"  # "gru" | "transformer"
+    hist_type: str = "gru"  # "gru" | "transformer" | "mlp"
     # The GRU runs in fp32 once per token: it is the most expensive part of a
     # forward pass per row, so it is kept narrower than the MLPs.
     hist_dim: int = 128
@@ -56,6 +62,7 @@ class NetConfig:
     scalar_hidden: int = 64
     width: int = 512
     trunk_layers: int = 3
+    card_embedding: bool = False  # add a per-card (52-way) embedding (Deep CFR)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,11 +76,12 @@ class CardBranch(nn.Module):
     # slot -> group: hole (0, 1), flop (2, 3, 4), turn (5), river (6)
     GROUPS = (0, 0, 1, 1, 1, 2, 3)
 
-    def __init__(self, dim: int, hidden: int) -> None:
+    def __init__(self, dim: int, hidden: int, card_embedding: bool = False) -> None:
         super().__init__()
         self.rank = nn.Embedding(14, dim)  # 13 = undealt
         self.suit = nn.Embedding(5, dim)  # 4 = undealt
         self.slot = nn.Embedding(7, dim)
+        self.card = nn.Embedding(NO_CARD + 1, dim) if card_embedding else None
         self.register_buffer("group", torch.tensor(self.GROUPS), persistent=False)
         self.mlp = nn.Sequential(
             nn.Linear(4 * dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU()
@@ -87,6 +95,8 @@ class CardBranch(nn.Module):
         suit = torch.where(dealt, c % 4, 4)
         slots = torch.arange(7, device=cards.device)
         e = self.rank(rank) + self.suit(suit) + self.slot(slots)[None]
+        if self.card is not None:
+            e = e + self.card(torch.where(dealt, c, NO_CARD))
         e = e * dealt[..., None].to(e.dtype)  # [n, 7, d]
         n = cards.shape[0]
         g = e.new_zeros(n, 4, self.dim).index_add_(1, self.group, e)
@@ -111,6 +121,13 @@ class HistoryBranch(nn.Module):
             self.tf = nn.TransformerEncoder(layer, cfg.hist_layers, enable_nested_tensor=False)
             self.cls = nn.Parameter(torch.zeros(1, 1, d))
             self.out = nn.Sequential(nn.Linear(d, cfg.hist_hidden), nn.ReLU())
+        elif self.kind == "mlp":
+            self.mlp = nn.Sequential(
+                nn.Linear(cfg.history_len * d, cfg.hist_hidden),
+                nn.ReLU(),
+                nn.Linear(cfg.hist_hidden, cfg.hist_hidden),
+                nn.ReLU(),
+            )
         else:
             raise ValueError(f"unknown hist_type {self.kind!r}")
 
@@ -120,6 +137,8 @@ class HistoryBranch(nn.Module):
         pos = torch.arange(T, device=hist.device)
         x = self.tok(hist) + self.pos(pos + 1)[None] + self.amt(hist_amt[..., None].float())
         x = x * mask[..., None].to(x.dtype)
+        if self.kind == "mlp":
+            return self.mlp(x.reshape(n, T * x.shape[-1]))
         if self.kind == "gru":
             lengths = mask.sum(1)
             with torch.autocast(device_type=hist.device.type, enabled=False):
@@ -142,7 +161,7 @@ class AdvantageNet(nn.Module):
     def __init__(self, cfg: NetConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.cards = CardBranch(cfg.card_dim, cfg.card_hidden)
+        self.cards = CardBranch(cfg.card_dim, cfg.card_hidden, cfg.card_embedding)
         self.history = HistoryBranch(cfg)
         self.scalars = nn.Sequential(nn.Linear(cfg.num_scalars, cfg.scalar_hidden), nn.ReLU())
         w = cfg.width

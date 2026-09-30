@@ -56,6 +56,10 @@ class TrainingConfig:
     reinit: bool = True  # re-initialize the advantage net every iteration (paper)
     bf16: bool = True  # bf16 autocast on CUDA (always fp32 on CPU)
     prefetch: int = 2  # minibatches prepared ahead by a host thread (0 = inline)
+    # > 0: move this many rows to the device at once and slice minibatches there
+    # (one host gather per chunk_rows / batch_size steps; replaces prefetch)
+    chunk_rows: int = 0
+    ema_decay: float = 0.0  # > 0: use an exponential moving average of the weights
     checkpoint_dtype: str = "float32"  # float32 | float16 | bfloat16
     # regret matching when no legal action has a positive advantage: "argmax"
     # (the Deep CFR paper; uniform was ~50% more exploitable in its ablation)

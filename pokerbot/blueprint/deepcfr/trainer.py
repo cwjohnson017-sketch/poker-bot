@@ -44,7 +44,7 @@ from ...config import git_hash
 from ...env.obs import SCALAR_NAMES
 from .checkpoint import list_checkpoints, load_net, save_net, write_meta
 from .config import DeepCFRConfig, spec_to_dict
-from .memory import ReservoirMemory
+from .memory import ReservoirMemory, decode
 from .networks import AdvantageNet, num_params
 from .traversal import FrontierTraverser, NetPolicy
 
@@ -112,6 +112,56 @@ class _Prefetcher:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class _ChunkSampler:
+    """Minibatches sliced on the device from large chunks of the memory.
+
+    A host thread draws ``rows`` rows uniformly (with replacement), gathers them
+    in the compact storage dtypes and moves them to ``device``; the training
+    loop then takes minibatches in a random order from the device chunk, so the
+    host does one gather per ``rows / batch`` steps instead of one per step.
+    Every minibatch is still a uniform sample of the memory."""
+
+    def __init__(
+        self, mem: ReservoirMemory, batch: int, device: torch.device, rows: int, steps: int
+    ) -> None:
+        self.batch, self.device = int(batch), device
+        self.rows = max(int(rows), self.batch)
+        self.per_chunk = self.rows // self.batch
+        n_chunks = -(-int(steps) // self.per_chunk)
+        seed = int(mem.rng.integers(2**62))
+        self.gen = torch.Generator(device=device).manual_seed(seed)
+        self.q: queue.Queue = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(
+            target=self._run, args=(mem, np.random.default_rng(seed), n_chunks), daemon=True
+        )
+        self.thread.start()
+        self.cur: dict[str, torch.Tensor] | None = None
+        self.perm: torch.Tensor | None = None
+        self.pos = self.per_chunk
+
+    def _run(self, mem: ReservoirMemory, rng: np.random.Generator, n: int) -> None:
+        try:
+            for _ in range(n):
+                idx = np.sort(rng.integers(0, len(mem), size=self.rows))
+                host = mem.gather_compact(idx)
+                self.q.put({k: v.to(self.device) for k, v in host.items()})
+        except Exception as e:  # surfaced in the training thread
+            self.q.put(e)
+
+    def get(self) -> dict[str, torch.Tensor]:
+        if self.pos >= self.per_chunk:
+            item = self.q.get()
+            if isinstance(item, Exception):
+                raise item
+            self.cur = item
+            self.perm = torch.randperm(self.rows, device=self.device, generator=self.gen)
+            self.pos = 0
+        assert self.cur is not None and self.perm is not None
+        idx = self.perm[self.pos * self.batch : (self.pos + 1) * self.batch]
+        self.pos += 1
+        return decode({k: v[idx] for k, v in self.cur.items()})
 
 
 class DeepCFRTrainer:
@@ -285,13 +335,19 @@ class DeepCFRTrainer:
             net = AdvantageNet(self.net_cfg).to(self.device)
             net.load_state_dict(self.nets[p].state_dict())
         net.train()
-        opt = torch.optim.Adam(net.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
-        steps = tc.sgd_steps
-        pre = (
-            _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
-            if tc.prefetch > 0
-            else None
+        params = list(net.parameters())
+        opt = torch.optim.Adam(
+            params, lr=tc.lr, weight_decay=tc.weight_decay, fused=self.device.type == "cuda"
         )
+        # exponential moving average of the weights (the returned net), with the
+        # usual warm-up so the random initialization does not linger in it
+        ema = [q.detach().clone() for q in params] if tc.ema_decay > 0 else None
+        steps = tc.sgd_steps
+        pre: _Prefetcher | _ChunkSampler | None = None
+        if tc.chunk_rows > 0:
+            pre = _ChunkSampler(mem, tc.batch_size, self.device, tc.chunk_rows, steps)
+        elif tc.prefetch > 0:
+            pre = _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
         tail = max(1, steps // 10)
         losses: list[torch.Tensor] = []
         first = float("nan")
@@ -310,13 +366,20 @@ class DeepCFRTrainer:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if tc.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), tc.grad_clip)
+                torch.nn.utils.clip_grad_norm_(params, tc.grad_clip)
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    decay = min(tc.ema_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(ema, params, 1.0 - decay)
             if step == 0:
                 first = float(loss.detach())
             if step >= steps - tail:
                 losses.append(loss.detach())
         final = float(torch.stack(losses).mean()) if losses else float("nan")
+        if ema is not None:
+            with torch.no_grad():
+                torch._foreach_copy_(params, ema)
         return net.eval(), final, first
 
     def run(self, iterations: int | None = None) -> None:

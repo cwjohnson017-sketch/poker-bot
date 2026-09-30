@@ -41,11 +41,16 @@ For iteration `t = 1, 2, ...` and each seat `p` in 0, 1:
    and the iteration `t`. Seat 1's traversal already uses the net seat 0
    trained in this iteration, as in Algorithm 1 of the paper.
 2. **Train.** The net is reinitialized, or warm-started with `reinit: false`.
-   It then runs `sgd_steps` Adam steps on uniform minibatches from the
-   reservoir, with the linear-CFR loss
+   It then runs `sgd_steps` Adam steps (fused on CUDA) on uniform minibatches
+   from the reservoir, with the linear-CFR loss
    `sum_i t_i * sum_a legal_ia (net(x_i)_a - r_ia)^2 / sum_i t_i`.
    Gradient-norm clipping is applied. On CUDA the MLPs run under bf16
-   autocast and the GRU and the loss stay in fp32.
+   autocast and the GRU and the loss stay in fp32. With `ema_decay > 0` the
+   saved net is an exponential moving average of the weights (the targets are
+   mostly noise, so averaging the last few thousand minibatches helps the
+   fit). With `chunk_rows > 0` a host thread moves that many uniformly drawn
+   rows to the device at a time and minibatches are sliced there, one host
+   gather per `chunk_rows / batch_size` steps instead of one per step.
 3. **Save.** The net is saved as `checkpoints/p{p}/iter{t}.pt`. The average
    strategy is `avg(I) = sum_t t * pi_t(I) * sigma_t(I) / sum_t t * pi_t(I)`,
    where `pi_t(I)` is the seat's own reach under `sigma_t`. `SDCFRPolicy`
@@ -182,7 +187,12 @@ copy-on-write.
 - History branch: token embedding plus position embedding plus a linear
   projection of the amount, then a packed GRU (hidden 256, final state).
   `hist_type: transformer` swaps in a transformer encoder with a summary
-  token.
+  token; `hist_type: mlp` a 2-layer MLP over the 24 flattened slots (the
+  paper's fixed-slot bet encoding), which runs under bf16 autocast without the
+  GRU's sequential loop and host sync.
+- `card_embedding: true` adds a 52-way per-card embedding to the rank, suit
+  and slot embeddings, as in the Deep CFR paper. Without it the per-group sum
+  cannot tell which hole card carries which suit (As5h and Ah5s look the same).
 - Scalars: a linear layer to 64.
 - Trunk: 3 layers of width 512 (residual and LayerNorm after the first),
   then a linear head to `A` advantages. The caller applies the legal mask
