@@ -25,6 +25,12 @@ forward pass per decision instead of one per net.
 
 Indexing: the net saved after iteration ``t`` has weight ``t``. The uniform
 strategy of iteration 1 (no net yet) is not included.
+
+With tabular preflop regrets (``preflop``: the :class:`~.preflop.PreflopTree`
+and each iteration's strategy table, saved in its checkpoint), rows at a
+known preflop node take iteration ``t``'s probabilities from its table
+instead of its net, in :meth:`SDCFRPolicy.net_policies` and
+:meth:`SDCFRPolicy.net_probs`; the reach weights and the average follow.
 """
 
 from __future__ import annotations
@@ -35,8 +41,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .checkpoint import list_checkpoints, load_net
+from .checkpoint import list_checkpoints, load_checkpoint, read_meta
 from .networks import AdvantageNet, regret_matching
+from .preflop import PreflopTree, table_probs
 
 
 class SDCFRPolicy:
@@ -47,6 +54,7 @@ class SDCFRPolicy:
         reach_weighted: bool = True,
         fallback: str = "uniform",
         device: torch.device | str = "cpu",
+        preflop: tuple[PreflopTree, dict[int, torch.Tensor]] | None = None,
     ) -> None:
         nets = sorted(nets, key=lambda x: x[0])
         if last_n:
@@ -56,6 +64,14 @@ class SDCFRPolicy:
         self.device = torch.device(device)
         self.iterations = [t for t, _ in nets]
         self.nets = [net.to(self.device).eval() for _, net in nets]
+        self.preflop_tree: PreflopTree | None = None
+        self.preflop_tables: torch.Tensor | None = None  # [T, nodes * 169, A]
+        if preflop is not None:
+            tree, tables = preflop
+            self.preflop_tree = tree.to(self.device)
+            self.preflop_tables = torch.stack(
+                [tables[t].to(self.device, torch.float32) for t in self.iterations]
+            )
         self.log_w = torch.log(torch.tensor(self.iterations, dtype=torch.float64))
         self.reach_weighted = reach_weighted
         self.fallback = fallback
@@ -76,7 +92,14 @@ class SDCFRPolicy:
             cks = cks[-int(last_n) :]
         if not cks:
             raise FileNotFoundError(f"no checkpoints for player {player} under {path}")
-        return cls([load_net(f, device) for _, f in cks], device=device, **kwargs)
+        loaded = [load_checkpoint(f, device) for _, f in cks]
+        preflop = None
+        meta = read_meta(path)
+        if meta.get("preflop") and all(pre is not None for _, _, pre in loaded):
+            tree = PreflopTree.from_meta(meta["preflop"], device)
+            preflop = (tree, {t: pre for t, _, pre in loaded})
+        nets = [(t, net) for t, net, _ in loaded]
+        return cls(nets, device=device, preflop=preflop, **kwargs)
 
     def __len__(self) -> int:
         return len(self.nets)
@@ -84,12 +107,29 @@ class SDCFRPolicy:
     # ------------------------------------------------------------ stateless
     @torch.no_grad()
     def net_policies(self, feats: dict[str, torch.Tensor]) -> torch.Tensor:
-        """``[T, n, A]`` regret-matching policy of every net."""
+        """``[T, n, A]`` policy of every iteration (its net, or its preflop table)."""
         feats = {k: v.to(self.device) for k, v in feats.items()}
         legal = feats["legal"]
-        return torch.stack(
+        P = torch.stack(
             [regret_matching(net(feats).float(), legal, self.fallback) for net in self.nets]
         )
+        return self._with_tables(P, feats, None)
+
+    def _with_tables(
+        self, P: torch.Tensor, feats: dict[str, torch.Tensor], index: int | None
+    ) -> torch.Tensor:
+        """Overwrite the rows of ``P`` at known preflop nodes with the tables."""
+        if self.preflop_tree is None or self.preflop_tables is None:
+            return P
+        rows, cells = self.preflop_tree.locate(feats)
+        if rows.numel() == 0:
+            return P
+        legal = feats["legal"][rows].float()
+        if index is None:
+            P[:, rows] = table_probs(self.preflop_tables, cells, legal)
+        else:
+            P[rows] = table_probs(self.preflop_tables[index], cells, legal)
+        return P
 
     @torch.no_grad()
     def average(
@@ -139,4 +179,5 @@ class SDCFRPolicy:
     def net_probs(self, feats: dict[str, torch.Tensor], index: int) -> torch.Tensor:
         """``[n, A]`` regret-matching policy of net ``index`` alone."""
         feats = {k: v.to(self.device) for k, v in feats.items()}
-        return regret_matching(self.nets[index](feats).float(), feats["legal"], self.fallback)
+        P = regret_matching(self.nets[index](feats).float(), feats["legal"], self.fallback)
+        return self._with_tables(P, feats, index)

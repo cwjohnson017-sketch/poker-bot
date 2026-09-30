@@ -32,8 +32,16 @@ def _on_device(pol: SDCFRPolicy, device: torch.device) -> SDCFRPolicy:
     if pol.device == device:
         return pol
     nets = [(t, copy.deepcopy(net)) for t, net in zip(pol.iterations, pol.nets, strict=True)]
+    preflop = None
+    if pol.preflop_tree is not None and pol.preflop_tables is not None:
+        tables = dict(zip(pol.iterations, pol.preflop_tables, strict=True))
+        preflop = (pol.preflop_tree, tables)
     return SDCFRPolicy(
-        nets, reach_weighted=pol.reach_weighted, fallback=pol.fallback, device=device
+        nets,
+        reach_weighted=pol.reach_weighted,
+        fallback=pol.fallback,
+        device=device,
+        preflop=preflop,
     )
 
 

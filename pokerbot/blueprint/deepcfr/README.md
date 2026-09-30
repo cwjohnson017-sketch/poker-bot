@@ -8,6 +8,7 @@ engines by `NeuralBlueprintAgent`.
 |---|---|
 | `features.py` | canonical network inputs (`features_from_obs`), `FeatureConfig` (optional equity inputs) |
 | `strength.py` | hand-strength inputs looked up per canonical hand class from the bucket build (`StrengthTables`, `add_strength`) |
+| `preflop.py` | tabular preflop regrets: `PreflopTree` (the abstract preflop nodes), `PreflopRegrets`, `TablePolicy` |
 | `networks.py` | `AdvantageNet`, `NetConfig`, `regret_matching`, `StrategyHead` |
 | `memory.py` | `ReservoirMemory`: compact host reservoir buffer, minibatch sampling, save/load |
 | `traversal.py` | `FrontierTraverser` (batched external sampling), `rollout`, `actor_probs`, `NetPolicy`, `deal_env` |
@@ -59,6 +60,23 @@ For iteration `t = 1, 2, ...` and each seat `p` in 0, 1:
    net, and after acting it multiplies each net's reach by that net's
    probability of the action taken. `last_n` averages only the most recent
    nets. `reach_weighted=False` gives a plain `t`-weighted mixture.
+
+**Tabular preflop** (`training.tabular_preflop`, `preflop.py`). Preflop has few
+infosets (the 100bb abstraction has 92 decision nodes, so 92 x 169 = 15,548
+with the lossless hand classes) and they are the ones the net fits worst: on
+the first 100bb run it explained about 2% of the preflop regret-target
+variance, and its raise outputs at the root were uncorrelated with the class
+means it was regressing onto. With the option on, the regret samples of
+preflop nodes are also summed into a table per seat,
+`R[node, class, a] += t * r` (tabular linear CFR over every sample, where the
+reservoir keeps a shrinking fraction), and both seats play preflop from its
+regret-matching strategy (uniform over the legal actions when no regret is
+positive). The table's strategy after iteration `t` is saved in checkpoint
+`t`, so `SDCFRPolicy` averages it like the nets: at a known preflop node
+iteration `t`'s probabilities come from its table. The net still trains on
+preflop samples and answers for histories the tree does not contain (off-tree
+opponent raises mapped onto lines the abstraction never reaches). The tree is
+enumerated from the game and spec at startup and stored in `meta.json`.
 
 Values are chips divided by `value_scale`, which defaults to the big blind.
 The 4070 Ti config uses 1000, which is 10bb. Regret matching is
@@ -252,6 +270,7 @@ values under `p0/` and `p1/`.
 | `max_frontier` | Must stay at or below `max_frontier_nodes`. |
 | `regret_abs_mean` | Mean absolute regret in value units. It should shrink slowly as the strategy converges. |
 | `allin_leaves` | Leaves scored by all-in equity (`allin_equity`). Zero means the feature is off. |
+| `preflop_samples` | Regret samples summed into the preflop table this iteration (`tabular_preflop`). |
 | `val_r2_preflop` ... `val_r2_river`, `val_r2_all` | Iteration-weighted R^2 of the new net on the held-out samples (`memory.holdout`): `1 - MSE / mean square target`, so predicting zero scores 0. The targets are mostly noise, so values are low (on the first 100bb run, about 0.02 preflop and 0.6 on the river), but a change to the network, loss or inputs that lowers them is fitting worse. Compare runs on these, not on `loss`. |
 | `traversal_s`, `train_s`, `slot_steps_per_s` | Throughput. Training should dominate once the memories are full. |
 

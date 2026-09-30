@@ -14,6 +14,11 @@ network from the same iteration, as in the Deep CFR paper):
 3. Save ``checkpoints/p{p}/iter{t}.pt``. The list of all checkpoints is the
    SD-CFR average strategy (:class:`~.policy.SDCFRPolicy`).
 
+With ``training.tabular_preflop`` the regret samples of preflop nodes are
+also summed into a table per seat (:mod:`.preflop`, linear weights ``t``);
+both seats play preflop from its regret-matching strategy, and each
+iteration's strategy table is saved in that iteration's checkpoint.
+
 With ``memory.holdout > 0`` that fraction of the regret samples goes to a
 separate validation reservoir instead; after each fit the net's
 iteration-weighted R^2 on it is logged per street (``val_r2_*``: 1 - weighted
@@ -46,6 +51,7 @@ from .checkpoint import list_checkpoints, load_net, save_net, write_meta
 from .config import DeepCFRConfig, spec_to_dict
 from .memory import ReservoirMemory, decode
 from .networks import AdvantageNet, num_params
+from .preflop import PreflopRegrets, PreflopTree, TablePolicy
 from .traversal import FrontierTraverser, NetPolicy
 
 CSV_FIELDS = (
@@ -62,6 +68,7 @@ CSV_FIELDS = (
     "max_frontier",
     "cut_slots",
     "allin_leaves",
+    "preflop_samples",
     "regret_abs_mean",
     "val_r2_preflop",
     "val_r2_flop",
@@ -209,6 +216,11 @@ class DeepCFRTrainer:
                 ReservoirMemory(cap, A, S, T, V, cfg.seed * 10 + 5 + p, f"strat_p{p}")
                 for p in (0, 1)
             ]
+        self.preflop: list[PreflopRegrets] | None = None
+        preflop_tree = None
+        if cfg.training.tabular_preflop:
+            preflop_tree = PreflopTree.build(self.game_config, self.spec, self.device)
+            self.preflop = [PreflopRegrets(preflop_tree, self.device) for _ in (0, 1)]
         self.nets: list[AdvantageNet | None] = [None, None]
         self.checkpoints: list[list[tuple[int, Path]]] = [[], []]
         self.iteration = 0
@@ -227,6 +239,8 @@ class DeepCFRTrainer:
             "fallback": cfg.training.fallback,
             "git": git_hash(),
         }
+        if preflop_tree is not None:
+            self.meta["preflop"] = preflop_tree.to_meta()
         write_meta(self.ckpt_root, self.meta)
         (self.out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2, default=str))
         if resume:
@@ -246,10 +260,13 @@ class DeepCFRTrainer:
         )
 
     # ---------------------------------------------------------------- policies
-    def policy(self, p: int) -> NetPolicy:
-        return NetPolicy(
+    def policy(self, p: int) -> NetPolicy | TablePolicy:
+        net = NetPolicy(
             self.nets[p], self.cfg.training.fallback, self.amp_dtype, self.cfg.traversal.infer_chunk
         )
+        if self.preflop is None:
+            return net
+        return TablePolicy(net, self.preflop[p].tree, self.preflop[p].strategy())
 
     # ---------------------------------------------------------------- phases
     def collect(self, p: int, t: int) -> dict[str, float]:
@@ -263,12 +280,19 @@ class DeepCFRTrainer:
             "max_frontier": 0,
             "cut_slots": 0,
             "allin_leaves": 0,
+            "preflop_samples": 0,
         }
         reg_sum = 0.0
         remaining = tr.traversals_per_iter
+        # this iteration's preflop regrets join the table after the traversals,
+        # so every batch plays the same strategy (like the nets)
+        pending = self.preflop[p].pending() if self.preflop is not None else None
         while remaining > 0:
             k = min(tr.roots_per_batch, remaining)
             res = self.traverser.traverse(p, policies, t, k)
+            if pending is not None:
+                n_pre = self.preflop[p].add_samples(pending, res.samples, float(t))
+                agg["preflop_samples"] += n_pre
             self._store(p, res.samples)
             if self.strat_mem is not None and res.strategy is not None:
                 self.strat_mem[1 - p].add_batch(res.strategy)
@@ -279,6 +303,8 @@ class DeepCFRTrainer:
             reg_sum += s["regret_abs_mean"] * s["nodes"]
             remaining -= k
         agg["regret_abs_mean"] = reg_sum / max(1, agg["nodes"])
+        if pending is not None:
+            self.preflop[p].regret += pending
         return agg
 
     def _store(self, p: int, samples: dict[str, torch.Tensor]) -> None:
@@ -398,8 +424,9 @@ class DeepCFRTrainer:
             t2 = time.time()
             val = self.validate(p, net)
             self.nets[p] = net
+            table = self.preflop[p].strategy() if self.preflop is not None else None
             path = save_net(
-                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype
+                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype, table
             )
             self.checkpoints[p].append((t, path))
             row = {
@@ -506,6 +533,7 @@ class DeepCFRTrainer:
             "iteration": self.iteration,
             "last_eval_iter": self.last_eval_iter,
             "holdout_rng": self._holdout_rng.bit_generator.state,
+            "preflop": [r.state_dict() for r in self.preflop] if self.preflop else None,
             "traverser_gen": self.traverser.generator.get_state(),
             "roots_gen": roots.generator.get_state() if roots is not None else None,
             "roots_n": roots.n if roots is not None else 0,
@@ -547,6 +575,11 @@ class DeepCFRTrainer:
         self.last_eval_iter = int(state.get("last_eval_iter", 0))
         if state.get("holdout_rng") is not None:
             self._holdout_rng.bit_generator.state = state["holdout_rng"]
+        if self.preflop is not None:
+            if not state.get("preflop"):
+                raise ValueError("resume point has no preflop regrets (tabular_preflop was off)")
+            for r, d in zip(self.preflop, state["preflop"], strict=True):
+                r.load_state_dict(d)
         self.traverser.generator.set_state(state["traverser_gen"])
         if state.get("roots_gen") is not None and state["roots_n"]:
             self.traverser.new_roots(int(state["roots_n"]))

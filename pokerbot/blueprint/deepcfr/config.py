@@ -60,6 +60,7 @@ class TrainingConfig:
     # (one host gather per chunk_rows / batch_size steps; replaces prefetch)
     chunk_rows: int = 0
     ema_decay: float = 0.0  # > 0: use an exponential moving average of the weights
+    tabular_preflop: bool = False  # preflop regrets in a table (169 classes x nodes)
     checkpoint_dtype: str = "float32"  # float32 | float16 | bfloat16
     # regret matching when no legal action has a positive advantage: "argmax"
     # (the Deep CFR paper; uniform was ~50% more exploitable in its ablation)
