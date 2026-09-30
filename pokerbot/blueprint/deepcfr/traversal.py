@@ -74,6 +74,7 @@ from ...env.equity import street_equities
 from ...env.vec_env import VecNLHE
 from .features import FeatureConfig, features_from_obs, index_features
 from .networks import regret_matching
+from .strength import StrengthTables, add_strength, load_strength
 
 PolicyFn = Callable[[dict[str, torch.Tensor]], torch.Tensor]
 """Maps a feature dict ``[n, ...]`` to action probabilities ``[n, A]`` (0 on illegal)."""
@@ -158,9 +159,11 @@ def rollout(
     generator: torch.Generator | None = None,
     obs_kwargs: dict[str, Any] | None = None,
     max_steps: int = 256,
+    strength: StrengthTables | None = None,
 ) -> torch.Tensor:
     """Play every live slot of ``env`` to the end (in place), each seat sampling
-    from its policy. Returns ``payoffs [n, 2]`` (long chips)."""
+    from its policy. Returns ``payoffs [n, 2]`` (long chips). ``strength``
+    appends the table-lookup strength columns for nets that expect them."""
     obs_kwargs = obs_kwargs or {}
     for _ in range(max_steps):
         live = (~env.done).nonzero().squeeze(1)
@@ -168,6 +171,8 @@ def rollout(
             break
         feats = features_from_obs(env.obs(generator=generator, **obs_kwargs))
         sub = index_features(feats, live)
+        if strength is not None:
+            sub = add_strength(sub, strength)
         probs = actor_probs(sub, env.actor[live], policies)
         a = env.tab.call_index[env.street.clamp(0, 3)].clone()
         a[live] = sample_actions(probs, generator)
@@ -270,6 +275,8 @@ class FrontierTraverser:
         self.generator = make_generator(seed * 2 + 1, self.device)
         self._roots: VecNLHE | None = None
         self.value_scale = float(self.cfg.value_scale or self.game_config.big_blind)
+        path = self.cfg.features.strength_tables
+        self.strength = load_strength(path) if path else None
 
     def new_roots(self, k: int) -> VecNLHE:
         """``k`` freshly dealt hands (buttons alternate per slot and per call)."""
@@ -313,6 +320,11 @@ class FrontierTraverser:
             c9 = env.cards
             hero, opp = (c9[:, 0:2], c9[:, 2:4]) if p == 0 else (c9[:, 2:4], c9[:, 0:2])
             root_eq = street_equities(hero, opp, c9[:, 4:9], cfg.preflop_equity_samples, gen)
+
+        root_str = None  # [K, 2, 4, 11] strength columns per root, seat and street
+        if self.strength is not None:
+            cols = self.strength.root_features(env.cards.cpu().numpy())
+            root_str = torch.from_numpy(cols).to(dev)
 
         root_value = torch.zeros(K, dtype=torch.float32, device=dev)
         pre_done = env.done.clone()
@@ -365,6 +377,9 @@ class FrontierTraverser:
             n = env.n
             feats = features_from_obs(env.obs(generator=gen, **obs_kwargs))
             actor = env.actor
+            if root_str is not None:
+                cols = root_str[root, actor.clamp(min=0), env.street.clamp(0, 3)]
+                feats["scalars"] = torch.cat([feats["scalars"], cols], 1)
             probs = actor_probs(feats, actor, policies)
             is_trav = actor == p
             legal = feats["legal"]

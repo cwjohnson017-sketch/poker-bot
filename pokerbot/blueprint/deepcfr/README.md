@@ -7,6 +7,7 @@ engines by `NeuralBlueprintAgent`.
 | Module | Contents |
 |---|---|
 | `features.py` | canonical network inputs (`features_from_obs`), `FeatureConfig` (optional equity inputs) |
+| `strength.py` | hand-strength inputs looked up per canonical hand class from the bucket build (`StrengthTables`, `add_strength`) |
 | `networks.py` | `AdvantageNet`, `NetConfig`, `regret_matching`, `StrategyHead` |
 | `memory.py` | `ReservoirMemory`: compact host reservoir buffer, minibatch sampling, save/load |
 | `traversal.py` | `FrontierTraverser` (batched external sampling), `rollout`, `actor_probs`, `NetPolicy`, `deal_env` |
@@ -157,8 +158,24 @@ the same equity values and corrections on the scalar engine.
 | `card_mask` | `[n, 7]` bool | visible cards |
 | `hist` | `[n, 24]` long | env tokens `1 + (street*2 + is_button)*A + idx`, 0 = pad |
 | `hist_amt` | `[n, 24]` float | chips added per action / starting stack |
-| `scalars` | `[n, 14 (+1) (+10)]` | `obs["scalars"]`, then optional equity and 10-bin equity histogram |
+| `scalars` | `[n, 14 (+1) (+10) (+11)]` | `obs["scalars"]`, then optional Monte Carlo equity and 10-bin equity histogram, then the optional table-lookup strength columns |
 | `legal` | `[n, A]` bool | legal abstract actions |
+
+**Strength inputs** (`features.strength_tables`, `strength.py`). The card-bucket
+build stores, per suit-isomorphic (hole, board) class of each postflop street,
+the class's equity against a random hand and, on the flop and turn, a 10-bin
+histogram of its river equity over the runouts. With `strength_tables` naming
+that directory (e.g. `data/abstraction/buckets_hunl`) the scalars get 11 more
+columns: the acting hand's equity and histogram (zeros on the river, whose
+histogram is its equity, and preflop, where the equity comes from a 169-class
+table computed once per process). The traversal looks them up once per root
+deal for both seats and every street (Rust canonical index plus a gather from
+the memory-mapped files; about 0.1 s per 8192 roots once the files are
+cached) and gathers them per slot; the scalar encoder, the range policy and
+`NeuralVecPolicy` append the same columns with `add_strength`. This replaces
+the Monte Carlo equity inputs, which cost more than an env step per decision.
+In an offline A/B on the 100bb run's reservoir they raised held-out explained
+variance from 0.243 to 0.261, almost all of it on the river.
 
 **Advantage memory** (`memory.py`, per sample, `A = 6`, `S = 14`):
 

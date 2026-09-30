@@ -57,6 +57,7 @@ from .scalar import (
     engine_for,
     nearest_abstract,
 )
+from .strength import add_strength, load_strength
 
 RAISE = 2
 BOARD_LEN = (0, 3, 4, 5)
@@ -159,22 +160,26 @@ class NeuralRangePolicy:
         K = holes.shape[0]
         out = {k: v.expand(K, *v.shape[1:]).clone() for k, v in feats.items()}
         out["cards"][:, :2] = holes
-        if self._equity:
-            from ...env.equity import equity_histogram, equity_vs_random
-
-            f = self.features
-            gen = self._gen()
-            b = out["cards"][:, 2:]
+        f = self.features
+        if self._equity or f.strength_tables:
+            # the hand-dependent columns are recomputed for every hand
             extra = [out["scalars"][:, :NUM_SCALARS]]
-            if f.equity_samples > 0:
-                extra.append(equity_vs_random(holes, b, f.equity_samples, gen)[:, None].float())
-            if f.hist_runouts > 0:
-                extra.append(
-                    equity_histogram(
-                        holes, b, f.hist_runouts, f.hist_bins, f.hist_opp_samples, gen
-                    ).float()
-                )
+            b = out["cards"][:, 2:]
+            if self._equity:
+                from ...env.equity import equity_histogram, equity_vs_random
+
+                gen = self._gen()
+                if f.equity_samples > 0:
+                    extra.append(equity_vs_random(holes, b, f.equity_samples, gen)[:, None].float())
+                if f.hist_runouts > 0:
+                    extra.append(
+                        equity_histogram(
+                            holes, b, f.hist_runouts, f.hist_bins, f.hist_opp_samples, gen
+                        ).float()
+                    )
             out["scalars"] = torch.cat(extra, 1)
+            if f.strength_tables:
+                out = add_strength(out, load_strength(f.strength_tables))
         return out, info
 
     @staticmethod
