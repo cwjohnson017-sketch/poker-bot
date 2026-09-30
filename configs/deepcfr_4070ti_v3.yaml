@@ -1,0 +1,120 @@
+# v3: deepcfr_4070ti.yaml (the dcfr2 settings) plus tabular preflop regrets,
+# table-lookup hand-strength inputs (needs the bucket build in
+# data/abstraction/buckets_hunl), the MLP history encoder with the 52-card
+# embedding, a weight EMA and device-sliced minibatches.
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti_v3.yaml --out runs/dcfr3
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti_v3.yaml --resume runs/dcfr3
+# dcfr2 measured ~14 s traversal and ~106 s training per player-iteration (with
+# the NVIDIA sysmem fallback off). The MLP history branch should make training
+# steps cheaper: measure train_s in the first iterations, then consider spending
+# the saving on more sgd_steps (Deep CFR's ablations: SGD steps set the final
+# exploitability; its heads-up limit run used 32k steps of 20k).
+# Host memory: 25 scalars make a sample 149 B, so 2 x 40M ~ 12 GB.
+#
+# Deep CFR (SD-CFR) neural blueprint: the real run on one RTX 4070 Ti (12 GB).
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti.yaml --out runs/dcfr1
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti.yaml --resume runs/dcfr1
+#
+# Budget estimates (not yet measured on the card; see the README for how to
+# check them in the first iterations):
+#   VRAM   ~3-5 GB peak. Frontier env state ~0.6 KB/slot x 262k slots x ~3
+#          live copies ~0.5 GB; features ~0.1 GB; one inference chunk of 32k
+#          rows ~1.5 GB (history embeddings + packed fp32 GRU); recorded nodes
+#          of one batch ~0.1 GB; training batch 10k ~0.5 GB. If nvidia-smi
+#          shows headroom, raise roots_per_batch and max_frontier_nodes
+#          together (e.g. 16384 / 524288).
+#   Host   advantage memories 2 x 40M x 121 B ~ 9.7 GB (needs 32 GB RAM);
+#          snapshots of the same size on disk every save_every iterations.
+#   Disk   one fp16 net ~4.4 MB; 2 x 600 iterations ~ 5.3 GB of checkpoints.
+#   Time   per iteration and player: traversal ~8 batches x ~20 frontier steps
+#          x ~0.3 s ~ 50 s (~3M regret samples); training 4000 Adam steps of
+#          10k at ~15 ms ~ 60 s. About 4 min per iteration, 600 iterations
+#          ~ 40 h, plus evaluation (~5 min every 10 iterations).
+#          The per-root equities (allin_equity / chance_cv) add ~34M hand
+#          evaluations per batch of 8192 roots on the GPU; check traversal_s in
+#          the first iterations.
+
+seed: 0
+device: auto               # cuda when available
+threads: null              # CPU threads for torch host ops (null = default)
+iterations: 600
+out_dir: runs/dcfr3
+
+game:                      # 100bb, the game of the tabular blueprint (mccfr_hunl.yaml)
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+actions: null              # null = DESIGN.md 5.3 action abstraction (env DEFAULT_SPEC)
+
+features:
+  equity_samples: 0        # equity inputs cost more than a whole env step;
+  hist_runouts: 0          # try 64 / 4 in a second run and compare
+  hist_bins: 10
+  hist_opp_samples: 0
+  strength_tables: data/abstraction/buckets_hunl  # 11 lookup columns
+
+network:                   # ~2.2M parameters
+  card_dim: 64
+  card_hidden: 768
+  hist_type: mlp           # the paper's fixed-slot bet encoding, bf16
+  hist_dim: 64
+  hist_hidden: 256
+  hist_layers: 1
+  width: 512
+  trunk_layers: 3
+  card_embedding: true     # rank + suit + slot + card (52) embeddings
+
+traversal:
+  traversals_per_iter: 65536   # root hands per player per iteration
+  roots_per_batch: 8192        # ~30 live slots per root at the widest step
+  max_frontier_nodes: 262144   # cap on live slots (the rest are rolled out)
+  max_depth: 64                # effectively uncapped: hands have <= 24 actions
+  max_steps: 64
+  value_scale: 1000            # regrets in units of 10bb (targets ~O(1-20)); scale-free for RM
+  record_strategy: false       # SD-CFR needs no strategy memory
+  infer_chunk: 32768           # rows per network call (bounds activation memory)
+  allin_equity: true           # all-ins called before the river score their exact equity
+  chance_cv: 1.0               # check-down control variate at every street change
+  preflop_equity_samples: 1024 # Monte Carlo runouts for the preflop equity (flop on: exact)
+
+memory:
+  capacity: 40000000       # per player
+  save_every: 10           # resume points (each snapshot writes ~10 GB)
+  holdout: 0.01            # 1% of regret samples validate the fit (val_r2_* in log.csv)
+  holdout_capacity: 400000
+
+training:
+  sgd_steps: 4000
+  batch_size: 10000
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  reinit: true             # from scratch every iteration, as in the paper
+  bf16: true               # autocast for the MLPs; the GRU stays fp32
+  prefetch: 3              # unused with chunk_rows
+  chunk_rows: 1000000      # 1M rows (~150 MB) to the GPU per 100 steps
+  ema_decay: 0.999         # the saved net averages the last ~1000 steps
+  tabular_preflop: true    # preflop regrets in a 92 x 169 table
+  checkpoint_dtype: float16
+  fallback: argmax         # no positive advantage: best action (uniform was ~50% worse)
+
+eval:
+  every: 10
+  deals: 1000              # 2000 hands per match; CIs stay wide, watch the trend
+  last_n: 32               # nets averaged per seat during evaluation
+  seed: 0                  # the same deals at every evaluation (paired comparisons)
+  sample_net: true         # one net per hand: the SD-CFR average at 1 forward pass/decision
+  luck_adjust: true        # also log all-in EV + chance-corrected results (mbb_adj)
+  engine: auto
+  device: null             # null = the training device
+  vs_equity: true
+  vs_previous: true
+  equity:
+    samples: 200
+
+logging:
+  tensorboard: true
+  csv: true
+  print: true

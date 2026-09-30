@@ -7,6 +7,8 @@ engines by `NeuralBlueprintAgent`.
 | Module | Contents |
 |---|---|
 | `features.py` | canonical network inputs (`features_from_obs`), `FeatureConfig` (optional equity inputs) |
+| `strength.py` | hand-strength inputs looked up per canonical hand class from the bucket build (`StrengthTables`, `add_strength`) |
+| `preflop.py` | tabular preflop regrets: `PreflopTree` (the abstract preflop nodes), `PreflopRegrets`, `TablePolicy` |
 | `networks.py` | `AdvantageNet`, `NetConfig`, `regret_matching`, `StrategyHead` |
 | `memory.py` | `ReservoirMemory`: compact host reservoir buffer, minibatch sampling, save/load |
 | `traversal.py` | `FrontierTraverser` (batched external sampling), `rollout`, `actor_probs`, `NetPolicy`, `deal_env` |
@@ -41,11 +43,16 @@ For iteration `t = 1, 2, ...` and each seat `p` in 0, 1:
    and the iteration `t`. Seat 1's traversal already uses the net seat 0
    trained in this iteration, as in Algorithm 1 of the paper.
 2. **Train.** The net is reinitialized, or warm-started with `reinit: false`.
-   It then runs `sgd_steps` Adam steps on uniform minibatches from the
-   reservoir, with the linear-CFR loss
+   It then runs `sgd_steps` Adam steps (fused on CUDA) on uniform minibatches
+   from the reservoir, with the linear-CFR loss
    `sum_i t_i * sum_a legal_ia (net(x_i)_a - r_ia)^2 / sum_i t_i`.
    Gradient-norm clipping is applied. On CUDA the MLPs run under bf16
-   autocast and the GRU and the loss stay in fp32.
+   autocast and the GRU and the loss stay in fp32. With `ema_decay > 0` the
+   saved net is an exponential moving average of the weights (the targets are
+   mostly noise, so averaging the last few thousand minibatches helps the
+   fit). With `chunk_rows > 0` a host thread moves that many uniformly drawn
+   rows to the device at a time and minibatches are sliced there, one host
+   gather per `chunk_rows / batch_size` steps instead of one per step.
 3. **Save.** The net is saved as `checkpoints/p{p}/iter{t}.pt`. The average
    strategy is `avg(I) = sum_t t * pi_t(I) * sigma_t(I) / sum_t t * pi_t(I)`,
    where `pi_t(I)` is the seat's own reach under `sigma_t`. `SDCFRPolicy`
@@ -53,6 +60,23 @@ For iteration `t = 1, 2, ...` and each seat `p` in 0, 1:
    net, and after acting it multiplies each net's reach by that net's
    probability of the action taken. `last_n` averages only the most recent
    nets. `reach_weighted=False` gives a plain `t`-weighted mixture.
+
+**Tabular preflop** (`training.tabular_preflop`, `preflop.py`). Preflop has few
+infosets (the 100bb abstraction has 92 decision nodes, so 92 x 169 = 15,548
+with the lossless hand classes) and they are the ones the net fits worst: on
+the first 100bb run it explained about 2% of the preflop regret-target
+variance, and its raise outputs at the root were uncorrelated with the class
+means it was regressing onto. With the option on, the regret samples of
+preflop nodes are also summed into a table per seat,
+`R[node, class, a] += t * r` (tabular linear CFR over every sample, where the
+reservoir keeps a shrinking fraction), and both seats play preflop from its
+regret-matching strategy (uniform over the legal actions when no regret is
+positive). The table's strategy after iteration `t` is saved in checkpoint
+`t`, so `SDCFRPolicy` averages it like the nets: at a known preflop node
+iteration `t`'s probabilities come from its table. The net still trains on
+preflop samples and answers for histories the tree does not contain (off-tree
+opponent raises mapped onto lines the abstraction never reaches). The tree is
+enumerated from the game and spec at startup and stored in `meta.json`.
 
 Values are chips divided by `value_scale`, which defaults to the big blind.
 The 4070 Ti config uses 1000, which is 10bb. Regret matching is
@@ -152,8 +176,24 @@ the same equity values and corrections on the scalar engine.
 | `card_mask` | `[n, 7]` bool | visible cards |
 | `hist` | `[n, 24]` long | env tokens `1 + (street*2 + is_button)*A + idx`, 0 = pad |
 | `hist_amt` | `[n, 24]` float | chips added per action / starting stack |
-| `scalars` | `[n, 14 (+1) (+10)]` | `obs["scalars"]`, then optional equity and 10-bin equity histogram |
+| `scalars` | `[n, 14 (+1) (+10) (+11)]` | `obs["scalars"]`, then optional Monte Carlo equity and 10-bin equity histogram, then the optional table-lookup strength columns |
 | `legal` | `[n, A]` bool | legal abstract actions |
+
+**Strength inputs** (`features.strength_tables`, `strength.py`). The card-bucket
+build stores, per suit-isomorphic (hole, board) class of each postflop street,
+the class's equity against a random hand and, on the flop and turn, a 10-bin
+histogram of its river equity over the runouts. With `strength_tables` naming
+that directory (e.g. `data/abstraction/buckets_hunl`) the scalars get 11 more
+columns: the acting hand's equity and histogram (zeros on the river, whose
+histogram is its equity, and preflop, where the equity comes from a 169-class
+table computed once per process). The traversal looks them up once per root
+deal for both seats and every street (Rust canonical index plus a gather from
+the memory-mapped files; about 0.1 s per 8192 roots once the files are
+cached) and gathers them per slot; the scalar encoder, the range policy and
+`NeuralVecPolicy` append the same columns with `add_strength`. This replaces
+the Monte Carlo equity inputs, which cost more than an env step per decision.
+In an offline A/B on the 100bb run's reservoir they raised held-out explained
+variance from 0.243 to 0.261, almost all of it on the river.
 
 **Advantage memory** (`memory.py`, per sample, `A = 6`, `S = 14`):
 
@@ -182,7 +222,12 @@ copy-on-write.
 - History branch: token embedding plus position embedding plus a linear
   projection of the amount, then a packed GRU (hidden 256, final state).
   `hist_type: transformer` swaps in a transformer encoder with a summary
-  token.
+  token; `hist_type: mlp` a 2-layer MLP over the 24 flattened slots (the
+  paper's fixed-slot bet encoding), which runs under bf16 autocast without the
+  GRU's sequential loop and host sync.
+- `card_embedding: true` adds a 52-way per-card embedding to the rank, suit
+  and slot embeddings, as in the Deep CFR paper. Without it the per-group sum
+  cannot tell which hole card carries which suit (As5h and Ah5s look the same).
 - Scalars: a linear layer to 64.
 - Trunk: 3 layers of width 512 (residual and LayerNorm after the first),
   then a linear head to `A` advantages. The caller applies the legal mask
@@ -225,6 +270,7 @@ values under `p0/` and `p1/`.
 | `max_frontier` | Must stay at or below `max_frontier_nodes`. |
 | `regret_abs_mean` | Mean absolute regret in value units. It should shrink slowly as the strategy converges. |
 | `allin_leaves` | Leaves scored by all-in equity (`allin_equity`). Zero means the feature is off. |
+| `preflop_samples` | Regret samples summed into the preflop table this iteration (`tabular_preflop`). |
 | `val_r2_preflop` ... `val_r2_river`, `val_r2_all` | Iteration-weighted R^2 of the new net on the held-out samples (`memory.holdout`): `1 - MSE / mean square target`, so predicting zero scores 0. The targets are mostly noise, so values are low (on the first 100bb run, about 0.02 preflop and 0.6 on the river), but a change to the network, loss or inputs that lowers them is fitting worse. Compare runs on these, not on `loss`. |
 | `traversal_s`, `train_s`, `slot_steps_per_s` | Throughput. Training should dominate once the memories are full. |
 

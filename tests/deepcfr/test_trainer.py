@@ -71,6 +71,20 @@ def test_one_iteration_smoke_and_resume(tmp_path):
     assert [t for t, _ in list_checkpoints(tmp_path, 1)] == [1, 2]
 
 
+def test_training_options_mlp_history_chunks_and_ema(tmp_path):
+    cfg = tiny_cfg()
+    cfg.eval.every = 0
+    cfg.network = {**cfg.network, "hist_type": "mlp", "card_embedding": True}
+    cfg.training.chunk_rows = 512
+    cfg.training.ema_decay = 0.99
+    tr = DeepCFRTrainer(cfg, tmp_path)
+    rows = tr.run_iteration(1)
+    tr.close()
+    assert tr.nets[0].cfg.hist_type == "mlp" and tr.nets[0].cfg.card_embedding
+    for r in rows:
+        assert math.isfinite(r["loss"]) and math.isfinite(r["val_r2_all"])
+
+
 def test_config_rejects_unknown_keys():
     with pytest.raises(ValueError):
         DeepCFRConfig.from_dict({"training": {"sgd_step": 3}})

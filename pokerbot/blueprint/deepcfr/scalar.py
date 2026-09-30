@@ -448,4 +448,8 @@ def encode_state(
                 )
             )
         feats["scalars"] = torch.cat([feats["scalars"]] + [e.float() for e in extra], 1)
+    if features.strength_tables:
+        from .strength import add_strength, load_strength
+
+        feats = add_strength(feats, load_strength(features.strength_tables))
     return feats, info

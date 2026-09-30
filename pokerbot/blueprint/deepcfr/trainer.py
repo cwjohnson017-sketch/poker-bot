@@ -14,6 +14,11 @@ network from the same iteration, as in the Deep CFR paper):
 3. Save ``checkpoints/p{p}/iter{t}.pt``. The list of all checkpoints is the
    SD-CFR average strategy (:class:`~.policy.SDCFRPolicy`).
 
+With ``training.tabular_preflop`` the regret samples of preflop nodes are
+also summed into a table per seat (:mod:`.preflop`, linear weights ``t``);
+both seats play preflop from its regret-matching strategy, and each
+iteration's strategy table is saved in that iteration's checkpoint.
+
 With ``memory.holdout > 0`` that fraction of the regret samples goes to a
 separate validation reservoir instead; after each fit the net's
 iteration-weighted R^2 on it is logged per street (``val_r2_*``: 1 - weighted
@@ -44,8 +49,9 @@ from ...config import git_hash
 from ...env.obs import SCALAR_NAMES
 from .checkpoint import list_checkpoints, load_net, save_net, write_meta
 from .config import DeepCFRConfig, spec_to_dict
-from .memory import ReservoirMemory
+from .memory import ReservoirMemory, decode
 from .networks import AdvantageNet, num_params
+from .preflop import PreflopRegrets, PreflopTree, TablePolicy
 from .traversal import FrontierTraverser, NetPolicy
 
 CSV_FIELDS = (
@@ -62,6 +68,7 @@ CSV_FIELDS = (
     "max_frontier",
     "cut_slots",
     "allin_leaves",
+    "preflop_samples",
     "regret_abs_mean",
     "val_r2_preflop",
     "val_r2_flop",
@@ -114,6 +121,56 @@ class _Prefetcher:
         return item
 
 
+class _ChunkSampler:
+    """Minibatches sliced on the device from large chunks of the memory.
+
+    A host thread draws ``rows`` rows uniformly (with replacement), gathers them
+    in the compact storage dtypes and moves them to ``device``; the training
+    loop then takes minibatches in a random order from the device chunk, so the
+    host does one gather per ``rows / batch`` steps instead of one per step.
+    Every minibatch is still a uniform sample of the memory."""
+
+    def __init__(
+        self, mem: ReservoirMemory, batch: int, device: torch.device, rows: int, steps: int
+    ) -> None:
+        self.batch, self.device = int(batch), device
+        self.rows = max(int(rows), self.batch)
+        self.per_chunk = self.rows // self.batch
+        n_chunks = -(-int(steps) // self.per_chunk)
+        seed = int(mem.rng.integers(2**62))
+        self.gen = torch.Generator(device=device).manual_seed(seed)
+        self.q: queue.Queue = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(
+            target=self._run, args=(mem, np.random.default_rng(seed), n_chunks), daemon=True
+        )
+        self.thread.start()
+        self.cur: dict[str, torch.Tensor] | None = None
+        self.perm: torch.Tensor | None = None
+        self.pos = self.per_chunk
+
+    def _run(self, mem: ReservoirMemory, rng: np.random.Generator, n: int) -> None:
+        try:
+            for _ in range(n):
+                idx = np.sort(rng.integers(0, len(mem), size=self.rows))
+                host = mem.gather_compact(idx)
+                self.q.put({k: v.to(self.device) for k, v in host.items()})
+        except Exception as e:  # surfaced in the training thread
+            self.q.put(e)
+
+    def get(self) -> dict[str, torch.Tensor]:
+        if self.pos >= self.per_chunk:
+            item = self.q.get()
+            if isinstance(item, Exception):
+                raise item
+            self.cur = item
+            self.perm = torch.randperm(self.rows, device=self.device, generator=self.gen)
+            self.pos = 0
+        assert self.cur is not None and self.perm is not None
+        idx = self.perm[self.pos * self.batch : (self.pos + 1) * self.batch]
+        self.pos += 1
+        return decode({k: v[idx] for k, v in self.cur.items()})
+
+
 class DeepCFRTrainer:
     def __init__(
         self, cfg: DeepCFRConfig, out_dir: str | Path | None = None, resume: bool = False
@@ -159,6 +216,11 @@ class DeepCFRTrainer:
                 ReservoirMemory(cap, A, S, T, V, cfg.seed * 10 + 5 + p, f"strat_p{p}")
                 for p in (0, 1)
             ]
+        self.preflop: list[PreflopRegrets] | None = None
+        preflop_tree = None
+        if cfg.training.tabular_preflop:
+            preflop_tree = PreflopTree.build(self.game_config, self.spec, self.device)
+            self.preflop = [PreflopRegrets(preflop_tree, self.device) for _ in (0, 1)]
         self.nets: list[AdvantageNet | None] = [None, None]
         self.checkpoints: list[list[tuple[int, Path]]] = [[], []]
         self.iteration = 0
@@ -177,6 +239,8 @@ class DeepCFRTrainer:
             "fallback": cfg.training.fallback,
             "git": git_hash(),
         }
+        if preflop_tree is not None:
+            self.meta["preflop"] = preflop_tree.to_meta()
         write_meta(self.ckpt_root, self.meta)
         (self.out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2, default=str))
         if resume:
@@ -196,10 +260,13 @@ class DeepCFRTrainer:
         )
 
     # ---------------------------------------------------------------- policies
-    def policy(self, p: int) -> NetPolicy:
-        return NetPolicy(
+    def policy(self, p: int) -> NetPolicy | TablePolicy:
+        net = NetPolicy(
             self.nets[p], self.cfg.training.fallback, self.amp_dtype, self.cfg.traversal.infer_chunk
         )
+        if self.preflop is None:
+            return net
+        return TablePolicy(net, self.preflop[p].tree, self.preflop[p].strategy())
 
     # ---------------------------------------------------------------- phases
     def collect(self, p: int, t: int) -> dict[str, float]:
@@ -213,12 +280,19 @@ class DeepCFRTrainer:
             "max_frontier": 0,
             "cut_slots": 0,
             "allin_leaves": 0,
+            "preflop_samples": 0,
         }
         reg_sum = 0.0
         remaining = tr.traversals_per_iter
+        # this iteration's preflop regrets join the table after the traversals,
+        # so every batch plays the same strategy (like the nets)
+        pending = self.preflop[p].pending() if self.preflop is not None else None
         while remaining > 0:
             k = min(tr.roots_per_batch, remaining)
             res = self.traverser.traverse(p, policies, t, k)
+            if pending is not None:
+                n_pre = self.preflop[p].add_samples(pending, res.samples, float(t))
+                agg["preflop_samples"] += n_pre
             self._store(p, res.samples)
             if self.strat_mem is not None and res.strategy is not None:
                 self.strat_mem[1 - p].add_batch(res.strategy)
@@ -229,6 +303,8 @@ class DeepCFRTrainer:
             reg_sum += s["regret_abs_mean"] * s["nodes"]
             remaining -= k
         agg["regret_abs_mean"] = reg_sum / max(1, agg["nodes"])
+        if pending is not None:
+            self.preflop[p].regret += pending
         return agg
 
     def _store(self, p: int, samples: dict[str, torch.Tensor]) -> None:
@@ -285,13 +361,19 @@ class DeepCFRTrainer:
             net = AdvantageNet(self.net_cfg).to(self.device)
             net.load_state_dict(self.nets[p].state_dict())
         net.train()
-        opt = torch.optim.Adam(net.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
-        steps = tc.sgd_steps
-        pre = (
-            _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
-            if tc.prefetch > 0
-            else None
+        params = list(net.parameters())
+        opt = torch.optim.Adam(
+            params, lr=tc.lr, weight_decay=tc.weight_decay, fused=self.device.type == "cuda"
         )
+        # exponential moving average of the weights (the returned net), with the
+        # usual warm-up so the random initialization does not linger in it
+        ema = [q.detach().clone() for q in params] if tc.ema_decay > 0 else None
+        steps = tc.sgd_steps
+        pre: _Prefetcher | _ChunkSampler | None = None
+        if tc.chunk_rows > 0:
+            pre = _ChunkSampler(mem, tc.batch_size, self.device, tc.chunk_rows, steps)
+        elif tc.prefetch > 0:
+            pre = _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
         tail = max(1, steps // 10)
         losses: list[torch.Tensor] = []
         first = float("nan")
@@ -310,13 +392,20 @@ class DeepCFRTrainer:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if tc.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), tc.grad_clip)
+                torch.nn.utils.clip_grad_norm_(params, tc.grad_clip)
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    decay = min(tc.ema_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(ema, params, 1.0 - decay)
             if step == 0:
                 first = float(loss.detach())
             if step >= steps - tail:
                 losses.append(loss.detach())
         final = float(torch.stack(losses).mean()) if losses else float("nan")
+        if ema is not None:
+            with torch.no_grad():
+                torch._foreach_copy_(params, ema)
         return net.eval(), final, first
 
     def run(self, iterations: int | None = None) -> None:
@@ -335,8 +424,9 @@ class DeepCFRTrainer:
             t2 = time.time()
             val = self.validate(p, net)
             self.nets[p] = net
+            table = self.preflop[p].strategy() if self.preflop is not None else None
             path = save_net(
-                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype
+                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype, table
             )
             self.checkpoints[p].append((t, path))
             row = {
@@ -443,6 +533,7 @@ class DeepCFRTrainer:
             "iteration": self.iteration,
             "last_eval_iter": self.last_eval_iter,
             "holdout_rng": self._holdout_rng.bit_generator.state,
+            "preflop": [r.state_dict() for r in self.preflop] if self.preflop else None,
             "traverser_gen": self.traverser.generator.get_state(),
             "roots_gen": roots.generator.get_state() if roots is not None else None,
             "roots_n": roots.n if roots is not None else 0,
@@ -484,6 +575,11 @@ class DeepCFRTrainer:
         self.last_eval_iter = int(state.get("last_eval_iter", 0))
         if state.get("holdout_rng") is not None:
             self._holdout_rng.bit_generator.state = state["holdout_rng"]
+        if self.preflop is not None:
+            if not state.get("preflop"):
+                raise ValueError("resume point has no preflop regrets (tabular_preflop was off)")
+            for r, d in zip(self.preflop, state["preflop"], strict=True):
+                r.load_state_dict(d)
         self.traverser.generator.set_state(state["traverser_gen"])
         if state.get("roots_gen") is not None and state["roots_n"]:
             self.traverser.new_roots(int(state["roots_n"]))
