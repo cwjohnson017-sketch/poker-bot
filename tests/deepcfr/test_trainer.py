@@ -43,11 +43,17 @@ def test_one_iteration_smoke_and_resume(tmp_path):
         assert [t for t, _ in list_checkpoints(tmp_path, p)] == [1]
     assert (tmp_path / "trainer_state.pt").exists()
     assert (tmp_path / "memory" / "adv_p0" / "target.npy").exists()
+    assert (tmp_path / "memory" / "val_p0" / "target.npy").exists()
     with open(tmp_path / "log.csv") as fh:
-        assert len(list(csv.DictReader(fh))) == 2
+        log = list(csv.DictReader(fh))
+    assert len(log) == 2
+    for r in log:  # the tiny config holds out 10% of the samples and scores all-ins
+        assert math.isfinite(float(r["val_r2_all"])) and float(r["val_r2_all"]) <= 1.0
+        assert int(r["allin_leaves"]) > 0
     with open(tmp_path / "eval.csv") as fh:
         ev = list(csv.DictReader(fh))
     assert [e["opponent"] for e in ev] == ["equity"]
+    assert math.isfinite(float(ev[0]["mbb_adj"]))
     assert any(p.name.startswith("events") for p in (tmp_path / "tb").iterdir())
 
     # resume: memories, nets and iteration counter come back; iteration 2 runs
@@ -55,6 +61,7 @@ def test_one_iteration_smoke_and_resume(tmp_path):
     tr2 = DeepCFRTrainer(tiny_cfg(), tmp_path, resume=True)
     assert tr2.iteration == 1
     assert len(tr2.adv_mem[0]) == rows[0]["adv_mem_size"]
+    assert len(tr2.val_mem[0]) == len(tr.val_mem[0]) > 0
     assert tr2.nets[0] is not None
     tr2.run(2)
     tr2.close()

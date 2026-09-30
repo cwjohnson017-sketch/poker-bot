@@ -32,6 +32,9 @@ class TraversalRunConfig:
     value_scale: float | None = None  # chips per value unit (default: big blind)
     record_strategy: bool = False  # SD-CFR does not need a strategy memory
     infer_chunk: int = 65536  # rows per network call inside a frontier step
+    allin_equity: bool = False  # score all-ins called before the river by their equity
+    chance_cv: float = 0.0  # beta of the street-change control variate (0 = off)
+    preflop_equity_samples: int = 1024  # Monte Carlo runouts for the preflop equity
 
 
 @dataclass
@@ -39,6 +42,8 @@ class MemoryConfig:
     capacity: int = 40_000_000  # advantage samples per player
     strategy_capacity: int = 0  # per player, only with record_strategy
     save_every: int = 1  # iterations between memory snapshots (resume points); 0 = never
+    holdout: float = 0.0  # fraction of regret samples kept out of training (validation)
+    holdout_capacity: int = 400_000  # per player, reservoir of held-out samples
 
 
 @dataclass
@@ -52,7 +57,10 @@ class TrainingConfig:
     bf16: bool = True  # bf16 autocast on CUDA (always fp32 on CPU)
     prefetch: int = 2  # minibatches prepared ahead by a host thread (0 = inline)
     checkpoint_dtype: str = "float32"  # float32 | float16 | bfloat16
-    fallback: str = "uniform"  # regret matching when no positive advantage
+    # regret matching when no legal action has a positive advantage: "argmax"
+    # (the Deep CFR paper; uniform was ~50% more exploitable in its ablation)
+    # or "uniform"
+    fallback: str = "argmax"
 
 
 @dataclass
@@ -65,6 +73,9 @@ class EvalConfig:
     vs_equity: bool = True
     vs_previous: bool = True
     equity: dict[str, Any] = field(default_factory=dict)  # EquityThresholdAgent kwargs
+    seed: int | None = 0  # deal seed, the same for every evaluation; None = iteration number
+    sample_net: bool = True  # play the SD-CFR average by sampling one net per hand
+    luck_adjust: bool = True  # also report all-in EV + chance-corrected results
 
 
 @dataclass
@@ -134,6 +145,9 @@ class DeepCFRConfig:
             max_steps=t.max_steps,
             value_scale=t.value_scale,
             record_strategy=t.record_strategy,
+            allin_equity=t.allin_equity,
+            chance_cv=t.chance_cv,
+            preflop_equity_samples=t.preflop_equity_samples,
             features=self.features,
         )
 

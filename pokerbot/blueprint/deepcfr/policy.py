@@ -17,6 +17,12 @@ multiplies each net's reach by that net's probability of the action.
 of the per-iteration policies, cheaper to reason about but not the CFR
 average). ``last_n`` keeps only the most recent nets for speed.
 
+Playing one hand with a single net drawn with probability ``w_t / sum w``
+(:meth:`SDCFRPolicy.sample_index`, :meth:`SDCFRPolicy.net_probs`) realizes
+the reach-weighted average exactly: the reach weights above are the
+posterior over the drawn net given the player's own actions. It costs one
+forward pass per decision instead of one per net.
+
 Indexing: the net saved after iteration ``t`` has weight ``t``. The uniform
 strategy of iteration 1 (no net yet) is not included.
 """
@@ -26,6 +32,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from .checkpoint import list_checkpoints, load_net
@@ -120,3 +127,16 @@ class SDCFRPolicy:
         p = self._last[:, 0, int(action)].double().cpu()
         self.log_reach = self.log_reach + torch.log(p.clamp(min=0))[:, None]
         self._last = None
+
+    # ------------------------------------------------------------ one net per hand
+    def sample_index(self, rng: np.random.Generator) -> int:
+        """A net drawn with probability proportional to its iteration weight
+        (play a whole hand with it; see the module docstring)."""
+        w = torch.softmax(self.log_w, 0).numpy()
+        return int(rng.choice(len(w), p=w / w.sum()))
+
+    @torch.no_grad()
+    def net_probs(self, feats: dict[str, torch.Tensor], index: int) -> torch.Tensor:
+        """``[n, A]`` regret-matching policy of net ``index`` alone."""
+        feats = {k: v.to(self.device) for k, v in feats.items()}
+        return regret_matching(self.nets[index](feats).float(), feats["legal"], self.fallback)

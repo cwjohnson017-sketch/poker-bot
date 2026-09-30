@@ -17,6 +17,9 @@
 #          x ~0.3 s ~ 50 s (~3M regret samples); training 4000 Adam steps of
 #          10k at ~15 ms ~ 60 s. About 4 min per iteration, 600 iterations
 #          ~ 40 h, plus evaluation (~5 min every 10 iterations).
+#          The per-root equities (allin_equity / chance_cv) add ~34M hand
+#          evaluations per batch of 8192 roots on the GPU; check traversal_s in
+#          the first iterations.
 
 seed: 0
 device: auto               # cuda when available
@@ -57,10 +60,15 @@ traversal:
   value_scale: 1000            # regrets in units of 10bb (targets ~O(1-20)); scale-free for RM
   record_strategy: false       # SD-CFR needs no strategy memory
   infer_chunk: 32768           # rows per network call (bounds activation memory)
+  allin_equity: true           # all-ins called before the river score their exact equity
+  chance_cv: 1.0               # check-down control variate at every street change
+  preflop_equity_samples: 1024 # Monte Carlo runouts for the preflop equity (flop on: exact)
 
 memory:
   capacity: 40000000       # per player
   save_every: 10           # resume points (each snapshot writes ~10 GB)
+  holdout: 0.01            # 1% of regret samples validate the fit (val_r2_* in log.csv)
+  holdout_capacity: 400000
 
 training:
   sgd_steps: 4000
@@ -72,12 +80,15 @@ training:
   bf16: true               # autocast for the MLPs; the GRU stays fp32
   prefetch: 3
   checkpoint_dtype: float16
-  fallback: uniform
+  fallback: argmax         # no positive advantage: best action (uniform was ~50% worse)
 
 eval:
   every: 10
-  deals: 500               # 1000 hands per match; CIs stay wide, watch the trend
+  deals: 1000              # 2000 hands per match; CIs stay wide, watch the trend
   last_n: 32               # nets averaged per seat during evaluation
+  seed: 0                  # the same deals at every evaluation (paired comparisons)
+  sample_net: true         # one net per hand: the SD-CFR average at 1 forward pass/decision
+  luck_adjust: true        # also log all-in EV + chance-corrected results (mbb_adj)
   engine: auto
   device: null             # null = the training device
   vs_equity: true

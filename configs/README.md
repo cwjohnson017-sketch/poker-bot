@@ -36,3 +36,6 @@ results lives only on the command line or in someone's shell history.
 | `mccfr_hunl.yaml` | `scripts/train_mccfr.py --config configs/mccfr_hunl.yaml` | The Phase 1 blueprint: 100bb, DESIGN.md action table, 169/1000/1000/1000 buckets; 6-10 GB RAM, 1-1.5 days on 16 cores. |
 | `buckets_tiny.yaml` | `scripts/build_buckets.py --config configs/buckets_tiny.yaml` | Card-bucket smoke run on the CPU (256 classes per street, 8 buckets, ~10 s); padded full-length tables for plumbing tests. |
 | `buckets_hunl.yaml` | `scripts/build_buckets.py --config configs/buckets_hunl.yaml --device cuda` | Postflop bucket tables for `mccfr_hunl.yaml` (1000/1000/1000, equity histograms + EMD k-means, sampled centre fitting); ~1.3 h on one RTX 4070 Ti. |
+
+The evaluation configs (`match`, `ladder`, `lbr`, `abr_*`) play 100bb, the game
+both blueprints are trained on; an agent trained for other stacks warns.

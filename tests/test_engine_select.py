@@ -70,5 +70,5 @@ def test_to_engine_action():
 def test_match_config_file_loads():
     cfg = load_yaml(Path(__file__).parent.parent / "configs" / "match.yaml")
     gc = game_config(cfg["game"], reference)
-    assert gc.num_players == 2 and gc.big_blind == 100 and gc.stacks == [20000, 20000]
+    assert gc.num_players == 2 and gc.big_blind == 100 and gc.stacks == [10000, 10000]
     assert git_hash() != ""
