@@ -50,6 +50,11 @@ _KIND_CODES = {
     "allin": K_ALLIN,
 }
 
+# when a sized raise is offered: always, only as the street's first voluntary
+# raise (an opening bet or raise), or only facing a voluntary raise (a re-raise)
+W_ANY, W_OPEN, W_RERAISE = 0, 1, 2
+_WHEN_CODES = {"open": W_OPEN, "reraise": W_RERAISE}
+
 AbstractAction = tuple
 
 
@@ -66,8 +71,13 @@ class ActionSpec:
             for a in st:
                 if a[0] not in _KIND_CODES:
                     raise ValueError(f"unknown abstract action {a}")
-                if a[0] in ("raise", "raise_x") and not (len(a) == 2 and a[1] > 0):
-                    raise ValueError(f"bad size in {a}")
+                if a[0] in ("raise", "raise_x"):
+                    if len(a) not in (2, 3) or not a[1] > 0:
+                        raise ValueError(f"bad size in {a}")
+                    if len(a) == 3 and a[2] not in _WHEN_CODES:
+                        raise ValueError(f"condition must be 'open' or 'reraise' in {a}")
+                elif len(a) != 1:
+                    raise ValueError(f"{a[0]} takes no size or condition: {a}")
             names = [a[0] for a in st]
             if names.count("fold") != 1 or names.count("check_call") != 1:
                 raise ValueError("every street needs exactly one fold and one check_call")
@@ -79,7 +89,9 @@ class ActionSpec:
 
     def describe(self, street: int, index: int) -> str:
         a = self.streets[street][index]
-        return a[0] if len(a) == 1 else f"{a[0]} {a[1]:g}"
+        if len(a) == 1:
+            return a[0]
+        return f"{a[0]} {a[1]:g}" + (f" ({a[2]})" if len(a) == 3 else "")
 
     def tables(self, device: torch.device | str) -> SpecTables:
         return SpecTables.build(self, device)
@@ -106,6 +118,7 @@ DEFAULT_SPEC = ActionSpec(
 class SpecTables:
     kind: torch.Tensor  # [4, A] abstract kind codes (K_*), K_INVALID for padding
     param: torch.Tensor  # [4, A] size in thousandths (0 when unused)
+    when: torch.Tensor  # [4, A] W_ANY / W_OPEN / W_RERAISE
     concrete: torch.Tensor  # [4, A] concrete kind (FOLD/CHECK_CALL/RAISE; CHECK_CALL for padding)
     fold_index: torch.Tensor  # [4]
     call_index: torch.Tensor  # [4]
@@ -119,11 +132,14 @@ class SpecTables:
         A = spec.num_actions
         kind = torch.full((4, A), K_INVALID, dtype=torch.long)
         param = torch.zeros((4, A), dtype=torch.long)
+        when = torch.zeros((4, A), dtype=torch.long)
         for s, st in enumerate(spec.streets):
             for i, a in enumerate(st):
                 kind[s, i] = _KIND_CODES[a[0]]
-                if len(a) == 2:
+                if len(a) >= 2:
                     param[s, i] = int(round(float(a[1]) * 1000))
+                if len(a) == 3:
+                    when[s, i] = _WHEN_CODES[a[2]]
         concrete = torch.full((4, A), CHECK_CALL, dtype=torch.long)
         concrete[kind == K_FOLD] = FOLD
         concrete[(kind == K_RAISE_POT) | (kind == K_RAISE_MULT) | (kind == K_ALLIN)] = RAISE
@@ -134,6 +150,7 @@ class SpecTables:
         return SpecTables(
             kind.to(d),
             param.to(d),
+            when.to(d),
             concrete.to(d),
             fold_index.to(d),
             call_index.to(d),
@@ -182,14 +199,20 @@ def legal_mask(
     targets: torch.Tensor,
     max_raise_to: torch.Tensor,
 ) -> torch.Tensor:
-    """``[n, A]`` bool. Inactive (finished) rows allow only check_call, a no-op."""
+    """``[n, A]`` bool. Inactive (finished) rows allow only check_call, a no-op.
+
+    A sized raise conditioned ``open`` is offered only while ``n_raises == 0``
+    on the street, one conditioned ``reraise`` only once ``n_raises >= 1``."""
     kind = tab.kind[street]
     can_raise = (raise_ok & (n_raises < tab.max_raises))[:, None]
+    when = tab.when[street]
+    first = (n_raises == 0)[:, None]
+    cond = (when == W_ANY) | ((when == W_OPEN) & first) | ((when == W_RERAISE) & ~first)
     fold_l = (kind == K_FOLD) & (to_call > 0)[:, None]
     call_l = kind == K_CHECK_CALL
     allin_l = (kind == K_ALLIN) & can_raise
     sized = (kind == K_RAISE_POT) | (kind == K_RAISE_MULT)
-    sized_l = sized & can_raise & (targets < max_raise_to[:, None])
+    sized_l = sized & can_raise & cond & (targets < max_raise_to[:, None])
     if tab.dedupe:
         same = (targets[:, :, None] == targets[:, None, :]) & sized_l[:, None, :] & tab.tril
         sized_l = sized_l & ~same.any(2)

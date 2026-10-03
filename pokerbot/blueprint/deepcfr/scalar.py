@@ -43,6 +43,7 @@ import torch
 
 from ...engine_select import get_engine, to_engine_action
 from ...env.actions import (
+    _WHEN_CODES,
     CHECK_CALL,
     FOLD,
     K_ALLIN,
@@ -76,19 +77,24 @@ class ScalarSpec:
     num_actions: int
     max_raises: int
     dedupe: bool
+    # per street and entry: 0 any, 1 only as the first raise, 2 only as a re-raise
+    when: tuple[tuple[int, ...], ...] = ()
 
     @staticmethod
     def build(spec: ActionSpec) -> ScalarSpec:
         A = spec.num_actions
-        rows = []
+        rows, whens = [], []
         for st in spec.streets:
-            row = []
+            row, wh = [], []
             for a in st:
-                param = int(round(float(a[1]) * 1000)) if len(a) == 2 else 0
+                param = int(round(float(a[1]) * 1000)) if len(a) >= 2 else 0
                 row.append((_KIND_CODES[a[0]], param))
+                wh.append(_WHEN_CODES[a[2]] if len(a) == 3 else 0)
             row += [(-1, 0)] * (A - len(row))
+            wh += [0] * (A - len(wh))
             rows.append(tuple(row))
-        return ScalarSpec(tuple(rows), A, spec.max_raises, spec.dedupe)
+            whens.append(tuple(wh))
+        return ScalarSpec(tuple(rows), A, spec.max_raises, spec.dedupe, tuple(whens))
 
     def concrete_kind(self, street: int, idx: int) -> int:
         k = self.rows[street][idx][0]
@@ -133,7 +139,9 @@ def legal_mask(
     """Legal abstract actions of a live decision (mirror of ``actions.legal_mask``)."""
     can_raise = raise_ok and n_raises < sp.max_raises
     kinds = [k for k, _ in sp.rows[street]]
-    sized = [k in (K_RAISE_POT, K_RAISE_MULT) for k in kinds]
+    when = sp.when[street] if sp.when else (0,) * len(kinds)
+    cond = [w == 0 or (w == 1 and n_raises == 0) or (w == 2 and n_raises >= 1) for w in when]
+    sized = [k in (K_RAISE_POT, K_RAISE_MULT) and cond[i] for i, k in enumerate(kinds)]
     sized_l = [s and can_raise and targets[i] < max_raise_to for i, s in enumerate(sized)]
     if sp.dedupe:
         dedup = list(sized_l)

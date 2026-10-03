@@ -9,7 +9,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::abstraction::{
     pseudo_harmonic as ph, raise_fraction, AbstractAction, ActionAbstraction, ActionList, Bucketer, CardAbstraction,
-    CardAbstractionSpec,
+    CardAbstractionSpec, When,
 };
 use crate::cards::{validate_cards, Card};
 use crate::game::{Action, GameConfig};
@@ -59,35 +59,50 @@ fn list_to_py<'py>(py: Python<'py>, l: &ActionList) -> PyResult<Vec<Bound<'py, P
 // Config parsing
 // ----------------------------------------------------------------------
 
-fn parse_action(obj: &Bound<'_, PyAny>) -> PyResult<AbstractAction> {
-    let (name, arg): (String, Option<f64>) = if let Ok(s) = obj.extract::<String>() {
-        (s, None)
+fn parse_action(obj: &Bound<'_, PyAny>) -> PyResult<(AbstractAction, When)> {
+    let (name, arg, cond): (String, Option<f64>, Option<String>) = if let Ok(s) = obj.extract::<String>() {
+        (s, None, None)
     } else {
         let items: Vec<Bound<'_, PyAny>> = obj.try_iter()?.collect::<PyResult<_>>()?;
-        if items.is_empty() {
-            return Err(verr("empty abstract action"));
+        if items.is_empty() || items.len() > 3 {
+            return Err(verr(format!("bad abstract action {obj}")));
         }
         let name: String = items[0].extract()?;
         let arg = if items.len() > 1 { Some(items[1].extract::<f64>()?) } else { None };
-        (name, arg)
+        let cond = if items.len() > 2 { Some(items[2].extract::<String>()?) } else { None };
+        (name, arg, cond)
     };
-    match (name.to_ascii_lowercase().as_str(), arg) {
-        ("fold" | "f", None) => Ok(AbstractAction::Fold),
-        ("check_call" | "call" | "check" | "c", None) => Ok(AbstractAction::CheckCall),
-        ("allin" | "all_in" | "all-in" | "a", None) => Ok(AbstractAction::AllIn),
-        ("raise" | "raise_pot" | "r", Some(f)) => Ok(AbstractAction::RaisePot(f)),
-        _ => Err(verr(format!(
-            "bad abstract action {obj}: use 'fold', 'check_call', 'allin' or ('raise', pot_fraction)"
-        ))),
+    let when = match cond.as_deref().map(|c| c.to_ascii_lowercase()) {
+        None => When::Any,
+        Some(c) if c == "open" => When::Open,
+        Some(c) if c == "reraise" => When::Reraise,
+        Some(c) => return Err(verr(format!("bad raise condition {c:?} in {obj}: use 'open' or 'reraise'"))),
+    };
+    let a = match (name.to_ascii_lowercase().as_str(), arg) {
+        ("fold" | "f", None) => AbstractAction::Fold,
+        ("check_call" | "call" | "check" | "c", None) => AbstractAction::CheckCall,
+        ("allin" | "all_in" | "all-in" | "a", None) => AbstractAction::AllIn,
+        ("raise" | "raise_pot" | "r", Some(f)) => AbstractAction::RaisePot(f),
+        _ => {
+            return Err(verr(format!(
+                "bad abstract action {obj}: use 'fold', 'check_call', 'allin' or ('raise', pot_fraction[, 'open'|'reraise'])"
+            )))
+        }
+    };
+    if when != When::Any && !matches!(a, AbstractAction::RaisePot(_)) {
+        return Err(verr(format!("only sized raises take an open/reraise condition: {obj}")));
     }
+    Ok((a, when))
 }
 
-fn action_to_py<'py>(py: Python<'py>, a: &AbstractAction) -> PyResult<Bound<'py, PyTuple>> {
-    match a {
-        AbstractAction::Fold => ("fold",).into_pyobject(py),
-        AbstractAction::CheckCall => ("check_call",).into_pyobject(py),
-        AbstractAction::RaisePot(f) => ("raise", *f).into_pyobject(py),
-        AbstractAction::AllIn => ("allin",).into_pyobject(py),
+fn action_to_py<'py>(py: Python<'py>, a: &AbstractAction, w: When) -> PyResult<Bound<'py, PyTuple>> {
+    match (a, w) {
+        (AbstractAction::Fold, _) => ("fold",).into_pyobject(py),
+        (AbstractAction::CheckCall, _) => ("check_call",).into_pyobject(py),
+        (AbstractAction::RaisePot(f), When::Any) => ("raise", *f).into_pyobject(py),
+        (AbstractAction::RaisePot(f), When::Open) => ("raise", *f, "open").into_pyobject(py),
+        (AbstractAction::RaisePot(f), When::Reraise) => ("raise", *f, "reraise").into_pyobject(py),
+        (AbstractAction::AllIn, _) => ("allin",).into_pyobject(py),
     }
 }
 
@@ -113,7 +128,14 @@ fn parse_action_abstraction(streets: Option<&Bound<'_, PyAny>>, max_raises: Opti
                 return Err(verr("need one action list per street (4)"));
             }
             for (s, l) in lists.iter().enumerate() {
-                a.streets[s] = l.try_iter()?.map(|x| parse_action(&x?)).collect::<PyResult<_>>()?;
+                let parsed: Vec<(AbstractAction, When)> =
+                    l.try_iter()?.map(|x| parse_action(&x?)).collect::<PyResult<_>>()?;
+                a.streets[s] = parsed.iter().map(|p| p.0).collect();
+                a.when[s] = if parsed.iter().all(|p| p.1 == When::Any) {
+                    Vec::new()
+                } else {
+                    parsed.iter().map(|p| p.1).collect()
+                };
             }
         }
     }
@@ -352,7 +374,15 @@ impl PyActionAbstraction {
     /// The abstract action lists, as tuples.
     #[getter]
     fn streets<'py>(&self, py: Python<'py>) -> PyResult<Vec<Vec<Bound<'py, PyTuple>>>> {
-        self.inner.streets.iter().map(|l| l.iter().map(|a| action_to_py(py, a)).collect()).collect()
+        (0..4)
+            .map(|s| {
+                self.inner.streets[s]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| action_to_py(py, a, self.inner.when_at(s, i)))
+                    .collect()
+            })
+            .collect()
     }
 
     #[getter]
