@@ -48,7 +48,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::abstraction::{
-    AbstractAction, ActionAbstraction, ActionList, Bucketer, CardAbstraction, CardAbstractionSpec,
+    AbstractAction, ActionAbstraction, ActionList, Bucketer, CardAbstraction, CardAbstractionSpec, When,
 };
 use crate::cards::Card;
 use crate::eval::{evaluate_hole_board, HandRank};
@@ -429,17 +429,21 @@ impl SolverConfig {
     /// JSON rendering (for strategy-file headers and logs).
     pub fn to_json(&self) -> String {
         let g = &self.game;
-        let action = |a: &AbstractAction| match a {
-            AbstractAction::Fold => "[\"fold\"]".to_string(),
-            AbstractAction::CheckCall => "[\"check_call\"]".to_string(),
-            AbstractAction::RaisePot(f) => format!("[\"raise\", {}]", f),
-            AbstractAction::AllIn => "[\"allin\"]".to_string(),
+        let action = |a: &AbstractAction, w: When| match (a, w) {
+            (AbstractAction::Fold, _) => "[\"fold\"]".to_string(),
+            (AbstractAction::CheckCall, _) => "[\"check_call\"]".to_string(),
+            (AbstractAction::RaisePot(f), When::Any) => format!("[\"raise\", {}]", f),
+            (AbstractAction::RaisePot(f), When::Open) => format!("[\"raise\", {}, \"open\"]", f),
+            (AbstractAction::RaisePot(f), When::Reraise) => format!("[\"raise\", {}, \"reraise\"]", f),
+            (AbstractAction::AllIn, _) => "[\"allin\"]".to_string(),
         };
-        let streets: Vec<String> = self
-            .actions
-            .streets
-            .iter()
-            .map(|l| format!("[{}]", l.iter().map(action).collect::<Vec<_>>().join(", ")))
+        let streets: Vec<String> = (0..4)
+            .map(|s| {
+                let l = &self.actions.streets[s];
+                let items: Vec<String> =
+                    l.iter().enumerate().map(|(i, a)| action(a, self.actions.when_at(s, i))).collect();
+                format!("[{}]", items.join(", "))
+            })
             .collect();
         let tables: Vec<String> = self
             .cards
@@ -492,14 +496,19 @@ impl SolverConfig {
         put_i64(w, g.big_blind);
         put_i64(w, g.ante);
         w.push(self.actions.max_raises);
-        for l in &self.actions.streets {
+        for (s, l) in self.actions.streets.iter().enumerate() {
             w.push(l.len() as u8);
-            for a in l {
+            for (i, a) in l.iter().enumerate() {
                 match a {
                     AbstractAction::Fold => w.push(0),
                     AbstractAction::CheckCall => w.push(1),
                     AbstractAction::RaisePot(f) => {
-                        w.push(2);
+                        // 2 = unconditioned (the original format), 4 = open, 5 = reraise
+                        w.push(match self.actions.when_at(s, i) {
+                            When::Any => 2,
+                            When::Open => 4,
+                            When::Reraise => 5,
+                        });
                         w.extend_from_slice(&f.to_le_bytes());
                     }
                     AbstractAction::AllIn => w.push(3),
@@ -537,16 +546,24 @@ impl SolverConfig {
         let game = GameConfig { num_players: n, stacks, small_blind: r.i64()?, big_blind: r.i64()?, ante: r.i64()? };
         let max_raises = r.u8()?;
         let mut streets: [Vec<AbstractAction>; 4] = Default::default();
-        for l in streets.iter_mut() {
+        let mut when: [Vec<When>; 4] = Default::default();
+        for (l, wl) in streets.iter_mut().zip(when.iter_mut()) {
             let len = r.u8()?;
             for _ in 0..len {
-                l.push(match r.u8()? {
-                    0 => AbstractAction::Fold,
-                    1 => AbstractAction::CheckCall,
-                    2 => AbstractAction::RaisePot(r.f64()?),
-                    3 => AbstractAction::AllIn,
+                let (a, w) = match r.u8()? {
+                    0 => (AbstractAction::Fold, When::Any),
+                    1 => (AbstractAction::CheckCall, When::Any),
+                    2 => (AbstractAction::RaisePot(r.f64()?), When::Any),
+                    3 => (AbstractAction::AllIn, When::Any),
+                    4 => (AbstractAction::RaisePot(r.f64()?), When::Open),
+                    5 => (AbstractAction::RaisePot(r.f64()?), When::Reraise),
                     k => return Err(format!("bad abstract action code {k}")),
-                });
+                };
+                l.push(a);
+                wl.push(w);
+            }
+            if wl.iter().all(|&w| w == When::Any) {
+                wl.clear();
             }
         }
         let mut buckets = [0u32; 4];
@@ -560,7 +577,7 @@ impl SolverConfig {
         }
         Ok(SolverConfig {
             game,
-            actions: ActionAbstraction { streets, max_raises },
+            actions: ActionAbstraction { streets, max_raises, when },
             cards: CardAbstractionSpec { buckets, hs_samples, tables },
             seed: r.u64()?,
             lcfr_discount_every: r.u64()?,
@@ -1357,6 +1374,7 @@ mod tests {
             actions: ActionAbstraction {
                 streets: [street.clone(), street.clone(), street.clone(), street],
                 max_raises: 2,
+                when: Default::default(),
             },
             cards: CardAbstractionSpec { buckets: [4, 4, 4, 4], hs_samples: 16, tables: Default::default() },
             seed: 1,

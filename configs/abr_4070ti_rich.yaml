@@ -1,0 +1,56 @@
+# Approximate best response with a richer learner action set, closer to what a human
+# opponent can do than the blueprint's own abstraction. Same budget as abr_4070ti.yaml.
+# python scripts/run_abr.py --config configs/abr_4070ti_rich.yaml --opponent neural:<run dir> \
+#     --log-dir runs/abr/<name> --out results/abr_<name>.json --checkpoint runs/abr/<name>/q.pt
+#
+# The learner picks among `learner_actions`; each choice is played as real chips. The
+# opponent sees every off-tree size the way it would in real play: translated into its
+# own abstraction by the randomized pseudo-harmonic mapping (`offtree: harmonic`), or
+# by the nearest size (`offtree: nearest`). It needs a vectorized opponent
+# (neural:<run dir>, uniform, call). Compare results only with runs on this same
+# config: a richer action set can find more than abr_4070ti.yaml.
+
+device: cuda
+opponent: uniform       # replace with the frozen policy under test
+samples: 16
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+abr:
+  seed: 0
+  n_envs: 16384
+  train_steps: 40000
+  buffer_size: 4000000
+  batch_size: 4096
+  updates_per_step: 2
+  learning_starts: 200000
+  lr: 0.0002
+  gamma: 1.0
+  target_update: 1000
+  grad_clip: 10.0
+  eps_start: 1.0
+  eps_end: 0.02
+  eps_decay_steps: 15000
+  hidden: [512, 512, 256]
+  card_dim: 64
+  hist_dim: 64
+  equity_samples: 64
+  reward_scale_bb: 20.0
+  eval_hands: 200000
+  eval_envs: 16384
+  eval_initial: true
+  eval_every: 10000
+  log_every: 200
+  offtree: harmonic
+  learner_actions:
+    max_raises: 8         # raises per street; the blueprint stops raising at its own cap
+    streets:
+      - [[fold], [check_call], [raise_x, 2.0], [raise_x, 2.5], [raise_x, 3.0], [raise_x, 4.0], [raise, 1.0], [allin]]
+      - [[fold], [check_call], [raise, 0.25], [raise, 0.33], [raise, 0.5], [raise, 0.75], [raise, 1.0], [raise, 1.5], [raise, 2.0], [allin]]
+      - [[fold], [check_call], [raise, 0.33], [raise, 0.5], [raise, 0.75], [raise, 1.0], [raise, 1.5], [raise, 2.0], [allin]]
+      - [[fold], [check_call], [raise, 0.33], [raise, 0.5], [raise, 0.75], [raise, 1.0], [raise, 1.5], [raise, 2.0], [raise, 3.0], [allin]]

@@ -54,6 +54,30 @@ impl AbstractAction {
     }
 }
 
+/// When a sized raise (`RaisePot`) is offered: always, only as the street's
+/// first voluntary raise (an opening bet or raise), or only facing one (a
+/// re-raise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum When {
+    #[default]
+    Any,
+    Open,
+    Reraise,
+}
+
+impl When {
+    /// Whether an entry with this condition is offered after `n_raises`
+    /// voluntary raises on the street.
+    #[inline]
+    pub fn allows(self, n_raises: usize) -> bool {
+        match self {
+            When::Any => true,
+            When::Open => n_raises == 0,
+            When::Reraise => n_raises >= 1,
+        }
+    }
+}
+
 /// Concrete actions available in a state under the abstraction, with the
 /// index of each in the street's abstract list. Fixed capacity, no allocation.
 #[derive(Clone, Copy, Debug)]
@@ -89,11 +113,14 @@ impl ActionList {
     }
 }
 
-/// Per-street abstract action lists plus a raise cap per street.
+/// Per-street abstract action lists plus a raise cap per street. `when`
+/// holds a condition per entry of `streets` (an empty list: all `Any`); only
+/// `RaisePot` entries may carry one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionAbstraction {
     pub streets: [Vec<AbstractAction>; 4],
     pub max_raises: u8,
+    pub when: [Vec<When>; 4],
 }
 
 impl Default for ActionAbstraction {
@@ -111,6 +138,7 @@ impl Default for ActionAbstraction {
                 vec![Fold, CheckCall, RaisePot(0.5), RaisePot(1.0), RaisePot(2.0), AllIn],
             ],
             max_raises: 4,
+            when: Default::default(),
         }
     }
 }
@@ -145,6 +173,12 @@ pub fn pseudo_harmonic(a: f64, b: f64, x: f64) -> f64 {
 }
 
 impl ActionAbstraction {
+    /// Condition of entry `i` on street `s`.
+    #[inline]
+    pub fn when_at(&self, s: usize, i: usize) -> When {
+        self.when[s].get(i).copied().unwrap_or_default()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.max_raises == 0 || self.max_raises > MAX_RAISES_CAP {
             return Err(format!("max_raises must be in 1..={MAX_RAISES_CAP}, got {}", self.max_raises));
@@ -156,6 +190,14 @@ impl ActionAbstraction {
             if !list.contains(&AbstractAction::CheckCall) {
                 return Err(format!("street {s}: check_call must be in the action list"));
             }
+            if !self.when[s].is_empty() && self.when[s].len() != list.len() {
+                return Err(format!("street {s}: {} conditions for {} actions", self.when[s].len(), list.len()));
+            }
+            for (i, a) in list.iter().enumerate() {
+                if self.when_at(s, i) != When::Any && !matches!(a, AbstractAction::RaisePot(_)) {
+                    return Err(format!("street {s}: only sized raises take an open/reraise condition, not {a:?}"));
+                }
+            }
             for a in list {
                 if let AbstractAction::RaisePot(f) = a {
                     if !(f.is_finite() && *f > 0.0) {
@@ -165,7 +207,7 @@ impl ActionAbstraction {
             }
             for i in 0..list.len() {
                 for j in 0..i {
-                    if list[i] == list[j] {
+                    if list[i] == list[j] && self.when_at(s, i) == self.when_at(s, j) {
                         return Err(format!("street {s}: duplicate action {:?}", list[i]));
                     }
                 }
@@ -192,8 +234,10 @@ impl ActionAbstraction {
     }
 
     fn legal_with(&self, state: &GameState, la: &LegalActions, out: &mut ActionList) {
-        let list = &self.streets[state.street()];
-        let raises_ok = la.can_raise() && state.num_raises_this_street() < self.max_raises as usize;
+        let s = state.street();
+        let list = &self.streets[s];
+        let n_raises = state.num_raises_this_street();
+        let raises_ok = la.can_raise() && n_raises < self.max_raises as usize;
         let mut is_allin = [false; MAX_ABSTRACT_ACTIONS];
         for (i, a) in list.iter().enumerate() {
             let concrete = match *a {
@@ -205,7 +249,7 @@ impl ActionAbstraction {
                 }
                 AbstractAction::CheckCall => Action::check_call(),
                 AbstractAction::RaisePot(f) => {
-                    if !raises_ok {
+                    if !raises_ok || !self.when_at(s, i).allows(n_raises) {
                         continue;
                     }
                     Action::raise_to(la.clamp_raise_to(pot_raise_to(state, f)))
@@ -680,11 +724,41 @@ mod tests {
                 vec![AbstractAction::CheckCall],
             ],
             max_raises: 4,
+            when: Default::default(),
         };
         let s = GameState::new_hand(&cfg(20_000), 0, &deck()).unwrap();
         let l = tiny.legal(&s);
         assert_eq!(l.actions(), &[Action::check_call(), Action::raise_to(200)]);
         assert_eq!(l.indices(), &[0, 1]);
+    }
+
+    #[test]
+    fn open_and_reraise_conditions() {
+        use AbstractAction::*;
+        let flop = vec![Fold, CheckCall, RaisePot(0.33), RaisePot(1.0), RaisePot(1.0), AllIn];
+        let flop_when = vec![When::Any, When::Any, When::Open, When::Open, When::Reraise, When::Any];
+        let a = ActionAbstraction {
+            streets: [vec![Fold, CheckCall, RaisePot(1.0), AllIn], flop.clone(), flop.clone(), flop],
+            max_raises: 4,
+            when: [vec![], flop_when.clone(), flop_when.clone(), flop_when],
+        };
+        a.validate().unwrap();
+        // Preflop limp and check -> flop, first to act: the open sizes, not the reraise one.
+        let mut s = GameState::new_hand(&cfg(20_000), 0, &deck()).unwrap();
+        s.apply(Action::check_call()).unwrap();
+        s.apply(Action::check_call()).unwrap();
+        assert_eq!(s.street(), 1);
+        assert_eq!(a.legal(&s).indices(), &[1, 2, 3, 5]);
+        // Facing a bet: only the reraise size (plus fold, call and all-in).
+        s.apply(Action::raise_to(150)).unwrap();
+        assert_eq!(a.legal(&s).indices(), &[0, 1, 4, 5]);
+        // A condition on a non-raise entry is rejected; equal sizes need different conditions.
+        let mut bad = a.clone();
+        bad.when[1][5] = When::Open;
+        assert!(bad.validate().is_err());
+        let mut dup = a.clone();
+        dup.when[1][4] = When::Open;
+        assert!(dup.validate().is_err());
     }
 
     #[test]

@@ -200,6 +200,22 @@ action abstraction. Otherwise the agent runs through `ScalarVecPolicy`, which
 rebuilds each slot as a scalar `GameState` and calls `policy()` one slot at
 a time. That path is for tests and small checks, not for the 4070 Ti config.
 
+**Richer learner actions** (`configs/abr_4070ti_rich.yaml`). By default the
+learner is confined to the opponent's action abstraction, so it can't use bet
+sizes the blueprint never considers, as a real opponent would. With
+`abr.learner_actions` (a spec mapping: `streets`, `max_raises`, `dedupe`), the
+learner picks among its own action set, and every choice is played as real
+chips (`VecNLHE.step_concrete`). The opponent records each off-tree size the
+way it would in real play: translated into its own abstraction by the
+randomized pseudo-harmonic mapping (`abr.offtree: harmonic`,
+`env.actions.harmonic_abstract`, which mirrors `abstraction.actions.map_offtree`),
+or by the nearest size (`nearest`). The learner keeps its own history of the
+real actions and its own legal mask (`LearnerView`). This needs a vectorized
+opponent: `ScalarVecPolicy` rebuilds slots from their abstract history, which
+off-tree raises make inexact, so it is rejected. A run on a richer set can find
+more than one confined to the blueprint's abstraction, so compare results only
+under the same config.
+
 How to read it: `final` is what the exploiter wins, which is a lower bound on
 exploitability, like LBR's but able to find multi-street lines. The
 `untrained` row is the baseline, and the difference shows the learning
