@@ -100,11 +100,13 @@ class NeuralBlueprintAgent(BaseAgent):
         name: str | None = None,
         offtree: str = "harmonic",
         sample_net: bool = False,
+        stride: int | None = None,
     ) -> NeuralBlueprintAgent:
         meta = read_meta(path)
         kw = dict(
             last_n=last_n,
             max_iter=max_iter,
+            stride=stride,
             device=device,
             reach_weighted=reach_weighted,
             fallback=meta.get("fallback", "uniform"),

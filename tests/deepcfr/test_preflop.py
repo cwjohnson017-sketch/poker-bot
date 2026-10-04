@@ -205,3 +205,26 @@ def test_policy_without_tables_is_unchanged():
     f = features_from_obs(VecNLHE(4, GameConfig(stacks=[1000, 1000]), "cpu", 0, SMALL_SPEC).obs())
     assert torch.allclose(pol.net_policies(f)[0], NetPolicy(net)(f))
     assert TraversalConfig().allin_equity is False
+
+
+def test_eval_stride_and_anchor(tmp_path, _threads):
+    """eval.stride thins the SD-CFR average to every k-th net plus the newest;
+    eval.anchor plays a fixed opponent at every evaluation."""
+    cfg = _tiny(tmp_path)
+    cfg.eval.every = 1
+    cfg.eval.deals = 4
+    cfg.eval.vs_equity = False
+    cfg.eval.vs_previous = False
+    cfg.eval.last_n = None
+    cfg.eval.stride = 2
+    cfg.eval.anchor = "always_call"
+    tr = DeepCFRTrainer(cfg, tmp_path)
+    for t in (1, 2, 3):
+        tr.run_iteration(t)
+    tr.close()
+    with open(tmp_path / "eval.csv") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["opponent"] for r in rows] == ["anchor"] * 3
+    pol = SDCFRPolicy.from_dir(tmp_path, 0, stride=2)
+    assert pol.iterations == [2, 3]  # every 2nd iteration plus the newest
+    assert SDCFRPolicy.from_dir(tmp_path, 0, stride=2, max_iter=2).iterations == [2]

@@ -73,6 +73,8 @@ class EvalConfig:
     every: int = 0  # iterations between evaluations (0 = off)
     deals: int = 200  # duplicate deals per match (2 hands each)
     last_n: int | None = 32  # SD-CFR nets averaged per seat during evaluation
+    stride: int | None = None  # use every stride-th net (plus the newest); None = all
+    anchor: str | None = None  # fixed opponent (agent spec, e.g. a previous run) at every eval
     engine: str = "auto"
     device: str | None = None  # device of the evaluated nets; None = training device
     vs_equity: bool = True

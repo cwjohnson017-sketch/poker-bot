@@ -228,6 +228,7 @@ class DeepCFRTrainer:
             preflop_tree = PreflopTree.build(self.game_config, self.spec, self.device)
             self.preflop = [PreflopRegrets(preflop_tree, self.device) for _ in (0, 1)]
         self.nets: list[AdvantageNet | None] = [None, None]
+        self._anchor: Any = None  # eval.anchor agent, built at the first evaluation
         self.checkpoints: list[list[tuple[int, Path]]] = [[], []]
         self.iteration = 0
         self.last_eval_iter = 0
@@ -474,11 +475,24 @@ class DeepCFRTrainer:
         gcfg = game_config(self.meta["game"], engine)
         dev = str(ec.device or self.device)
         cur = NeuralBlueprintAgent.from_dir(
-            self.ckpt_root, ec.last_n, t, device=dev, name=f"sdcfr_{t}", sample_net=ec.sample_net
+            self.ckpt_root,
+            ec.last_n,
+            t,
+            device=dev,
+            name=f"sdcfr_{t}",
+            sample_net=ec.sample_net,
+            stride=ec.stride,
         )
         opponents = []
         if ec.vs_equity:
             opponents.append(("equity", EquityThresholdAgent(**ec.equity)))
+        if ec.anchor:
+            if self._anchor is None:
+                from ...agents.registry import make_agent
+
+                self._anchor = make_agent(ec.anchor)
+                self._anchor.name = "anchor"
+            opponents.append(("anchor", self._anchor))
         prev_t = self.last_eval_iter if self.last_eval_iter else t - 1
         if ec.vs_previous and prev_t >= 1:
             prev = NeuralBlueprintAgent.from_dir(
@@ -488,6 +502,7 @@ class DeepCFRTrainer:
                 device=dev,
                 name=f"sdcfr_{prev_t}",
                 sample_net=ec.sample_net,
+                stride=ec.stride,
             )
             opponents.append(("previous", prev))
         rows = []

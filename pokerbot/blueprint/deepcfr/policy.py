@@ -85,9 +85,15 @@ class SDCFRPolicy:
         last_n: int | None = None,
         max_iter: int | None = None,
         device: torch.device | str = "cpu",
+        stride: int | None = None,
         **kwargs,
     ) -> SDCFRPolicy:
         cks = list_checkpoints(path, player, max_iter)
+        if stride and int(stride) > 1 and cks:
+            # every stride-th iteration plus the newest: with linear iteration
+            # weights this keeps the shape of the full average at a fraction of the nets
+            newest = cks[-1][0]
+            cks = [(t, f) for t, f in cks if t % int(stride) == 0 or t == newest]
         if last_n:
             cks = cks[-int(last_n) :]
         if not cks:
