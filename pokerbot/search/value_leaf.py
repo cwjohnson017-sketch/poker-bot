@@ -191,6 +191,8 @@ class ValueLeafEvaluator:
         self.pair_ba = (self.c2 * NUM_CARDS + self.c1).contiguous()
         self._calls = [0, 0]
         self._cache: list[torch.Tensor | None] = [None, None]
+        self._board_ids: torch.Tensor | None = None  # predictor board-cache ids
+        self._board_gen: Any = None
         self.net_calls = 0  # predict() calls
         self.net_rows = 0  # rows sent to predict()
 
@@ -242,12 +244,21 @@ class ValueLeafEvaluator:
             torch.mul(ordered[a:b, None], avoid[u][None, :, None, :], out=ranges[a - l0 : b - l0])
         rows = slice(l0 * RIVERS, l1 * RIVERS)
         with torch.no_grad():
-            ev = self.predictor.predict(
-                self.boards5[self.row_board[rows]],
-                ranges.view(n, 2, C),
-                self.row_c[rows],
-                self.row_stack[rows],
-            )
+            ids = self._predictor_board_ids()
+            if ids is None:
+                ev = self.predictor.predict(
+                    self.boards5[self.row_board[rows]],
+                    ranges.view(n, 2, C),
+                    self.row_c[rows],
+                    self.row_stack[rows],
+                )
+            else:
+                ev = self.predictor.predict_ids(
+                    ids[self.row_board[rows]],
+                    ranges.view(n, 2, C),
+                    self.row_c[rows],
+                    self.row_stack[rows],
+                )
         self.net_calls += 1
         self.net_rows += n
         ev = ev.to(dt).reshape(Lc, RIVERS, 2, C)
@@ -268,6 +279,20 @@ class ValueLeafEvaluator:
                 hit = self.card_combos[self.cards[l0:l1]]
             ev_p.scatter_(2, hit, 0.0)
         return ev_p
+
+    def _predictor_board_ids(self) -> torch.Tensor | None:
+        """Ids of the 5-card boards in a predictor with a board cache
+        (``board_ids`` / ``predict_ids``), looked up once and again only when the
+        predictor's cache was reset; ``None`` for a plain ``predict``."""
+        pred = self.predictor
+        if not hasattr(pred, "predict_ids"):
+            return None
+        cache = getattr(pred, "cache", None)
+        gen = getattr(cache, "generation", None)
+        if self._board_ids is None or gen != self._board_gen:
+            self._board_ids = pred.board_ids(self.boards5)
+            self._board_gen = getattr(cache, "generation", None)
+        return self._board_ids
 
     def _combine(
         self,
