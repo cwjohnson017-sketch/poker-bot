@@ -187,18 +187,27 @@ def make_batches(
     batch_size: int,
     big_blind: int = 100,
     max_c: int | None = None,
+    generator: torch.Generator | None = None,
 ) -> list[tuple[torch.Tensor, int]]:
     """Sort the states by ``c`` and chunk them into batches of ``batch_size``:
     a list of ``(indices, c)`` where ``c`` is the batch's median rounded to a
-    chip amount (the ``c`` the batch is solved at). The median is snapped to a
-    reachable river-root amount (:func:`.value_ranges.reachable_c`: ``bb`` or
-    at least ``2 * bb``, so at least 100 at 50/100) and capped at ``max_c``."""
+    chip amount (the ``c`` the batch is solved at). With a (CPU) ``generator``
+    it is instead log-uniform between the batch's smallest and largest ``c``,
+    so wide batches (the sparse large pots) do not all land on one value
+    across shards. ``c`` is snapped to a reachable river-root amount
+    (:func:`.value_ranges.reachable_c`: ``bb`` or at least ``2 * bb``, so at
+    least 100 at 50/100) and capped at ``max_c``."""
     c = states["c"].long()
     order = torch.argsort(c, stable=True)
     out = []
     for lo in range(0, order.numel(), int(batch_size)):
         idx = order[lo : lo + int(batch_size)]
-        med = int(round(float(torch.quantile(c[idx].double(), 0.5))))
+        if generator is None:
+            med = int(round(float(torch.quantile(c[idx].double(), 0.5))))
+        else:
+            a, b = math.log(max(1, int(c[idx].min()))), math.log(max(1, int(c[idx].max())))
+            u = float(torch.rand((), generator=generator, dtype=torch.float64))
+            med = int(round(math.exp(a + u * (b - a))))
         cc = int(vr.reachable_c(torch.tensor(med), big_blind))
         if max_c is not None:
             cc = min(cc, int(max_c))
@@ -307,13 +316,16 @@ def solve_states(
     device: torch.device | str,
     solver_cfg: Any = None,
     trees: TreeCache | None = None,
+    generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Solve all ``states`` in ``c``-sorted batches; rows in the input order."""
+    """Solve all ``states`` in ``c``-sorted batches (see :func:`make_batches`
+    for ``generator``); rows in the input order."""
     game = vr._game(game_config)
     start = int(game["stacks"][0])
     n = states["c"].shape[0]
     out: dict[str, torch.Tensor] = {}
-    for idx, c in make_batches(states, batch_size, game["big_blind"], max_c=start - 1):
+    batches = make_batches(states, batch_size, game["big_blind"], start - 1, generator)
+    for idx, c in batches:
         tree = trees.get(c) if trees is not None else None
         rows = solve_batch(
             take(states, idx), c, spec, game_config, iterations, device, solver_cfg, tree
@@ -434,8 +446,9 @@ def generate(
             log,
         )
         t1 = time.time()
+        c_gen = torch.Generator().manual_seed(seeds[2] + 1)
         rows = solve_states(
-            states, spec, engine_cfg, cfg.iterations, cfg.batch, dev, solver_cfg, trees
+            states, spec, engine_cfg, cfg.iterations, cfg.batch, dev, solver_cfg, trees, c_gen
         )
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
