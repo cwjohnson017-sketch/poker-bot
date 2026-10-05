@@ -57,10 +57,12 @@ class LeafConfig:
     max_total_rollouts: int = 8000  # per solve; rollouts per leaf shrink (to >= 1) above this
     explore: float = 0.25  # uniform mixing in the action proposal
     seed: int = 0
-    # "rollouts" (above) or "value_net": a river value net at turn-end leaves
+    # "rollouts" (above) or "value_net": a value net at turn-end leaves
     # (pokerbot.search.value_leaf); flop solves need depth_streets >= 1
     mode: str = "rollouts"
-    net: str | None = None  # value_net: checkpoint path for ValueNetPredictor.from_path
+    # value_net: checkpoint path; a river net (48 rows per leaf) or a turn-end net
+    # (one row per leaf), by the checkpoint's meta kind (turn_net.load_leaf_predictor)
+    net: str | None = None
     net_every: int = 1  # value_net: run the net every n regret updates per player (1 = exact)
 
 

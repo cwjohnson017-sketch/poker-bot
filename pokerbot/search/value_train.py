@@ -6,10 +6,14 @@
   ``ev_p(c)`` in pot units, see :mod:`.value_net`), ``exploit`` (pot units) and
   ``source`` (0 blueprint self-play, 1 perturbed, 2 random ranges).
   :func:`save_shard` writes one; :func:`load_shards` concatenates them.
+  Turn-end shards (:mod:`.turn_data`) have the same keys with ``boards``
+  [n, 4] (the river card is not dealt).
 * **Features.** :class:`ValueData` keeps the samples (on the GPU when they fit)
   and the ``rank2`` table of every distinct board once
   (:class:`~.value_net.BoardFeatureCache`, int16); the buckets of a batch are
-  one gather and an integer division.
+  one gather and an integer division. Another feature cache with the same
+  interface can be passed in (``cache`` / ``cache_factory``; the turn-end net
+  uses :class:`~.turn_net.TurnFeatureCache`, see :func:`.turn_net.train_turn_net`).
 * **Loss.** Huber (or MSE) on ``ev`` of both players after the zero-sum layer,
   over valid combos whose opponent disjoint mass exceeds ``MASS_EPS``.
 * **Report** (pot units) on held-out samples: MAE / RMSE per combo, overall, per
@@ -68,7 +72,8 @@ POT_BINS = (100, 250, 500, 1000, 2000, 4000)  # lower edges of the c bins; last 
 
 def save_shard(path: str | Path, data: dict[str, Any]) -> Path:
     """Write one shard (atomically: a temp file renamed into place). ``data``
-    holds the :data:`SHARD_DTYPES` keys (cast to those dtypes, moved to CPU)."""
+    holds the :data:`SHARD_DTYPES` keys (cast to those dtypes, moved to CPU);
+    ``boards`` is ``[n, 5]`` (river) or ``[n, 4]`` (turn-end)."""
     missing = [k for k in SHARD_DTYPES if k not in data]
     if missing:
         raise KeyError(f"shard is missing {missing}")
@@ -81,7 +86,9 @@ def save_shard(path: str | Path, data: dict[str, Any]) -> Path:
         for k, dt in SHARD_DTYPES.items()
     }
     n = out["boards"].shape[0]
-    shapes = {"boards": (n, 5), "c": (n,), "stack": (n,), "ranges": (n, 2, C)}
+    nb = out["boards"].shape[1] if out["boards"].dim() == 2 else 5
+    shapes = {"boards": (n, nb if nb in (4, 5) else 5), "c": (n,), "stack": (n,)}
+    shapes["ranges"] = (n, 2, C)
     shapes.update(targets=(n, 2, C), exploit=(n,), source=(n,))
     for k, shp in shapes.items():
         if tuple(out[k].shape) != shp:
@@ -207,13 +214,16 @@ class ValueTrainConfig:
 
 
 class ValueData:
-    """Samples on ``device`` plus one ``rank2`` row per distinct board."""
+    """Samples on ``device`` plus one feature row per distinct board: ``rank2``
+    of river boards by default, or the given ``cache`` (an empty feature cache
+    on ``device`` with ``max_boards=None``, e.g. a turn-end one)."""
 
     def __init__(
         self,
         data: dict[str, torch.Tensor],
         device: torch.device | str = "cpu",
         max_exploit: float = 0.0,
+        cache: Any = None,
     ):
         dev = self.device = torch.device(device)
         keep = torch.ones(data["c"].shape[0], dtype=torch.bool)
@@ -221,7 +231,14 @@ class ValueData:
             keep &= data["exploit"].float() <= max_exploit
         self.dropped = int((~keep).sum())
         sel = keep.nonzero().squeeze(1)
-        self.cache = BoardFeatureCache(dev, max_boards=None, tables=False)
+        if cache is None:
+            if data["boards"].shape[1] != 5:
+                raise ValueError(
+                    f"{data['boards'].shape[1]}-card boards need their own feature cache "
+                    "(turn-end shards: pokerbot.search.turn_net.train_turn_net)"
+                )
+            cache = BoardFeatureCache(dev, max_boards=None, tables=False)
+        self.cache = cache
         self.board_id = self.cache.ids(data["boards"][sel])
         self.ranges = data["ranges"][sel].to(dev, torch.float16)
         self.targets = data["targets"][sel].to(dev, torch.float16)
@@ -445,10 +462,15 @@ def train_value_net(
     log: Any = print,
     raw: dict[str, torch.Tensor] | None = None,
     raw_heldout: dict[str, torch.Tensor] | None = None,
+    cache_factory: Any = None,
+    meta: dict[str, Any] | None = None,
 ) -> tuple[RiverValueNet, dict[str, Any]]:
     """Train on the shards of ``data`` (or the loaded dict ``raw``); evaluate on
     ``heldout`` when given, else on a seeded held-out split. Writes ``out`` (the
-    checkpoint) and ``out.with_suffix('.json')`` (the report) when ``out`` is set."""
+    checkpoint) and ``out.with_suffix('.json')`` (the report) when ``out`` is set.
+    ``cache_factory(device)`` makes the board-feature cache of each dataset
+    (default: river :class:`~.value_net.BoardFeatureCache`); ``meta`` is merged
+    into the checkpoint's meta (e.g. ``kind: turn_end``) and set as ``net.meta``."""
     net_cfg = net_cfg or ValueNetConfig()
     cfg = cfg or ValueTrainConfig()
     log = log or (lambda *_a, **_k: None)
@@ -456,11 +478,15 @@ def train_value_net(
     t0 = time.time()
     raw = raw if raw is not None else load_shards(data)
     ddev = _data_device(cfg.data_device, dev, int(raw["c"].shape[0]))
-    ds = ValueData(raw, ddev, cfg.max_exploit)
+
+    def make_cache() -> Any:
+        return cache_factory(ddev) if cache_factory is not None else None
+
+    ds = ValueData(raw, ddev, cfg.max_exploit, make_cache())
     del raw
     if heldout is not None or raw_heldout is not None:
         raw_h = raw_heldout if raw_heldout is not None else load_shards(heldout)
-        val_ds = ValueData(raw_h, ddev, cfg.max_exploit)
+        val_ds = ValueData(raw_h, ddev, cfg.max_exploit, make_cache())
         del raw_h
         tr, va = torch.arange(len(ds)), torch.arange(len(val_ds))
     else:
@@ -526,12 +552,16 @@ def train_value_net(
         data=[str(p) for p in shard_files(data)] if data is not None else [],
         heldout_data=[str(p) for p in shard_files(heldout)] if heldout is not None else [],
     )
+    if meta:
+        rep["meta"] = dict(meta)
     log(format_report(rep))
+    net.meta = dict(meta or {})
     if out is not None:
         out = Path(out)
-        meta = {k: rep[k] for k in ("train", "data", "heldout_data", "train_samples")}
-        meta["heldout"] = {"overall": rep["overall"]}
-        save_value_net(out, net, meta)
+        ck_meta = {k: rep[k] for k in ("train", "data", "heldout_data", "train_samples")}
+        ck_meta["heldout"] = {"overall": rep["overall"]}
+        ck_meta.update(meta or {})
+        save_value_net(out, net, ck_meta)
         out.with_suffix(".json").write_text(json.dumps(rep, indent=1))
         log(f"# wrote {out} and {out.with_suffix('.json')}")
     return net.eval(), rep

@@ -36,6 +36,11 @@ Sources:
   hands therefore never pay for the 1326-combo policies. Other blueprints
   (anything with ``policy_matrix``) use a scalar-engine path, one hand at a
   time.
+
+  With ``turn_end=True`` the same hands give **turn-end states** (the leaves
+  of a flop search, :mod:`.turn_data`): play stops at the end of turn betting,
+  which is the river root without its card, so the state has the 4-card board
+  (``boards [m, 4]``) and ranges that are zero only on combos hitting it.
 * :func:`perturb_ranges`: log-normal per-combo noise, strength tilts, uniform
   mixing and random support removal applied to existing ranges.
 * :func:`random_ranges`: DeepStack-style recursive random splits of the mass
@@ -143,6 +148,7 @@ def selfplay_river_states(
     stats: dict[str, float] | None = None,
     max_hands: int | None = None,
     log: Callable[[str], Any] | None = None,
+    turn_end: bool = False,
 ) -> dict[str, torch.Tensor]:
     """``n`` river-root states from blueprint self-play (see the module docstring).
 
@@ -151,8 +157,10 @@ def selfplay_river_states(
     river, ranges the blueprint made empty (replaced by uniform, as
     :func:`range_reach` does) and the seconds per phase. ``max_hands`` bounds
     the hands played (default ``1000 * n + 100000``): a blueprint that never
-    reaches the river raises instead of looping forever.
+    reaches the river raises instead of looping forever. ``turn_end`` stops at
+    the end of turn betting instead: 4-card boards, ranges masked by them only.
     """
+    nb = 4 if turn_end else 5
     stats = stats if stats is not None else {}
     stats.update({k: v for k, v in _new_stats().items() if k not in stats})
     t0 = time.time()
@@ -161,25 +169,27 @@ def selfplay_river_states(
         bf16 = dev.type == "cuda"
     max_hands = int(max_hands) if max_hands is not None else 1000 * int(n) + 100_000
     if n <= 0:
-        return _empty_states()
+        return _empty_states(nb)
     if _lockstep_ok(bp):
         hands = _play_lockstep(
             bp, game_config, n, dev, seed, explore, n_envs, bf16, stats, max_hands, log
         )
         t1 = time.time()
         stats["phase1_s"] += t1 - t0
-        out = _replay_ranges(bp, game_config, hands, dev, bf16, replay_chunk, slots_per_call, stats)
+        out = _replay_ranges(
+            bp, game_config, hands, dev, bf16, replay_chunk, slots_per_call, stats, nb
+        )
         stats["phase2_s"] += time.time() - t1
     else:
-        out = _play_scalar(bp, game_config, n, seed, explore, stats, max_hands)
+        out = _play_scalar(bp, game_config, n, seed, explore, stats, max_hands, nb)
     stats["seconds"] += time.time() - t0
     return out
 
 
-def _empty_states() -> dict[str, torch.Tensor]:
+def _empty_states(board_cards: int = 5) -> dict[str, torch.Tensor]:
     z = torch.zeros(0, dtype=torch.long)
     return {
-        "boards": torch.zeros(0, 5, dtype=torch.long),
+        "boards": torch.zeros(0, board_cards, dtype=torch.long),
         "c": z,
         "stack": z.clone(),
         "ranges": torch.zeros(0, 2, NUM_COMBOS),
@@ -418,9 +428,11 @@ def _replay_ranges(
     chunk: int,
     slots_per_call: int,
     stats: dict[str, float],
+    board_cards: int = 5,
 ) -> dict[str, torch.Tensor]:
     """Phase 2: replay the kept hands in lockstep and build both players'
-    1326-combo reach from the policy columns of the actions taken."""
+    1326-combo reach from the policy columns of the actions taken (states on
+    the first ``board_cards`` board cards: 5 at the river root, 4 at turn end)."""
     agent = bp.agent
     spec = agent.spec
     fc = agent.features
@@ -476,10 +488,10 @@ def _replay_ranges(
             j += 1
         if bank is not None:
             bank.clear()
-        ranges = _finish_ranges(reach, boards, buttons, stats)
+        ranges = _finish_ranges(reach, boards[:, :board_cards], buttons, stats)
         parts.append(
             {
-                "boards": boards.cpu(),
+                "boards": boards[:, :board_cards].cpu(),
                 "c": c.cpu(),
                 "stack": stack.cpu(),
                 "ranges": ranges.cpu(),
@@ -530,6 +542,7 @@ def _play_scalar(
     explore: float,
     stats: dict[str, float],
     max_hands: int,
+    board_cards: int = 5,
 ) -> dict[str, torch.Tensor]:
     """Scalar-engine self-play for any blueprint with ``policy_matrix``, one
     hand at a time (slow; for tests and blueprints without the lockstep path)."""
@@ -567,7 +580,7 @@ def _play_scalar(
                 contrib = contributions(state, config)
                 rows.append(
                     {
-                        "board": [int(x) for x in state.board],
+                        "board": [int(x) for x in state.board][:board_cards],
                         "c": int(contrib[0]),
                         "stack": min(int(s) for s in state.stacks),
                         "reach": reach,
@@ -680,7 +693,11 @@ def random_c(
     return reachable_c(x.round().long().clamp(lo, hi), big_blind)
 
 
-def random_ranges(boards: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+def random_ranges(
+    boards: torch.Tensor,
+    generator: torch.Generator | None = None,
+    strengths: torch.Tensor | None = None,
+) -> torch.Tensor:
     """``[n, 1326]`` DeepStack-style random ranges on ``[n, 5]`` boards.
 
     The valid combos are sorted by strength (random order within ties); the
@@ -689,10 +706,16 @@ def random_ranges(boards: torch.Tensor, generator: torch.Generator | None = None
     the rest to its second half, down to single combos. One level of the
     recursion is one vectorised step over all boards and combos (a node is
     identified by its first position, which draws its fraction).
+
+    ``strengths`` (``[n, 1326]``, ``-1`` on invalid combos, e.g. a turn-end
+    strength key on 4-card boards) replaces the 5-card hand strengths.
     """
     dev = boards.device
     n = boards.shape[0]
-    s = combo_strengths(boards.long()).double()
+    if strengths is None:
+        s = combo_strengths(boards.long()).double()
+    else:
+        s = strengths.to(dev).double()
     tie = torch.rand(n, NUM_COMBOS, generator=generator, device=dev, dtype=torch.float64)
     order = (s + 0.5 * tie).argsort(1)  # board conflicts (-1) first, then by strength
     V = (s >= 0).sum(1, keepdim=True)
@@ -738,9 +761,12 @@ def perturb_ranges(
     tilt_std: float = 2.0,
     max_mix: float = 0.3,
     max_zero: float = 0.5,
+    pct: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Random perturbations of ``ranges`` (``[n, 1326]`` or ``[n, k, 1326]``,
     one board per row of ``boards [n, 5]``); every range gets its own draws.
+    ``pct`` (``[n, 1326]``) replaces :func:`strength_pct` for the tilts (e.g. a
+    turn-end percentile on 4-card boards).
 
     Each range independently gets (with the given probabilities; at least the
     noise when none is drawn):
@@ -760,7 +786,7 @@ def perturb_ranges(
     r = ranges.reshape(-1, NUM_COMBOS).double()
     N = r.shape[0]
     b = boards.long().to(dev)
-    pct = strength_pct(b).double().repeat_interleave(k, 0)
+    pct = (strength_pct(b) if pct is None else pct.to(dev)).double().repeat_interleave(k, 0)
     valid = board_valid(b).repeat_interleave(k, 0)
 
     def U(*size: int) -> torch.Tensor:
