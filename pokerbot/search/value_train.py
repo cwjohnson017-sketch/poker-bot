@@ -291,9 +291,6 @@ def _forward(net: RiverValueNet, b: dict, amp: bool) -> torch.Tensor:
 
 # --------------------------------------------------------------------------- held-out report
 
-_STAT_KEYS = ("cnt", "abs", "sq", "zabs", "zsq", "oabs", "osq", "zok")
-_W_KEYS = ("wabs", "wzabs", "woabs")
-
 
 @torch.no_grad()
 def sample_stats(
