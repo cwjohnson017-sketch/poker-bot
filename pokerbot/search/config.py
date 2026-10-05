@@ -12,7 +12,7 @@ from ..config import REPO_ROOT, load_yaml
 from ..env.actions import DEFAULT_SPEC, ActionSpec, spec_from_lists
 from .leaf import LeafConfig
 from .solver import SolverConfig
-from .tree import TreeConfig
+from .tree import LEAF_MODES, TreeConfig
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "search_default.yaml"
 
@@ -89,6 +89,10 @@ def search_config(data: dict | str | Path | None = None, **overrides: Any) -> Se
     tree = dict(data.pop("tree", None) or {})
     spec = _spec(tree.pop("actions", None), tree.pop("max_raises", None))
     leaf = _sub(LeafConfig, data.pop("leaf", None))
+    if leaf.mode not in LEAF_MODES:
+        raise ValueError(f"unknown leaf.mode {leaf.mode!r} (expected one of {LEAF_MODES})")
+    if tree.setdefault("leaf_mode", leaf.mode) != leaf.mode:
+        raise ValueError("tree.leaf_mode must match leaf.mode (set leaf.mode only)")
     tree.setdefault("num_continuations", len(leaf.strategies))
     tcfg = _sub(TreeConfig, tree, TreeConfig(spec=spec))
     scfg = _sub(SolverConfig, data.pop("solver", None))

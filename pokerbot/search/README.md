@@ -14,6 +14,7 @@ and for preflop play.
 | `tree.py` | `TreeBuilder` / `build_tree` -> `SubgameTree` (flat tensors), node budget |
 | `showdown.py` | O(n) range-vs-range showdown with card removal (`ShowdownTables`), fold kernel, dense reference |
 | `leaf.py` | depth-limit leaf values from blueprint rollouts with `k` biased continuation strategies |
+| `value_leaf.py` | depth-limit leaf values from a river value net (`leaf.mode: value_net`), `ShowdownOracle` |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
 | `gadget.py` | safe resolving gadget, continual-resolving cache |
 | `agent.py` | `SearchAgent`, `make_search_agent` (match runner: `search:<blueprint spec>`) |
@@ -53,7 +54,7 @@ are depth-sorted and a node's children are contiguous):
 | Field | Meaning |
 |---|---|
 | `parent`, `slot`, `depth` | parent id (-1 at the root), position among the parent's children, depth |
-| `kind` | `DECISION`, `CHANCE`, `FOLD_NODE`, `SHOWDOWN`, `LEAF`, `CONTINUATION` |
+| `kind` | `DECISION`, `CHANCE`, `FOLD_NODE`, `SHOWDOWN`, `LEAF`, `CONTINUATION`, `VALUE` |
 | `actor` | player to act (decisions, and the leaf chooser at `LEAF`), else -1 |
 | `street`, `contrib [N, 2]`, `bets [N, 2]` | street, chips committed this hand, chips committed this street |
 | `board_id` | index into `boards` (the public board at the node) |
@@ -160,6 +161,69 @@ board is disjoint from any given pair of hands with the same probability, so
 the scale `|All| / (R * N_k)` makes the estimate unbiased
 (`test_leaf_rollouts_estimate_the_continuation_value`). Card-independent
 blueprints share betting paths across leaves.
+
+### Value-net leaves (`value_leaf.py`, `leaf.mode: value_net`)
+
+Design: `docs/value_net.md`. `leaf.mode: value_net` (it sets
+`tree.leaf_mode`) makes every depth-limit leaf a `VALUE` terminal: no
+children, actor -1, its engine state kept in `tree.states`. Only turn-end
+leaves on 4-card boards are supported, i.e. flop solves with
+`depth_streets: 1` (a flop solve with `depth_streets: 0` would need a turn net
+and raises `ValueError`). Turn and river solves have no leaves either way.
+
+`ValueLeafEvaluator` values a leaf on board `b4` by the exact chance average
+of a river-start net `N_R` over the 48 river cards, using the solver's
+chance-node identity, so card removal stays exact:
+
+    v_i(c) = sum_{x not in b4} (1/44) * [c avoids x] * m^x_-i(c) * pot * ev^x_i(c)
+
+Here `ev^x = N_R(b4 + x, ranges, c, stack)` is in pot units per unit of
+disjoint opponent mass, and the ranges are both reaches at the leaf masked by
+`x`, in `(OOP, IP)` order. `m^x_-i` is the opponent's masked mass disjoint
+from `c`. It is computed for all 48 cards from one per-card sum per leaf
+(`m - S[x] + r({x, c1}) + r({x, c2})`), without a matmul per row.
+
+* The net is nonlinear in both ranges. So `RangeSolver` passes the full
+  `[2, N, 1326]` reach from its forward pass to `TerminalEvaluator`, which
+  hands `reach[:, VALUE ids]` to the provider at every update (DeepStack
+  style).
+* There is one net row per (leaf, river card), leaf-major. They are batched
+  in chunks of whole leaves, about 16k rows per `predict`.
+* `leaf.net_every: n` runs the net on only every n-th regret update per
+  player. The updates in between reuse the cached `ev` (fp16), re-weighted
+  by the current opponent mass. Value, best-response and exploitability
+  passes (and the continual-resolving cache) always run the net.
+* `tree.leaf_budget_cost` sets how many nodes a leaf counts for in
+  `max_nodes`: 1 by default for `VALUE`, 1 + k for `LEAF`. Setting it to
+  `1 + k` gives a value-net tree exactly the trunk abstraction of the
+  rollout tree.
+
+The predictor comes from `SearchAgent(..., value_predictor=...)`, or is
+loaded once per agent from `leaf.net` with
+`value_net.ValueNetPredictor.from_path(path, device)`. Its interface:
+
+```python
+predict(boards: LongTensor[n, 5], ranges: Tensor[n, 2, 1326],  # (OOP, IP), any positive scale
+        c: Tensor[n], stack: Tensor[n]) -> Tensor[n, 2, 1326]  # ev in pot units, 0 on invalid combos
+```
+
+`ShowdownOracle` implements it exactly for a checked-down river. A turn solve
+whose river is check-down reproduces the full solve to showdown
+(`test_value_leaf.py`). `FixedLeafValues` returns precomputed leaf values.
+
+**Cost on the RTX 4070 Ti.** fp32 reaches, chunks of 16k rows, measured with
+a stand-in MLP (512-1024-512) as the net. The evaluator's own work per
+`values()` call comes on top of the net:
+
+| Leaves (net rows) | Evaluator work per call | Cached call (`net_every > 1`) |
+|---|---|---|
+| 343 (16k) | about 2 ms | 1.4 ms |
+| 1,900 (91k) | about 7 ms | 6 ms |
+
+The evaluator's work is writing the masked net input, one batched matmul and
+a few gathers. The largest item is writing the `[rows, 2, 1326]` fp32 input:
+968 MB at 1,900 leaves, about 2.8 ms. A net that accepted bf16 ranges would
+halve it. One solver iteration makes two calls, one per player.
 
 ## Safe resolving gadget (`gadget.py`)
 
@@ -351,6 +415,15 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
   the (slow) tabular timing above.
 * `test_abstract.py`: scalar abstract actions against `pokerbot.env.actions`,
   pseudo-harmonic mapping, `CardView`, `range_reach`.
+* `test_value_leaf.py`: covers the following.
+  * Value-net leaves with `ShowdownOracle` match a turn solve to showdown
+    with a checked-down river: values, best responses, exploitability and
+    every turn strategy.
+  * The leaf values match the dense showdown enumerated over river cards,
+    and the per-card identity for the masked opponent masses holds.
+  * `net_every`, a flop value-net solve, and `leaf_budget_cost` reproducing
+    the rollout tree under a binding budget.
+  * A value-net agent plays legal hands.
 
 ## Shortcuts and limits
 

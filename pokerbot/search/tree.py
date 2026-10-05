@@ -21,7 +21,10 @@ run-out), ``LEAF`` (depth limit: the start of a street beyond the solved
 horizon) and ``CONTINUATION``. A ``LEAF`` is a decision of the leaf chooser
 (the searcher's opponent by default) among ``k`` continuation strategies
 (Pluribus): each ``CONTINUATION`` child is valued by blueprint rollouts
-(see :mod:`pokerbot.search.leaf`).
+(see :mod:`pokerbot.search.leaf`). With ``leaf_mode="value_net"`` a depth
+limit is instead a ``VALUE`` terminal (no children), valued by a leaf value
+network on both players' current reaches (see
+:mod:`pokerbot.search.value_leaf`).
 
 Node budget: when the expanded tree is larger than ``max_nodes``, bet sizes
 are removed deepest street first (the size farthest from pot-sized first),
@@ -54,8 +57,9 @@ from .abstract import (
     to_action,
 )
 
-DECISION, CHANCE, FOLD_NODE, SHOWDOWN, LEAF, CONTINUATION = range(6)
-KIND_NAMES = ("decision", "chance", "fold", "showdown", "leaf", "continuation")
+DECISION, CHANCE, FOLD_NODE, SHOWDOWN, LEAF, CONTINUATION, VALUE = range(7)
+KIND_NAMES = ("decision", "chance", "fold", "showdown", "leaf", "continuation", "value")
+LEAF_MODES = ("rollouts", "value_net")
 
 
 @dataclass
@@ -67,6 +71,11 @@ class TreeConfig:
     min_chance_cards: int = 4  # floor when the budget forces subsampling
     num_continuations: int = 4  # k continuation strategies at depth-limit leaves
     seed: int = 0
+    # "rollouts": LEAF + k CONTINUATION children; "value_net": one VALUE terminal
+    leaf_mode: str = "rollouts"
+    # nodes a depth-limit leaf counts for in the budget (None: 1 + k for rollouts,
+    # 1 for value_net; 1 + k gives a value-net tree the rollout tree's abstraction)
+    leaf_budget_cost: int | None = None
 
 
 @dataclass
@@ -97,7 +106,7 @@ class SubgameTree:
     slot: torch.Tensor  # position among the parent's children
     depth: torch.Tensor
     kind: torch.Tensor
-    actor: torch.Tensor  # acting player (DECISION, LEAF), else -1
+    actor: torch.Tensor  # acting player (DECISION, LEAF), else -1 (VALUE too)
     street: torch.Tensor
     contrib: torch.Tensor  # [N, 2] chips committed this hand
     bets: torch.Tensor  # [N, 2] chips committed on the node's street
@@ -114,7 +123,7 @@ class SubgameTree:
     children: torch.Tensor  # [N, max_children] child ids, -1 padded
     boards: list[tuple[int, ...]]
     level_start: list[int]  # node ids of depth d are level_start[d] .. level_start[d+1]-1
-    states: list[Any]  # engine state per node (DECISION / LEAF), else None
+    states: list[Any]  # engine state per node (DECISION / LEAF / VALUE), else None
     histories: list[tuple]  # concrete actions from the subgame root per node
     current_node: int  # the observed decision node (end of the path)
     path_nodes: list[tuple[int, int]]  # (node, child slot taken) along the observed path
@@ -138,7 +147,7 @@ class SubgameTree:
         return int((self.kind == kind).sum())
 
     def summary(self) -> str:
-        parts = [f"{KIND_NAMES[k]}={self.count(k)}" for k in range(6)]
+        parts = [f"{name}={self.count(k)}" for k, name in enumerate(KIND_NAMES)]
         return f"{self.num_nodes} nodes ({', '.join(parts)}), depth {len(self.level_start) - 1}"
 
     def child_actions(self, node: int) -> list[tuple[int, int]]:
@@ -175,6 +184,13 @@ class TreeBuilder:
         self.history_before = list(history_before)
         self.path = [(int(s), int(p), *action_key(a)) for s, p, a in path]
         self.tc = tree_config or TreeConfig()
+        if self.tc.leaf_mode not in LEAF_MODES:
+            raise ValueError(f"unknown leaf_mode {self.tc.leaf_mode!r} (expected {LEAF_MODES})")
+        self.value_leaves = self.tc.leaf_mode == "value_net"
+        cost = self.tc.leaf_budget_cost
+        if cost is None:
+            cost = 1 if self.value_leaves else 1 + int(self.tc.num_continuations)
+        self.leaf_cost = int(cost)
         self.device = torch.device(device)
         self.root_state = make_state(self.engine, config, button, self.board, self.history_before)
         if self.root_state.is_terminal:
@@ -264,9 +280,11 @@ class TreeBuilder:
         if path_pos is not None and path_pos < len(self.path):
             raise ValueError("observed path continues past the end of the street")
         if new_st > self.last_street:
-            n = _Skel(LEAF, new_st, BOARD_LEN[st], (c[0], c[1]), (0, 0), state=state, history=hist)
-            n.actor = self.leaf_chooser
-            n.count = 1 + self.tc.num_continuations
+            kind = VALUE if self.value_leaves else LEAF
+            n = _Skel(kind, new_st, BOARD_LEN[st], (c[0], c[1]), (0, 0), state=state, history=hist)
+            if kind == LEAF:
+                n.actor = self.leaf_chooser
+            n.count = self.leaf_cost
             return n
         n = _Skel(CHANCE, st, BOARD_LEN[st], (c[0], c[1]), (0, 0), history=hist)
         n.template = self._node(state, hist, None)
@@ -373,7 +391,7 @@ class TreeBuilder:
             r["aabs"].append(ab)
             r["cont"].append(cont)
             r["folder"].append(s.folder if cont < 0 else -1)
-            states.append(s.state if s.kind in (DECISION, LEAF) and cont < 0 else None)
+            states.append(s.state if s.kind in (DECISION, LEAF, VALUE) and cont < 0 else None)
             hists.append(s.history)
             kids: list[tuple] = []
             if cont >= 0:
@@ -496,10 +514,12 @@ __all__ = [
     "FOLD_NODE",
     "KIND_NAMES",
     "LEAF",
+    "LEAF_MODES",
     "RAISE",
     "SHOWDOWN",
     "SubgameTree",
     "TreeBuilder",
     "TreeConfig",
+    "VALUE",
     "build_tree",
 ]
