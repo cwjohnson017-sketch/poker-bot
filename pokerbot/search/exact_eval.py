@@ -192,19 +192,28 @@ def trunk_exploitability(
                     v = bs.root_values(p, sig_r, best_response=True, ranges=actual)  # [B, C]
                     leaf_vals[p].index_add_(0, jj, (w * v).to(dtype))
                 stats["instances"] += len(chunk)
+                del bs, sig_r, ex, v, actual, mixed, norm  # keep one batch alive at a time
             if log:
                 log(f"#   c={c}: {len(insts)} river subgames, {time.perf_counter() - t0:.0f}s")
     t_river = time.perf_counter() - t0
-    ev_solver = RangeSolver(
-        tree,
-        root,
-        solver.cfg,
-        value_leaves=FixedLeafValues(leaf_vals),
-    )
+    # back the leaf values up through the trunk with the solver's own terminal
+    # evaluator (its all-in matrices), the leaf provider swapped for fixed values
+    term = solver.terminals
+    if L:
+        row = {lf["node"]: i for i, lf in enumerate(leaves)}
+        perm = torch.tensor([row[int(n)] for n in term.value_ids.tolist()], device=dev)
+        fixed = FixedLeafValues(leaf_vals[:, perm])
+    else:
+        fixed = FixedLeafValues(leaf_vals)
+    old = term.value_leaves
+    term.value_leaves = fixed
     br = []
-    for p in (0, 1):
-        vb, _ = ev_solver.values(p, sigma, True, root)
-        br.append(float((root[p] * vb[0]).sum() / Z))
+    try:
+        for p in (0, 1):
+            vb, _ = solver.values(p, sigma, True, root)
+            br.append(float((root[p] * vb[0]).sum() / Z))
+    finally:
+        term.value_leaves = old
     return {
         "br": br,
         "exploitability": (br[0] + br[1]) / 2,
