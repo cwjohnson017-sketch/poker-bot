@@ -155,7 +155,7 @@ def test_stacked_nets_match_one_by_one():
     stacked = StackedAdvantageNets(nets)
     env = VecNLHE(64, GameConfig(), "cpu", seed=4)
     g = torch.Generator().manual_seed(5)
-    for step in range(12):
+    for _ in range(12):
         f = features_from_obs(env.obs())
         for feats in (f, {k: v[:1].expand(40, *v.shape[1:]).clone() for k, v in f.items()}):
             if feats is not f:  # one public state, different hole cards: the range-query shortcuts
