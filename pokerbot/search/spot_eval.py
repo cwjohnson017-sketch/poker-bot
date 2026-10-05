@@ -141,6 +141,7 @@ class EvalSettings:
     budget: float = 4.0  # seconds per decision for value_net_budget
     device: str = "auto"
     variants: tuple[str, ...] = ()
+    turn_net: str | None = None  # turn-end net checkpoint for the value_net_turn* variants
     search: dict = field(default_factory=dict)  # extra search_config overrides (every search)
 
     def torch_device(self) -> torch.device:
@@ -157,20 +158,27 @@ class EvalSettings:
         return d
 
 
-_EVERY = re.compile(r"^value_net_every(\d+)$")
+_EVERY = re.compile(r"^value_net(_turn)?_every(\d+)$")
 
 
 def parse_variant(name: str) -> dict:
     """``value_net_every<n>``: value-net search with ``leaf.net_every n``;
     ``value_net_budget``: value-net search under ``EvalSettings.budget`` seconds
     with the default iteration settings (cap and ``min_iterations`` from the
-    config) instead of a fixed count, on the same tree."""
-    if name == "value_net_budget":
-        return {"net_every": 1, "budget": True}
+    config) instead of a fixed count, on the same tree. ``value_net_turn``,
+    ``value_net_turn_budget`` and ``value_net_turn_every<n>``: the same with the
+    turn-end net ``EvalSettings.turn_net`` as the leaf model."""
+    if name in ("value_net_budget", "value_net_turn_budget"):
+        return {"net_every": 1, "budget": True, "turn": "_turn" in name}
+    if name == "value_net_turn":
+        return {"net_every": 1, "budget": False, "turn": True}
     m = _EVERY.match(name)
-    if m and int(m.group(1)) >= 1:
-        return {"net_every": int(m.group(1)), "budget": False}
-    raise ValueError(f"unknown variant {name!r} (value_net_every<n> or value_net_budget)")
+    if m and int(m.group(2)) >= 1:
+        return {"net_every": int(m.group(2)), "budget": False, "turn": bool(m.group(1))}
+    raise ValueError(
+        f"unknown variant {name!r} (value_net[_turn]_every<n>, value_net[_turn]_budget, "
+        "value_net_turn)"
+    )
 
 
 def _merge(base: dict, extra: dict | None) -> dict:
@@ -542,13 +550,12 @@ def evaluate_spot(
     ro_over = search_overrides(settings, "rollouts")
     k = search_config(**ro_over).tree.num_continuations
 
-    def vn_over(net_every: int = 1, budget: float | None = None) -> dict:
-        return search_overrides(settings, "value_net", net_path, net_every, budget, k)
+    def vn_over(net_every: int = 1, budget: float | None = None, path: Any = net_path) -> dict:
+        return search_overrides(settings, "value_net", path, net_every, budget, k)
 
-    def search(name: str, over: dict, vn: bool) -> SearchRun:
-        run = run_search(
-            name, blueprint, state, game_config, over, predictor_factory() if vn else None
-        )
+    def search(name: str, over: dict, vn: bool, own_net: bool = False) -> SearchRun:
+        pred = predictor_factory() if vn and not own_net else None
+        run = run_search(name, blueprint, state, game_config, over, pred)
         s = run.stats
         log(
             f"  {name}: {s.get('total_seconds', run.seconds):.2f}s "
@@ -564,8 +571,11 @@ def evaluate_spot(
     runs["rollout"] = search("rollout", ro_over, False)
     for name in settings.variants:
         v = parse_variant(name)
-        over = vn_over(v["net_every"], settings.budget if v["budget"] else None)
-        runs[name] = search(name, over, True)
+        if v["turn"] and not settings.turn_net:
+            raise ValueError(f"variant {name} needs EvalSettings.turn_net (--turn-net)")
+        path = settings.turn_net if v["turn"] else net_path
+        over = vn_over(v["net_every"], settings.budget if v["budget"] else None, path)
+        runs[name] = search(name, over, True, own_net=v["turn"])
     vrun = runs["value_net"]
     vsolver = vrun.solver
     check = check_same_trunk(vrun, runs["rollout"])

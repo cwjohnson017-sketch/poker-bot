@@ -94,8 +94,11 @@ def test_search_overrides_share_the_trunk():
     budget = se.search_overrides(TINY, "value_net", None, 1, 3.0, 4)
     assert budget["time_budget"]["flop"] == 3.0
     assert "iterations" not in budget["solver"] and "min_iterations" not in budget
-    assert se.parse_variant("value_net_every3") == {"net_every": 3, "budget": False}
+    assert se.parse_variant("value_net_every3") == {"net_every": 3, "budget": False, "turn": False}
     assert se.parse_variant("value_net_budget")["budget"]
+    assert se.parse_variant("value_net_turn") == {"net_every": 1, "budget": False, "turn": True}
+    assert se.parse_variant("value_net_turn_every2")["turn"]
+    assert se.parse_variant("value_net_turn_budget")["budget"]
     with pytest.raises(ValueError):
         se.parse_variant("value_net_every0")
 
