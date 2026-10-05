@@ -1,0 +1,28 @@
+# Head to head: value-net search against its own blueprint (100bb, 50/100).
+#   python scripts/play_match.py --config configs/match_search_vn.yaml \
+#       --a search:neural:runs/dcfr4_distilled_v2 --b neural:runs/dcfr4_distilled_v2
+# The search agent reads configs/search_value_net.yaml (leaf.net: the value net).
+
+engine: auto
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+match:
+  a: search:neural:runs/dcfr4_distilled_v2
+  b: neural:runs/dcfr4_distilled_v2
+  hands: 1000             # duplicate: 500 deals played from both seats
+  duplicate: true
+  luck_adjust: true
+  seed: 0
+
+agents:                   # constructor arguments by agent prefix
+  search:
+    config: configs/search_value_net.yaml
+    blueprint: {device: cuda}
+  neural:
+    device: cuda

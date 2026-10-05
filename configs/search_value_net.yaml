@@ -1,0 +1,39 @@
+# Real-time search with value-net leaves (pokerbot/search, docs/value_net.md).
+# Same as search_default.yaml except where noted. leaf.net must point at a trained
+# checkpoint: a turn-end net (one row per leaf, fast) or a river net (48 rows per
+# leaf, slower); the agent picks the evaluator from the checkpoint's kind.
+#   python scripts/play_match.py --config configs/match_search_vn.yaml
+
+search:
+  device: auto
+  seed: 0
+  time_budget:              # seconds per decision: tree + gadget + leaf setup + solve
+    flop: 4.0               # value-net flop solves fit a < 5 s decision
+    turn: 1.0
+    river: 1.0
+  min_iterations: 10
+  remove_own_blockers: true
+  fallback_on_error: true
+
+  tree:
+    actions: blueprint      # the blueprint's own abstraction (dcfr4: 12 actions per street)
+    depth_streets: 1        # flop solves: flop + turn, value-net leaves at the end of the turn
+    max_nodes: 6000         # value-net leaves count 1 node each
+    chance_cards: null
+    min_chance_cards: 4
+
+  solver:
+    algorithm: dcfr
+    iterations: 1000
+    max_runouts: 48
+    dtype: float32
+
+  leaf:
+    mode: value_net
+    net: runs/value_net/turn_v1.pt
+    net_every: 1
+
+  gadget:
+    safe: true
+    prior_mix: 0.05
+    rollouts: 256
