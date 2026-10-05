@@ -15,6 +15,12 @@ and for preflop play.
 | `showdown.py` | O(n) range-vs-range showdown with card removal (`ShowdownTables`), fold kernel, dense reference |
 | `leaf.py` | depth-limit leaf values from blueprint rollouts with `k` biased continuation strategies |
 | `value_leaf.py` | depth-limit leaf values from a river value net (`leaf.mode: value_net`), `ShowdownOracle` |
+| `value_net.py` | the river value net: board strength-percentile buckets, `RiverValueNet` (zero-sum output), `ValueNetPredictor` |
+| `value_train.py` | value-net training data (shards), training loop, held-out report |
+| `value_ranges.py` | river-root states for training: blueprint self-play ranges on `VecNLHE`, perturbed and DeepStack-style random ranges |
+| `value_data.py` | data generation: states batched by pot, solved exactly, written as shards (`scripts/gen_value_data.py`) |
+| `batch_solver.py` | `BatchRiverSolver`: DCFR on many river subgames sharing one betting tree, `river_tree` |
+| `exact_eval.py` | exact exploitability of a flop/turn strategy with every river subgame solved (`trunk_exploitability`), `map_sigma` |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
 | `gadget.py` | safe resolving gadget, continual-resolving cache |
 | `agent.py` | `SearchAgent`, `make_search_agent` (match runner: `search:<blueprint spec>`) |
