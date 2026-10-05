@@ -133,7 +133,8 @@ def make_states(
     ``source``, in source order (self-play, perturbed, random)."""
     dev = torch.device(device)
     n_sp, n_pert, n_rand = mix_counts(n, mix)
-    start = int(vr._game(game_config)["stacks"][0])
+    game = vr._game(game_config)
+    start = int(game["stacks"][0])
     parts = []
     if n_sp + n_pert:
         sp = vr.selfplay_river_states(
@@ -165,7 +166,7 @@ def make_states(
         )
     if n_rand:
         g = torch.Generator(device=dev).manual_seed(seeds[2])
-        rs = vr.random_states(n_rand, g, start, c_range[0], c_range[1])
+        rs = vr.random_states(n_rand, g, start, c_range[0], c_range[1], game["big_blind"])
         rs = {k: v.cpu() for k, v in rs.items()}
         rs["source"] = torch.full((n_rand,), SOURCE_RANDOM, dtype=torch.uint8)
         parts.append(rs)
@@ -182,18 +183,23 @@ def take(states: dict[str, torch.Tensor], idx: torch.Tensor) -> dict[str, torch.
 
 
 def make_batches(
-    states: dict[str, torch.Tensor], batch_size: int, min_c: int = 100, max_c: int | None = None
+    states: dict[str, torch.Tensor],
+    batch_size: int,
+    big_blind: int = 100,
+    max_c: int | None = None,
 ) -> list[tuple[torch.Tensor, int]]:
     """Sort the states by ``c`` and chunk them into batches of ``batch_size``:
     a list of ``(indices, c)`` where ``c`` is the batch's median rounded to a
-    chip amount in ``[min_c, max_c]`` (the ``c`` the batch is solved at)."""
+    chip amount (the ``c`` the batch is solved at). The median is snapped to a
+    reachable river-root amount (:func:`.value_ranges.reachable_c`: ``bb`` or
+    at least ``2 * bb``, so at least 100 at 50/100) and capped at ``max_c``."""
     c = states["c"].long()
     order = torch.argsort(c, stable=True)
     out = []
     for lo in range(0, order.numel(), int(batch_size)):
         idx = order[lo : lo + int(batch_size)]
-        med = float(torch.quantile(c[idx].double(), 0.5))
-        cc = max(int(min_c), int(round(med)))
+        med = int(round(float(torch.quantile(c[idx].double(), 0.5))))
+        cc = int(vr.reachable_c(torch.tensor(med), big_blind))
         if max_c is not None:
             cc = min(cc, int(max_c))
         out.append((idx, cc))
@@ -303,10 +309,11 @@ def solve_states(
     trees: TreeCache | None = None,
 ) -> dict[str, torch.Tensor]:
     """Solve all ``states`` in ``c``-sorted batches; rows in the input order."""
-    start = int(vr._game(game_config)["stacks"][0])
+    game = vr._game(game_config)
+    start = int(game["stacks"][0])
     n = states["c"].shape[0]
     out: dict[str, torch.Tensor] = {}
-    for idx, c in make_batches(states, batch_size, max_c=start - 1):
+    for idx, c in make_batches(states, batch_size, game["big_blind"], max_c=start - 1):
         tree = trees.get(c) if trees is not None else None
         rows = solve_batch(
             take(states, idx), c, spec, game_config, iterations, device, solver_cfg, tree

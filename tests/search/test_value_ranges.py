@@ -219,6 +219,10 @@ def test_random_c_and_states():
     g = torch.Generator().manual_seed(5)
     c = vrg.random_c(20000, g)
     assert int(c.min()) >= 100 and int(c.max()) <= 9900
+    assert not bool(((c > 100) & (c < 200)).any())  # no river root commits 1-2 big blinds
+    assert 0.05 < float((c == 100).double().mean()) < 0.1  # log(sqrt 2) / log 99 = 7.5%
+    snapped = vrg.reachable_c(torch.tensor([50, 100, 141, 142, 199, 200, 777]))
+    assert snapped.tolist() == [100, 100, 100, 200, 200, 200, 777]
     med = float(c.double().median())
     assert 900 < med < 1100  # log-uniform: median sqrt(100 * 9900) ~ 995
     st = vrg.random_states(8, g)
@@ -292,13 +296,16 @@ def fake_solver(monkeypatch):
 def test_make_batches_sorts_by_c_and_uses_the_median():
     from pokerbot.search.value_data import make_batches, mix_counts
 
-    c = torch.tensor([900, 50, 300, 120, 7000, 301, 302, 5000, 60])
+    c = torch.tensor([900, 50, 300, 120, 7000, 301, 302, 5000, 60, 150, 170, 180])
     batches = make_batches({"c": c}, 4)
-    assert [b[0].numel() for b in batches] == [4, 4, 1]
+    assert [b[0].numel() for b in batches] == [4, 4, 4]
     flat = torch.cat([b[0] for b in batches])
-    assert sorted(flat.tolist()) == list(range(9))
+    assert sorted(flat.tolist()) == list(range(12))
     assert c[flat].tolist() == sorted(c.tolist())
-    assert [b[1] for b in batches] == [100, 601, 7000]  # medians 90 (-> 100), 601, 7000
+    # medians 135 (-> 100: one to two big blinds is unreachable), 240.5 (-> 240), 2950
+    assert [b[1] for b in batches] == [100, 240, 2950]
+    assert make_batches({"c": torch.tensor([150, 160, 170])}, 4)[0][1] == 200
+    assert make_batches({"c": c}, 12, max_c=200)[0][1] == 200
     assert mix_counts(4096, (0.5, 0.25, 0.25)) == (2048, 1024, 1024)
     assert sum(mix_counts(7, (0.5, 0.3, 0.2))) == 7
 
@@ -363,6 +370,7 @@ def test_generate_shards_and_resume(fake_solver, tmp_path):
 
 def test_solve_batch_with_the_real_solver():
     pytest.importorskip("pokerbot.search.batch_solver")
+    from pokerbot.search.combos import blocked_sum
     from pokerbot.search.value_data import solve_batch
 
     g = torch.Generator().manual_seed(8)
@@ -370,10 +378,12 @@ def test_solve_batch_with_the_real_solver():
     config = vrg.engine_game_config({"stacks": [10000, 10000], "small_blind": 50, "big_blind": 100})
     rows = solve_batch(st, 600, DEFAULT_SPEC, config, 50, device="cpu")
     t = rows["targets"].float()
-    assert bool(torch.isfinite(t).all()) and bool((rows["exploit"] >= -1e-4).all())
-    # range-weighted best-response values of both players sum to at least zero
+    assert bool(torch.isfinite(t).all()) and bool((rows["exploit"] > 0).all())
+    # sum_c r_p(c) m_{-p}(c) ev_p(c) is player p's best-response value per unit
+    # of pair mass Z, in pots; the two add up to 2 Z exploit
     r = rows["ranges"].float()
-    from pokerbot.search.combos import blocked_sum
-
-    gv = sum((r[:, p] * blocked_sum(r[:, 1 - p]) * t[:, p]).sum(-1) for p in range(2))
-    assert bool((gv >= -1e-3).all())
+    terms = [r[:, p] * blocked_sum(r[:, 1 - p]) * t[:, p] for p in range(2)]
+    gv = sum(x.sum(-1) for x in terms)
+    Z = (r[:, 0] * blocked_sum(r[:, 1])).sum(-1)
+    scale = sum(x.abs().sum(-1) for x in terms)
+    torch.testing.assert_close(gv, 2 * Z * rows["exploit"], rtol=0, atol=float(2e-3 * scale.max()))

@@ -650,18 +650,34 @@ def random_boards(
     return torch.rand(n, 52, generator=generator, device=dev).argsort(1)[:, :5]
 
 
+def reachable_c(c: torch.Tensor, big_blind: int = 100) -> torch.Tensor:
+    """Snap river-root commitments to amounts a hand can reach: a limped pot
+    commits one big blind, and every bet or raise is at least one big blind,
+    so ``c`` is ``bb`` or at least ``2 * bb``. Values in between go to the
+    nearer of the two in log space; values below ``bb`` go to ``bb``."""
+    bb = int(big_blind)
+    c = torch.as_tensor(c).long()
+    low = c.double() < math.sqrt(2.0) * bb
+    gap = (c > bb) & (c < 2 * bb)
+    c = torch.where(gap, torch.where(low, bb, 2 * bb), c)
+    return c.clamp(min=bb)
+
+
 def random_c(
     n: int,
     generator: torch.Generator | None = None,
     lo: int = C_MIN,
     hi: int = C_MAX,
     device: Any = None,
+    big_blind: int = 100,
 ) -> torch.Tensor:
-    """``[n]`` long: chips committed per player, log-uniform in ``[lo, hi]``."""
+    """``[n]`` long: chips committed per player, log-uniform in ``[lo, hi]``,
+    then snapped to reachable amounts (:func:`reachable_c`: no ``c`` strictly
+    between one and two big blinds, which no river root has)."""
     dev = generator.device if generator is not None and device is None else device
     u = torch.rand(n, generator=generator, device=dev, dtype=torch.float64)
     x = torch.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
-    return x.round().long().clamp(lo, hi)
+    return reachable_c(x.round().long().clamp(lo, hi), big_blind)
 
 
 def random_ranges(boards: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
@@ -775,11 +791,13 @@ def random_states(
     start_stack: int = 10000,
     c_lo: int = C_MIN,
     c_hi: int = C_MAX,
+    big_blind: int = 100,
 ) -> dict[str, torch.Tensor]:
-    """``n`` river states with random boards, log-uniform ``c`` and
-    independent :func:`random_ranges` for both players (on the generator's device)."""
+    """``n`` river states with random boards, log-uniform ``c`` (:func:`random_c`)
+    and independent :func:`random_ranges` for both players (on the generator's
+    device)."""
     boards = random_boards(n, generator)
-    c = random_c(n, generator, c_lo, c_hi)
+    c = random_c(n, generator, c_lo, c_hi, big_blind=big_blind)
     r0 = random_ranges(boards, generator)
     r1 = random_ranges(boards, generator)
     return {
@@ -811,6 +829,7 @@ __all__ = [
     "random_c",
     "random_ranges",
     "random_states",
+    "reachable_c",
     "range_summary",
     "selfplay_river_states",
     "strength_pct",
