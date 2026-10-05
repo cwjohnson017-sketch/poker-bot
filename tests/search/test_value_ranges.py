@@ -230,3 +230,150 @@ def test_board_valid_matches_valid_masks():
     boards = _boards(16, 6)
     assert torch.equal(vrg.board_valid(boards), valid_masks(boards.tolist()))
     assert torch.equal(vrg.board_valid(boards[:, :3]), valid_masks(boards[:, :3].tolist()))
+
+
+# -- value_data: batching, solving, shards -------------------------------------
+
+
+class _FakeTree:
+    def __init__(self, c):
+        self.c = c
+
+
+def _fake_solver_module(calls):
+    """Stand-in for pokerbot.search.batch_solver: best-response values
+    ``(p + 1) * 0.1 * c * m_{-p}`` (so the targets are ``0.05 * (p + 1)``) and
+    exploitability ``0.02 * c`` chips (0.01 pot)."""
+    import types
+
+    from pokerbot.search.combos import blocked_sum
+
+    mod = types.ModuleType("pokerbot.search.batch_solver")
+
+    def river_tree(game_config, c, spec, button=1, device="cpu"):
+        assert button == 1
+        calls["trees"].append(int(c))
+        return _FakeTree(int(c))
+
+    class BatchRiverSolver:
+        def __init__(self, tree, boards, ranges, cfg=None, device=None):
+            assert boards.shape[0] == ranges.shape[0] and ranges.shape[1:] == (2, NUM_COMBOS)
+            self.tree, self.boards, self.ranges = tree, boards, ranges
+            calls["solves"].append((tree.c, boards.shape[0]))
+
+        def solve(self, iterations):
+            calls["iterations"].append(iterations)
+            return {}
+
+        def root_values(self, player, sigma=None, best_response=False, ranges=None):
+            assert best_response
+            m = blocked_sum(self.ranges[:, 1 - player])
+            return m * (player + 1) * 0.1 * self.tree.c
+
+        def exploitability(self, ranges=None):
+            B = self.boards.shape[0]
+            c = float(self.tree.c)
+            return {"exploitability": torch.full((B,), 0.02 * c), "pot": torch.full((B,), 2 * c)}
+
+    mod.river_tree = river_tree
+    mod.BatchRiverSolver = BatchRiverSolver
+    return mod
+
+
+@pytest.fixture
+def fake_solver(monkeypatch):
+    import sys
+
+    calls = {"trees": [], "solves": [], "iterations": []}
+    monkeypatch.setitem(sys.modules, "pokerbot.search.batch_solver", _fake_solver_module(calls))
+    return calls
+
+
+def test_make_batches_sorts_by_c_and_uses_the_median():
+    from pokerbot.search.value_data import make_batches, mix_counts
+
+    c = torch.tensor([900, 50, 300, 120, 7000, 301, 302, 5000, 60])
+    batches = make_batches({"c": c}, 4)
+    assert [b[0].numel() for b in batches] == [4, 4, 1]
+    flat = torch.cat([b[0] for b in batches])
+    assert sorted(flat.tolist()) == list(range(9))
+    assert c[flat].tolist() == sorted(c.tolist())
+    assert [b[1] for b in batches] == [100, 601, 7000]  # medians 90 (-> 100), 601, 7000
+    assert mix_counts(4096, (0.5, 0.25, 0.25)) == (2048, 1024, 1024)
+    assert sum(mix_counts(7, (0.5, 0.3, 0.2))) == 7
+
+
+def test_solve_batch_targets_and_format(fake_solver):
+    from pokerbot.search.value_data import SHARD_DTYPES, solve_batch
+
+    g = torch.Generator().manual_seed(7)
+    st = vrg.random_states(6, g)
+    st["source"] = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.uint8)
+    config = vrg.engine_game_config({"stacks": [10000, 10000], "small_blind": 50, "big_blind": 100})
+    rows = solve_batch(st, 1234, DEFAULT_SPEC, config, 17, device="cpu")
+    assert fake_solver["trees"] == [1234] and fake_solver["iterations"] == [17]
+    assert {k: v.dtype for k, v in rows.items()} == SHARD_DTYPES
+    assert rows["ranges"].shape == rows["targets"].shape == (6, 2, NUM_COMBOS)
+    assert bool((rows["c"] == 1234).all()) and bool((rows["stack"] == 10000 - 1234).all())
+    assert torch.equal(rows["boards"].long(), st["boards"])
+    assert torch.equal(rows["source"], st["source"])
+    torch.testing.assert_close(rows["exploit"], torch.full((6,), 0.01))
+    valid = valid_masks(st["boards"].tolist())
+    for p in range(2):
+        t = rows["targets"][:, p].float()
+        assert bool((t[~valid] == 0).all())
+        want = torch.full_like(t[valid], 0.05 * (p + 1))
+        torch.testing.assert_close(t[valid], want, rtol=1e-3, atol=0)  # fp16 storage
+    # the stored fp16 ranges are the solved ranges: normalised up to fp16 rounding
+    torch.testing.assert_close(rows["ranges"].float().sum(-1), torch.ones(6, 2), rtol=0, atol=2e-3)
+
+
+def test_generate_shards_and_resume(fake_solver, tmp_path):
+    from pokerbot.search.value_data import GenConfig, generate
+
+    bp = _passive_blueprint()
+    bp.game = {"stacks": [10000, 10000], "small_blind": 50, "big_blind": 100}
+    cfg = GenConfig(samples=20, shard_size=8, batch=4, iterations=9, seed=3, n_envs=16)
+    meta = generate(bp, tmp_path, cfg, device="cpu", log=None)
+    names = sorted(p.name for p in tmp_path.glob("shard_*.pt"))
+    assert names == ["shard_00000.pt", "shard_00001.pt", "shard_00002.pt"]
+    shards = [torch.load(tmp_path / n, weights_only=True) for n in names]
+    assert [int(s["c"].shape[0]) for s in shards] == [8, 8, 4]
+    s0 = shards[0]
+    assert sorted(s0["source"].tolist()) == [0, 0, 0, 0, 1, 1, 2, 2]
+    assert bool((s0["c"] + s0["stack"] == 10000).all())
+    assert set(fake_solver["iterations"]) == {9}
+    assert meta["config"]["samples"] == 20 and len(meta["shards"]) == 3
+    assert meta["timing"]["samples_written"] == 20
+    assert "exploit_p90" in meta["shards"]["shard_00001.pt"]
+    # resume: only the missing shard is regenerated, identically
+    (tmp_path / "shard_00001.pt").unlink()
+    n_solves = len(fake_solver["solves"])
+    generate(bp, tmp_path, cfg, device="cpu", resume=True, log=None)
+    assert len(fake_solver["solves"]) - n_solves == 2  # 8 samples in batches of 4
+    again = torch.load(tmp_path / "shard_00001.pt", weights_only=True)
+    for k, v in shards[1].items():
+        assert torch.equal(v, again[k]), k
+    with pytest.raises(FileExistsError):
+        generate(bp, tmp_path, cfg, device="cpu", log=None)
+    cfg2 = GenConfig(samples=20, shard_size=8, batch=4, iterations=10, seed=3, n_envs=16)
+    with pytest.raises(ValueError, match="iterations"):
+        generate(bp, tmp_path, cfg2, device="cpu", resume=True, log=None)
+
+
+def test_solve_batch_with_the_real_solver():
+    pytest.importorskip("pokerbot.search.batch_solver")
+    from pokerbot.search.value_data import solve_batch
+
+    g = torch.Generator().manual_seed(8)
+    st = vrg.random_states(3, g)
+    config = vrg.engine_game_config({"stacks": [10000, 10000], "small_blind": 50, "big_blind": 100})
+    rows = solve_batch(st, 600, DEFAULT_SPEC, config, 50, device="cpu")
+    t = rows["targets"].float()
+    assert bool(torch.isfinite(t).all()) and bool((rows["exploit"] >= -1e-4).all())
+    # range-weighted best-response values of both players sum to at least zero
+    r = rows["ranges"].float()
+    from pokerbot.search.combos import blocked_sum
+
+    gv = sum((r[:, p] * blocked_sum(r[:, 1 - p]) * t[:, p]).sum(-1) for p in range(2))
+    assert bool((gv >= -1e-3).all())
