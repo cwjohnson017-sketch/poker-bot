@@ -23,6 +23,7 @@ At every postflop decision:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,8 @@ class SearchAgent(BaseAgent):
             self.cfg = config
         else:
             self.cfg = search_config(config, **overrides)
+        if self.cfg.tree.spec is None:  # tree.actions: blueprint
+            self.cfg.tree = replace(self.cfg.tree, spec=blueprint.spec)
         self.device = self.cfg.torch_device()
         self.cache = ContinualCache()
         self._roots: dict = {}

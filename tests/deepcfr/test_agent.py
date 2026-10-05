@@ -132,3 +132,44 @@ def test_agent_greedy_is_deterministic(tmp_path):
 def test_unknown_agent_still_errors():
     with pytest.raises(ValueError):
         make_agent("nope")
+
+
+def test_stacked_nets_match_one_by_one():
+    """StackedAdvantageNets (all nets in batched matmuls, shared-board and
+    shared-history shortcuts) equals evaluating the nets one by one."""
+    from pokerbot.blueprint.deepcfr.features import features_from_obs
+    from pokerbot.blueprint.deepcfr.networks import AdvantageNet, NetConfig, StackedAdvantageNets
+    from pokerbot.env import GameConfig, VecNLHE
+
+    torch.manual_seed(0)
+    cfg = NetConfig(
+        card_dim=8,
+        card_hidden=24,
+        hist_type="mlp",
+        hist_dim=8,
+        hist_hidden=16,
+        width=32,
+        card_embedding=True,
+    )
+    nets = [AdvantageNet(cfg).eval() for _ in range(3)]
+    stacked = StackedAdvantageNets(nets)
+    env = VecNLHE(64, GameConfig(), "cpu", seed=4)
+    g = torch.Generator().manual_seed(5)
+    for step in range(12):
+        f = features_from_obs(env.obs())
+        for feats in (f, {k: v[:1].expand(40, *v.shape[1:]).clone() for k, v in f.items()}):
+            if feats is not f:  # one public state, different hole cards: the range-query shortcuts
+                feats["cards"][:, :2] = torch.randperm(52, generator=g)[:2]
+                board = set(feats["cards"][0, 2:].tolist())
+                holes = [
+                    h
+                    for h in torch.combinations(torch.arange(52), 2).tolist()
+                    if not board & set(h)
+                ][:40]
+                feats["cards"][:, :2] = torch.tensor(holes)
+            with torch.no_grad():
+                want = torch.stack([n(feats) for n in nets])
+            torch.testing.assert_close(stacked(feats), want, rtol=1e-4, atol=1e-5)
+        a = torch.multinomial(env.legal_mask().float(), 1, generator=g).squeeze(1)
+        env.step(torch.where(a == 0, 1, a))
+        env.reset(env.done)

@@ -212,3 +212,60 @@ def test_flop_decision_timing_tabular_blueprint(small_strategy, monkeypatch):
         f"  blueprint policy_combos: {calls['n']} calls, {calls['t']:.2f}s total, "
         f"{1e3 * calls['t'] / max(1, calls['n']):.2f} ms/call"
     )
+
+
+def test_incremental_reach_rollouts_match_history_replay(tiny_neural_run, one_thread):
+    """Rollouts that carry the neural blueprint's own reach forward give the
+    same weights, actions and payoffs as replaying the history at every step."""
+    from pokerbot.search.leaf import LeafConfig, _rollout
+
+    bp = make_blueprint(f"neural:{tiny_neural_run}")
+    assert hasattr(bp, "policy_combos_nets")
+
+    class Replay:  # the same blueprint without the incremental hooks
+        spec = bp.spec
+
+        def policy_combos(self, state, player):
+            return bp.policy_combos(state, player)
+
+    engine = get_engine()
+    g = bp.game
+    config = engine.GameConfig(
+        num_players=2, stacks=g["stacks"], small_blind=g["small_blind"], big_blind=g["big_blind"]
+    )
+    flops = [s for s in random_states(bp.spec, config, 30, seed=13) if s.street == 1][:6]
+    assert flops
+    cfg = LeafConfig()
+    checked = 0
+    for i, s in enumerate(flops):
+        rng = np.random.default_rng(i)
+        full = list(s.board) + [c for c in range(52) if c not in s.board][:2]
+        for chooser in (0, 1):
+            a = _rollout(
+                s,
+                full,
+                bp,
+                chooser,
+                cfg.strategies,
+                cfg,
+                config,
+                engine,
+                np.random.default_rng(100 + i),
+            )
+            b = _rollout(
+                s,
+                full,
+                Replay(),
+                chooser,
+                cfg.strategies,
+                cfg,
+                config,
+                engine,
+                np.random.default_rng(100 + i),
+            )
+            assert a[2:] == b[2:]  # kind, folder, amount: the same sampled line
+            torch.testing.assert_close(a[0], b[0], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(a[1], b[1], rtol=1e-5, atol=1e-6)
+            checked += 1
+        del rng
+    assert checked >= 6

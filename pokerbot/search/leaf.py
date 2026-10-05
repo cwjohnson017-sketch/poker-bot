@@ -40,7 +40,7 @@ import numpy as np
 import torch
 
 from .abstract import CHECK_CALL, FOLD, RAISE, CardView, contributions, legal_options, to_action
-from .blueprint import policy_matrix
+from .blueprint import normalise_combos, policy_matrix
 from .combos import NUM_COMBOS, valid_mask
 from .showdown import ShowdownTables, fold_values
 from .tree import CONTINUATION, LEAF
@@ -182,15 +182,27 @@ def _rollout(
     s = state.clone()
     ok = valid_mask(full_board)
     A = bp.spec.num_actions
+    # Blueprints with per-combo own reach (neural SD-CFR) can carry it along the
+    # rollout instead of replaying the history at every decision: same values.
+    incremental = hasattr(bp, "policy_combos_nets")
+    log_reach: dict[int, Any] = {}
+    nets = None
     while not s.is_terminal:
         p = int(s.current_player)
         opts = legal_options(s, bp.spec)
-        P = policy_matrix(bp, CardView(s, full_board), p)  # [C|1, A]
         classes = torch.full((A,), -1, dtype=torch.long)
         legal = torch.zeros(A)
         for o in opts:
             classes[o.index] = o.kind
             legal[o.index] = 1.0
+        view = CardView(s, full_board)
+        if incremental:
+            if p not in log_reach:  # the first rollout decision of p: reach of the leaf
+                log_reach[p] = bp.log_reach_combos(view, p)
+            avg, nets = bp.policy_combos_nets(view, p, log_reach[p])
+            P = normalise_combos(avg, legal)
+        else:
+            P = policy_matrix(bp, view, p)  # [C|1, A]
         if p == chooser:
             Pk = _biased(P, classes, strategies, cfg.bias)  # [k, C|1, A]
             mix = Pk.mean(0)
@@ -207,6 +219,8 @@ def _rollout(
             w_ch = w_ch * (Pk[:, :, a] / q[a])
         else:
             w_nc = w_nc * (P[:, a] / q[a])
+        if incremental and log_reach[p] is not None:
+            log_reach[p] = log_reach[p] + torch.log(nets[:, :, a].clamp(min=0))
         opt = next(o for o in opts if o.index == a)
         s.apply(to_action(engine, opt.kind, opt.amount))
     c = contributions(s, game_config)

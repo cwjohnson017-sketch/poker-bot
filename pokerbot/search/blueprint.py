@@ -79,6 +79,18 @@ def policy_vector(bp: Any, state: Any, player: int) -> list[float]:
     return _normalise(bp.policy(state, player), legal, bp.spec.num_actions)
 
 
+def normalise_combos(P: Any, legal_t: torch.Tensor, device: Any = "cpu") -> torch.Tensor:
+    """Rows of a ``policy_combos`` result normalised over the legal actions
+    (uniform where a row has no legal mass)."""
+    P = torch.as_tensor(P, dtype=torch.float32, device=device)
+    if P.dim() == 1:
+        P = P[None]
+    P = P.clamp(min=0) * legal_t
+    s = P.sum(-1, keepdim=True)
+    uni = legal_t / legal_t.sum()
+    return torch.where(s > 0, P / s.clamp(min=1e-30), uni)
+
+
 def policy_matrix(
     bp: Any,
     state: Any,
@@ -99,13 +111,7 @@ def policy_matrix(
     legal_t[legal] = 1.0
     fn = getattr(bp, "policy_combos", None)
     if fn is not None:
-        P = torch.as_tensor(fn(view, player), dtype=torch.float32, device=device)
-        if P.dim() == 1:
-            P = P[None]
-        P = P.clamp(min=0) * legal_t
-        s = P.sum(-1, keepdim=True)
-        uni = legal_t / legal_t.sum()
-        return torch.where(s > 0, P / s.clamp(min=1e-30), uni)
+        return normalise_combos(fn(view, player), legal_t, device)
     if getattr(bp, "card_independent", False):
         row = _normalise(bp.policy(view, player), legal, A)
         return torch.tensor([row], dtype=torch.float32, device=device)

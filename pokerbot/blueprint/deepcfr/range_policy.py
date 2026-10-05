@@ -46,6 +46,7 @@ import torch
 
 from ...engine_select import to_engine_action
 from ...env.actions import ActionSpec
+from ...env.cards import NO_CARD
 from ...env.obs import NUM_SCALARS
 from .features import FeatureConfig
 from .policy import SDCFRPolicy
@@ -162,9 +163,17 @@ class NeuralRangePolicy:
         out["cards"][:, :2] = holes
         f = self.features
         if self._equity or f.strength_tables:
-            # the hand-dependent columns are recomputed for every hand
-            extra = [out["scalars"][:, :NUM_SCALARS]]
+            # the hand-dependent columns are recomputed for every hand. Hands
+            # sharing a card with the board (zero rows in probs_all) get a valid
+            # placeholder hand for this, since the lookups reject duplicate cards.
             b = out["cards"][:, 2:]
+            clash = (holes[:, :, None] == b[:, None, :]).any(2).any(1)
+            if bool(clash.any()):
+                board = [int(c) for c in b[0].tolist() if int(c) != NO_CARD]
+                holes = holes.clone()
+                holes[clash] = torch.tensor(self._placeholder(board), dtype=holes.dtype)
+                out["cards"][:, :2] = holes
+            extra = [out["scalars"][:, :NUM_SCALARS]]
             if self._equity:
                 from ...env.equity import equity_histogram, equity_vs_random
 
@@ -257,17 +266,37 @@ class NeuralRangePolicy:
     def probs_all(self, state: Any, seat: int, config: Any) -> torch.Tensor:
         """``[1326, A]`` average policy of every combo (canonical order); rows
         of combos sharing a card with the board are zero."""
+        return self.probs_all_nets(state, seat, config)[0]
+
+    def log_reach_all(self, state: Any, seat: int, config: Any) -> torch.Tensor | None:
+        """``[T, 1326]`` own log reach of every combo at ``state`` (None when
+        the policy is not reach-weighted)."""
+        if not self.policies[seat].reach_weighted:
+            return None
+        return self._log_reach_all(state, seat, config)
+
+    @torch.no_grad()
+    def probs_all_nets(
+        self, state: Any, seat: int, config: Any, log_reach: Any = "history"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`probs_all` plus every net's policy ``[T, 1326, A]`` (float64,
+        CPU). ``log_reach`` (``[T, 1326]`` or None) supplies the own reach
+        instead of replaying the history: after an own action ``a`` the reach
+        at the next decision is ``log_reach + log(nets[:, :, a])``, exactly what
+        the replay computes, so rollouts can carry it forward."""
         pol = self.policies[seat]
         board = [int(c) for c in state.board]
         hist = list(state.history)
         cur = self._state(config, state.button, board, hist, seat, self._placeholder(board))
         feats, info = self._batch(cur, seat, config, ALL_COMBOS)
-        lr = self._log_reach_all(state, seat, config) if pol.reach_weighted else None
-        avg, _ = pol.average(feats, lr)
+        if isinstance(log_reach, str):
+            log_reach = self.log_reach_all(state, seat, config)
+        lr = log_reach if pol.reach_weighted else None
+        avg, P = pol.average(feats, lr)
         avg = avg.float().cpu() * torch.tensor(info.legal, dtype=torch.float32)
         avg = avg / avg.sum(1, keepdim=True).clamp(min=1e-30)
         avg[board_conflicts(board)] = 0.0
-        return avg
+        return avg, P.double().cpu()
 
     def probs_batch(self, state: Any, seat: int, holes: Any, config: Any) -> np.ndarray:
         """``[K, A]`` for the hands ``holes`` (rows of :meth:`probs_all`)."""

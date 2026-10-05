@@ -60,7 +60,9 @@ def _sub(cls: type, data: dict | None, base: Any = None) -> Any:
     return replace(base, **data)
 
 
-def _spec(data: Any, max_raises: int | None) -> ActionSpec:
+def _spec(data: Any, max_raises: int | None) -> ActionSpec | None:
+    if data == "blueprint":
+        return None  # the blueprint's own abstraction, filled in by SearchAgent
     if data in (None, "default"):
         spec = DEFAULT_SPEC
     else:

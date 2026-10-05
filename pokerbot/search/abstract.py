@@ -73,7 +73,8 @@ def legal_options(
     la = state.legal_actions()
     raise_ok = la.min_raise_to > 0
     lo, hi = int(la.min_raise_to), int(la.max_raise_to)
-    can_raise = raise_ok and raises_this_street(state) < cap
+    n_raises = raises_this_street(state)
+    can_raise = raise_ok and n_raises < cap
     out: list[Option] = []
     seen: list[int] = []
     for i, a in enumerate(acts):
@@ -90,6 +91,8 @@ def legal_options(
         if name == "allin":
             out.append(Option(i, RAISE, hi, name))
             continue
+        if len(a) == 3 and (a[2] == "open") != (n_raises == 0):
+            continue  # an open size facing a raise, or a reraise size facing none
         m = _milli(a[1])
         if name == "raise":
             raw = max_bet + (m * (pot + to_call) + 500) // 1000
