@@ -249,9 +249,12 @@ class TurnFeatureCache:
     def _add(self, boards: torch.Tensor, keys: list[int]) -> None:
         start, k = len(self), len(keys)
         self._reserve(start + k)
-        mr, vr = turn_rank_tables(boards)
-        self._mrank2[start : start + k] = mr.to(torch.int16)
-        self._vrank2[start : start + k] = vr.to(torch.int16)
+        step = 4096  # bounds the long [step, 1326] temporaries of turn_rank_tables
+        for s in range(0, k, step):
+            e = min(k, s + step)
+            mr, vr = turn_rank_tables(boards[s:e])
+            self._mrank2[start + s : start + e] = mr.to(torch.int16)
+            self._vrank2[start + s : start + e] = vr.to(torch.int16)
         self._boards[start : start + k] = boards
         for i, key in enumerate(keys):
             self._index[key] = start + i
