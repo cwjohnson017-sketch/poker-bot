@@ -64,7 +64,7 @@ discounts and the strategy weight are device scalars).
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -132,6 +132,9 @@ class _Seg:
     par: torch.Tensor  # [m] internal parent ids
     src_par: torch.Tensor  # [m] reach rows of the actor at the parents
     orig: torch.Tensor  # [m * k] BFS ids of the children
+
+
+Strategy = Callable[[_Seg], torch.Tensor]  # segment -> its [m, k, B, 1081] edge rows
 
 
 @dataclass
@@ -340,7 +343,17 @@ class BatchRiverSolver:
     def _view(self, x: torch.Tensor, g: _Seg) -> torch.Tensor:
         return x[g.s : g.e].view(g.m, g.k, self.B, CV)
 
-    def _forward(self, p: int, sigma: torch.Tensor, root: torch.Tensor) -> None:
+    # A strategy is a function of a segment returning its ``[m, k, B, 1081]`` rows.
+
+    def _current(self, g: _Seg) -> torch.Tensor:
+        return self._view(self.sigma, g)
+
+    def _average(self, g: _Seg) -> torch.Tensor:
+        S = self._view(self.strat_sum, g)
+        tot = S.sum(1, keepdim=True)
+        return torch.where(tot > 0, S / tot.clamp(min=1e-30), self._current(g))
+
+    def _forward(self, p: int, sigma: Strategy, root: torch.Tensor) -> None:
         """Player ``p``'s reach on the rows of ``p``'s edges (and its root row)."""
         R = self.reach
         R[0 if p == 0 else self.N] = root
@@ -348,7 +361,7 @@ class BatchRiverSolver:
             for g in self.by_depth[d]:
                 if g.p == p:
                     par = R.index_select(0, g.src_par).unsqueeze(1)
-                    torch.mul(par, self._view(sigma, g), out=self._view(R, g))
+                    torch.mul(par, sigma(g), out=self._view(R, g))
 
     def _terminals(self, i: int, v: torch.Tensor) -> None:
         """Values of player ``i`` at the fold and showdown nodes, against the
@@ -362,7 +375,7 @@ class BatchRiverSolver:
                 )
                 v.index_copy_(0, term.ids, op(r.view(-1, self.B, CV)))
 
-    def _backward(self, i: int, sigma: torch.Tensor, mode: str) -> torch.Tensor:
+    def _backward(self, i: int, sigma: Strategy, mode: str) -> torch.Tensor:
         """Values of player ``i`` against the opponent's reach in the buffer.
         ``mode``: "value" plays ``sigma``, "br" maximises at ``i``'s nodes,
         "update" plays ``sigma`` and also updates ``i``'s regrets, strategy sum
@@ -377,7 +390,7 @@ class BatchRiverSolver:
                 elif mode == "br":
                     out = cv.amax(1)
                 else:
-                    out = (cv * self._view(sigma, g)).sum(1)
+                    out = (cv * sigma(g)).sum(1)
                 v.index_copy_(0, g.par, out)
             if mode == "update":
                 for g in self.by_depth[d]:
@@ -428,9 +441,9 @@ class BatchRiverSolver:
     def _update(self, i: int) -> None:
         for p in (0, 1):
             if not self._reach_ok[p]:
-                self._forward(p, self.sigma, self.ranges[:, p])
+                self._forward(p, self._current, self.ranges[:, p])
                 self._reach_ok[p] = True
-        self._backward(i, self.sigma, "update")
+        self._backward(i, self._current, "update")
         self._reach_ok[i] = False
 
     def _iteration(self) -> None:
@@ -441,7 +454,7 @@ class BatchRiverSolver:
         """One iteration from the captured CUDA graph (capturing it first).
         The graph starts from player 0's reach being current."""
         if not self._reach_ok[0]:
-            self._forward(0, self.sigma, self.ranges[:, 0])
+            self._forward(0, self._current, self.ranges[:, 0])
             self._reach_ok[0] = True
         self._reach_ok[1] = False
         if self._graph is None:
@@ -481,27 +494,17 @@ class BatchRiverSolver:
 
     # -- results ------------------------------------------------------------
 
-    def _average_internal(self) -> torch.Tensor:
-        avg = torch.empty_like(self.sigma)
-        avg[0] = 1
-        for g in self.segs:
-            S = self._view(self.strat_sum, g)
-            tot = S.sum(1, keepdim=True)
-            avg_g = torch.where(tot > 0, S / tot.clamp(min=1e-30), self._view(self.sigma, g))
-            self._view(avg, g).copy_(avg_g)
-        return avg
-
     def _to_full(self, x: torch.Tensor) -> torch.Tensor:
         """``[B, 1081] -> [B, 1326]``, zero on board conflicts."""
         return x.new_zeros(*x.shape[:-1], C).scatter_(-1, self.cmap.expand_as(x), x)
 
-    def _strategy_out(self, x: torch.Tensor) -> torch.Tensor:
-        """Internal edge rows -> ``[N, B, 1326]`` in BFS order, uniform for
-        combos that conflict with the board, root row 1."""
-        out = x.new_empty(self.N, self.B, C)
+    def _strategy_out(self, sigma: Strategy) -> torch.Tensor:
+        """``[N, B, 1326]`` in BFS order, uniform for combos that conflict
+        with the board, root row 1."""
+        out = self.sigma.new_empty(self.N, self.B, C)
         out[0] = 1
         for g in self.segs:
-            rows = x[g.s : g.e]
+            rows = sigma(g).reshape(g.e - g.s, self.B, CV)
             full = rows.new_full((g.e - g.s, self.B, C), 1.0 / g.k)
             full.scatter_(2, self.cmap.expand_as(rows), rows)
             out.index_copy_(0, g.orig, full)
@@ -511,22 +514,22 @@ class BatchRiverSolver:
     def average_strategy(self) -> torch.Tensor:
         """``[N, B, 1326]``: entry ``n`` is the probability that the actor at
         ``parent(n)`` takes the action into ``n`` (root row 1), BFS node ids."""
-        return self._strategy_out(self._average_internal())
+        return self._strategy_out(self._average)
 
     @torch.no_grad()
     def current_strategy(self) -> torch.Tensor:
-        return self._strategy_out(self.sigma)
+        return self._strategy_out(self._current)
 
-    def _internal_sigma(self, sigma: torch.Tensor | None) -> torch.Tensor:
+    def _strategy_in(self, sigma: torch.Tensor | None) -> Strategy:
         if sigma is None:
-            return self._average_internal()
+            return self._average
         sigma = torch.as_tensor(sigma).to(self.device, self.dtype)
         if tuple(sigma.shape) != (self.N, self.B, C):
             raise ValueError(f"sigma must be [{self.N}, {self.B}, {C}]")
-        sigma = sigma.index_select(0, self.perm)
-        return sigma.gather(2, self.cmap.expand(self.N, -1, -1))
+        x = sigma.index_select(0, self.perm).gather(2, self.cmap.expand(self.N, -1, -1))
+        return lambda g: self._view(x, g)
 
-    def _values(self, player: int, sigma: torch.Tensor, root: torch.Tensor, mode: str):
+    def _values(self, player: int, sigma: Strategy, root: torch.Tensor, mode: str):
         """Root values ``[B, 1081]`` of ``player`` (reach buffer overwritten)."""
         o = 1 - player
         self._reach_ok[o] = False
@@ -547,7 +550,7 @@ class BatchRiverSolver:
         1326]`` as from :meth:`average_strategy`; default the average strategy),
         or a best response to it when ``best_response``. ``ranges [B, 2, 1326]``
         overrides the root reaches. Zero for combos that hit the board."""
-        sig = self._internal_sigma(sigma)
+        sig = self._strategy_in(sigma)
         root = self.ranges if ranges is None else self._compact_ranges(ranges)
         mode = "br" if best_response else "value"
         return self._to_full(self._values(player, sig, root, mode))
@@ -558,7 +561,7 @@ class BatchRiverSolver:
         ``br [B, 2]`` and values ``ev [B, 2]`` of each player (range-weighted,
         divided by the pair mass), ``nashconv [B]`` and ``exploitability [B]``
         (half of it), all in chips, plus ``pot`` (``2c``)."""
-        sigma = self._average_internal()
+        sigma = self._average
         root = self.ranges if ranges is None else self._compact_ranges(ranges)
         Z = (root[:, 0] * self.kern.fold(root[None, :, 1].clone())[0]).sum(-1)
         br = torch.zeros(self.B, 2, device=self.device, dtype=self.dtype)
