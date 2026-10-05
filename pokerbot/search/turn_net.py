@@ -289,11 +289,13 @@ class TurnFeatureCache:
                 0,
             ]
         n = len(self)
-        if t[1] < n:
-            t[0][t[1] : n] = turn_buckets(
-                self._mrank2[t[1] : n], self._vrank2[t[1] : n], K, self.spread_buckets
+        step = 8192  # bounds the long temporaries of turn_buckets
+        for s in range(t[1], n, step):
+            e = min(n, s + step)
+            t[0][s:e] = turn_buckets(
+                self._mrank2[s:e], self._vrank2[s:e], K, self.spread_buckets
             ).to(torch.int16)
-            t[1] = n
+        t[1] = max(t[1], n)
         return t[0]
 
     def features(
