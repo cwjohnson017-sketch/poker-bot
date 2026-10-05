@@ -835,6 +835,46 @@ def render_markdown(data: dict) -> str:
         row += [_f(_mean([prof(s, c) for s in g])) for c in cols]
         row.append(_f(_mean([s["reference_sanity"]["mbb"] for s in g])))
         lines.append("| " + " | ".join(row) + " |")
+    # one-sided: the opponent's best response to the strategy of the player to act
+    mbb = 1000.0 / 100.0
+
+    def onesided(s: dict, c: str) -> float | None:
+        p = s["profiles"].get(c)
+        return None if p is None else p["br"][1 - int(s["seat"])] * mbb
+
+    lines += [
+        "",
+        "## Best response against the acting player's strategy (mbb/hand)",
+        "",
+        "BR of the opponent of the player to act (the searcher) against that player's "
+        "trunk strategy, river exact as above. The safe-resolving gadget leaves the "
+        "opponent's own subgame strategy unrefined for hands that would terminate, and "
+        "the two-sided number above charges the searches for it although they never play "
+        "it. The searcher's exploitability is this BR minus the opponent's game value, "
+        "which is the same for every column: differences between columns are exact "
+        "differences in exploitability. Lower is better.",
+        "",
+    ]
+    head1 = ["spot"] + [PROFILE_NAMES.get(c, c) for c in cols]
+    head1 += [f"{PROFILE_NAMES.get(c, c)} - blueprint" for c in cols if c != "blueprint"]
+    lines.append("| " + " | ".join(head1) + " |")
+    lines.append("|---|" + "---:|" * (len(head1) - 1))
+
+    def orow(label: str, g: Sequence[dict]) -> str:
+        vals = {c: _mean([onesided(s, c) for s in g]) for c in cols}
+        bp = vals.get("blueprint")
+        cells = [label] + [_f(vals[c]) for c in cols]
+        cells += [
+            _f(None if vals[c] is None or bp is None else vals[c] - bp)
+            for c in cols
+            if c != "blueprint"
+        ]
+        return "| " + " | ".join(cells) + " |"
+
+    for s in spots:
+        lines.append(orow(s["label"], [s]))
+    for name, g in groups:
+        lines.append(orow(name, g))
     if spots:
         bpo = _mean([s.get("blueprint_offtree") for s in spots])
         lines += [
