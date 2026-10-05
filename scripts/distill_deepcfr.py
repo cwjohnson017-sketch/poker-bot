@@ -20,11 +20,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stride", type=int, default=10, help="every k-th net of the average")
     ap.add_argument("--last-n", type=int, default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--data", default=None, help="cache of the generated rows (.pt)")
     for name, default in DistillConfig().__dict__.items():
-        ap.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default)
+        if isinstance(default, tuple):
+            ap.add_argument(f"--{name.replace('_', '-')}", type=float, nargs="*", default=default)
+        else:
+            ap.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default)
     args = ap.parse_args(argv)
-    cfg = DistillConfig(**{k: getattr(args, k) for k in DistillConfig().__dict__})
-    print(distill(args.run, args.out, cfg, args.stride, args.last_n, args.device), flush=True)
+    vals = {k: getattr(args, k) for k in DistillConfig().__dict__}
+    vals["street_mix"] = tuple(vals["street_mix"] or ())
+    cfg = DistillConfig(**vals)
+    rep = distill(
+        args.run, args.out, cfg, args.stride, args.last_n, args.device, data_path=args.data
+    )
+    print(rep, flush=True)
     return 0
 
 

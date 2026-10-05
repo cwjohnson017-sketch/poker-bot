@@ -40,6 +40,8 @@ from .networks import AdvantageNet, NetConfig
 from .policy import SDCFRPolicy
 from .strength import add_strength, load_strength
 
+STREET_COL = 8  # street one-hot in the base scalars (env.obs.SCALAR_NAMES)
+
 KEYS = ("cards", "hist", "hist_amt", "scalars", "legal", "target")
 _DTYPES = {
     "cards": torch.uint8,
@@ -62,6 +64,10 @@ class DistillConfig:
     lr_final: float = 1e-5  # cosine decay to this
     holdout: float = 0.02
     seed: int = 0
+    # share of each training batch per street (preflop, flop, turn, river);
+    # empty = sample rows uniformly (preflop decisions dominate the data)
+    street_mix: tuple = ()
+    width: int = 0  # trunk width of the distilled net (0 = the blueprint's)
 
 
 def _game(meta: dict[str, Any]) -> Any:
@@ -175,6 +181,11 @@ def train_seat(
     perm = torch.randperm(n, generator=g, device=device)
     n_val = max(1, int(n * cfg.holdout))
     val, tr = perm[:n_val], perm[n_val:]
+    street = data["scalars"][:, STREET_COL : STREET_COL + 4].float().argmax(1)
+    by_street = [tr[street[tr] == s] for s in range(4)]
+    mix = torch.tensor(cfg.street_mix or [0.0] * 4, dtype=torch.float64)
+    stratified = bool(cfg.street_mix) and all(len(b) > 0 for b in by_street)
+    counts = (mix / mix.sum() * cfg.batch).round().long().tolist() if stratified else None
     torch.manual_seed(cfg.seed + 4)
     net = AdvantageNet(net_cfg).to(device).train()
     opt = torch.optim.Adam(net.parameters(), lr=cfg.lr, fused=device.type == "cuda")
@@ -190,18 +201,32 @@ def train_seat(
             tvs.append(tv.float().cpu())
         net.train()
         tv = torch.cat(tvs)
-        return {
+        st = street[val].cpu()
+        out = {
             "tv_mean": float(tv.mean()),
             "tv_p90": float(tv.quantile(0.9)),
             "tv_p99": float(tv.quantile(0.99)),
         }
+        for s, name in enumerate(("preflop", "flop", "turn", "river")):
+            m = st == s
+            out[f"tv_{name}"] = float(tv[m].mean()) if bool(m.any()) else float("nan")
+        return out
 
     for step in range(cfg.steps):
         frac = step / max(1, cfg.steps - 1)
         lr = cfg.lr_final + 0.5 * (cfg.lr - cfg.lr_final) * (1 + math.cos(math.pi * frac))
         for pg in opt.param_groups:
             pg["lr"] = lr
-        idx = tr[torch.randint(0, tr.numel(), (cfg.batch,), generator=g, device=device)]
+        if stratified:
+            idx = torch.cat(
+                [
+                    b[torch.randint(0, b.numel(), (k,), generator=g, device=device)]
+                    for b, k in zip(by_street, counts, strict=True)
+                    if k > 0
+                ]
+            )
+        else:
+            idx = tr[torch.randint(0, tr.numel(), (cfg.batch,), generator=g, device=device)]
         loss, _ = _loss(net, _batch(data, idx, device), amp)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -210,9 +235,10 @@ def train_seat(
         if log and (step + 1) % max(1, cfg.steps // 10) == 0:
             ev = evaluate()
             log(
-                f"# distill {label} step {step + 1}: loss {float(loss):.4f}, held-out TV "
-                f"mean {ev['tv_mean']:.4f} p90 {ev['tv_p90']:.4f} p99 {ev['tv_p99']:.4f}, "
-                f"{time.time() - t0:.0f}s"
+                f"# distill {label} step {step + 1}: loss {float(loss.detach()):.4f}, held-out TV "
+                f"mean {ev['tv_mean']:.4f} p90 {ev['tv_p90']:.4f} p99 {ev['tv_p99']:.4f}; streets "
+                f"{ev['tv_preflop']:.3f} / {ev['tv_flop']:.3f} / {ev['tv_turn']:.3f} / "
+                f"{ev['tv_river']:.3f}, {time.time() - t0:.0f}s"
             )
     return net.eval(), evaluate()
 
@@ -225,7 +251,10 @@ def distill(
     last_n: int | None = None,
     device: str = "cuda",
     log: Any = print,
+    data_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    """Distill ``run`` into ``out``. ``data_path`` caches the generated rows:
+    loaded when the file exists, else written after generation."""
     cfg = cfg or DistillConfig()
     log = log or (lambda *_a, **_k: None)
     dev = torch.device(device)
@@ -236,11 +265,21 @@ def distill(
         for p in (0, 1)
     ]
     log(f"# distilling {run}: {len(policies[0])} nets per seat (stride {stride}), {cfg}")
-    data = generate(policies, meta, cfg, dev, log)
+    if data_path is not None and Path(data_path).exists():
+        data = torch.load(data_path, weights_only=True)
+        log(f"# loaded {sum(int(d['target'].shape[0]) for d in data):,} rows from {data_path}")
+    else:
+        data = generate(policies, meta, cfg, dev, log)
+        if data_path is not None:
+            Path(data_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(data, data_path)
     del policies
     if dev.type == "cuda":
         torch.cuda.empty_cache()
     net_cfg = NetConfig.from_dict(meta["net_config"])
+    if cfg.width:
+        net_cfg = NetConfig.from_dict({**net_cfg.to_dict(), "width": int(cfg.width)})
+    meta = {**meta, "net_config": net_cfg.to_dict()}
     out = Path(out)
     root = out / "checkpoints"
     new_meta = {k: v for k, v in meta.items() if k != "preflop"}

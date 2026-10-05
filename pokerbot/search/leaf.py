@@ -39,6 +39,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import vec_rollouts
 from .abstract import CHECK_CALL, FOLD, RAISE, CardView, contributions, legal_options, to_action
 from .blueprint import normalise_combos, policy_matrix
 from .combos import NUM_COMBOS, valid_mask
@@ -255,6 +256,41 @@ def build_leaf_rollouts(
     rng = np.random.default_rng(cfg.seed)
     shared = bool(getattr(bp, "card_independent", False))
     path_cache: dict[tuple, tuple] = {}
+    if vec_rollouts.supports(bp):  # every rollout at once on VecNLHE
+        specs, meta = [], []
+        for leaf in leaves:
+            state = tree.states[leaf]
+            board = list(tree.boards[int(tree.board_id[leaf])])
+            chooser = int(tree.actor[leaf])
+            first = int(tree.first_child[leaf])
+            if int(tree.num_children[leaf]) != k:
+                raise ValueError("tree continuations do not match the leaf config")
+            scale = runout_scale(len(board)) / R
+            avail = [c for c in range(52) if c not in board]
+            for _ in range(R):
+                runout = rng.choice(avail, size=5 - len(board), replace=False).tolist()
+                full = board + [int(c) for c in runout]
+                specs.append(vec_rollouts.Rollout(state, full, chooser))
+                meta.append((first, chooser, full, scale))
+        out = vec_rollouts.run_rollouts(
+            specs, bp, game_config, cfg.strategies, cfg.bias, cfg.explore, device, cfg.seed
+        )
+        for r, (first, chooser, full, scale) in enumerate(meta):
+            nc_id = rs.add_weight(out.w_nc[r])
+            ch_ids = [rs.add_weight(out.w_ch[r, j]) for j in range(k)]
+            for j in range(k):
+                w0, w1 = (ch_ids[j], nc_id) if chooser == 0 else (nc_id, ch_ids[j])
+                rs.add_row(
+                    cont_target[first + j],
+                    out.kind[r],
+                    out.folder[r],
+                    out.amount[r],
+                    full,
+                    w0,
+                    w1,
+                    scale,
+                )
+        return rs.finalise()
     for leaf in leaves:
         state = tree.states[leaf]
         board = list(tree.boards[int(tree.board_id[leaf])])
@@ -304,6 +340,26 @@ def build_root_rollouts(
     rng = np.random.default_rng(seed)
     avail = [c for c in range(52) if c not in board]
     scale = runout_scale(len(board)) / rollouts
+    if vec_rollouts.supports(bp):
+        fulls = [
+            list(board) + [int(c) for c in rng.choice(avail, size=5 - len(board), replace=False)]
+            for _ in range(rollouts)
+        ]
+        out = vec_rollouts.run_rollouts(
+            [vec_rollouts.Rollout(state, f, 0) for f in fulls],
+            bp,
+            game_config,
+            cfg.strategies,
+            cfg.bias,
+            cfg.explore,
+            device,
+            seed,
+        )
+        for r, full in enumerate(fulls):
+            i0 = rs.add_weight(out.w_ch[r, 0])
+            i1 = rs.add_weight(out.w_nc[r])
+            rs.add_row(0, out.kind[r], out.folder[r], out.amount[r], full, i0, i1, scale)
+        return rs.finalise()
     for _ in range(rollouts):
         runout = rng.choice(avail, size=5 - len(board), replace=False).tolist()
         full = list(board) + [int(c) for c in runout]

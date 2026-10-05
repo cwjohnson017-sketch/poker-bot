@@ -269,3 +269,51 @@ def test_incremental_reach_rollouts_match_history_replay(tiny_neural_run, one_th
             checked += 1
         del rng
     assert checked >= 6
+
+
+@pytest.fixture(scope="module")
+def tiny_distilled_run(tiny_neural_run, tmp_path_factory):
+    from pokerbot.blueprint.deepcfr.distill import DistillConfig, distill
+
+    out = tmp_path_factory.mktemp("distilled")
+    threads = torch.get_num_threads()
+    try:
+        cfg = DistillConfig(rows=3000, n_envs=64, steps=40, batch=256, holdout=0.1)
+        distill(tiny_neural_run, out, cfg, device="cpu", log=None)
+    finally:
+        torch.set_num_threads(threads)
+    return out
+
+
+def test_lockstep_rollout_policies_match_policy_matrix(tiny_distilled_run, one_thread):
+    """The lockstep rollouts' per-step range policy (VecNLHE slots replayed to
+    the state) equals the scalar path's policy_matrix at the same states."""
+    from pokerbot.search import vec_rollouts as vr
+
+    bp = make_blueprint(f"neural:{tiny_distilled_run}")
+    assert vr.supports(bp)
+    engine = get_engine()
+    g = bp.game
+    config = engine.GameConfig(
+        num_players=2, stacks=g["stacks"], small_blind=g["small_blind"], big_blind=g["big_blind"]
+    )
+    states = [s for s in random_states(bp.spec, config, 40, seed=21) if s.street >= 1][:24]
+    rng = np.random.default_rng(3)
+    ros = []
+    for s in states:
+        avail = [c for c in range(52) if c not in s.board]
+        full = list(s.board) + rng.choice(avail, 5 - len(s.board), replace=False).tolist()
+        ros.append(vr.Rollout(s, [int(c) for c in full], 0))
+    env = vr.make_env(ros, bp.spec, config, "cpu")
+    from pokerbot.blueprint.deepcfr.features import features_from_obs
+    from pokerbot.blueprint.deepcfr.strength import load_strength
+
+    feats = features_from_obs(env.obs(**bp.agent.features.obs_kwargs()))
+    st = bp.agent.features.strength_tables
+    cache = vr.StrengthCache(load_strength(st), "cpu") if st else None
+    boards = torch.tensor([ro.board for ro in ros])
+    P = vr.slot_policies(bp.agent, env, torch.arange(len(ros)), feats, boards, cache)
+    for i, (s, ro) in enumerate(zip(states, ros, strict=True)):
+        want = policy_matrix(bp, CardView(s, ro.board), s.current_player)
+        ok = valid_mask(ro.board)
+        torch.testing.assert_close(P[i][ok], want[ok], rtol=1e-4, atol=1e-5)
