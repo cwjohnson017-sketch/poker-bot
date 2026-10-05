@@ -6,7 +6,7 @@ python scripts/train_turn_net.py --data data/value_turn --out runs/vn/turn.pt --
 python scripts/train_turn_net.py --data d1 --heldout-data d2 --out turn.pt --spread-buckets 8
 
 --spread-buckets 1 buckets combos by their mean river strength only (1-D);
-k > 1 splits each of buckets / k mean buckets into k sub-buckets by the spread
+k > 1 (default 8) splits each of buckets / k mean buckets into k sub-buckets by the spread
 of the river strength (2-D: separates draws from made hands). Every field of
 ValueNetConfig and ValueTrainConfig is a flag, as in scripts/train_value_net.py.
 The checkpoint records kind turn_end, so a search agent with leaf.net pointing
@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pokerbot.search.turn_net import train_turn_net  # noqa: E402
+from pokerbot.search.turn_net import DEFAULT_SPREAD_BUCKETS, train_turn_net  # noqa: E402
 from pokerbot.search.value_net import ValueNetConfig  # noqa: E402
 from pokerbot.search.value_train import ValueTrainConfig  # noqa: E402
 
@@ -39,7 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data", action="append", required=True, help="shard directory (repeat)")
     ap.add_argument("--heldout-data", action="append", default=None, help="held-out shards")
     ap.add_argument("--out", required=True, help="checkpoint path (.pt)")
-    ap.add_argument("--spread-buckets", type=int, default=1, help="1 = 1-D buckets")
+    ap.add_argument(
+        "--spread-buckets", type=int, default=DEFAULT_SPREAD_BUCKETS, help="1 = 1-D buckets"
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quiet", action="store_true")
     _add_fields(ap, ValueNetConfig)

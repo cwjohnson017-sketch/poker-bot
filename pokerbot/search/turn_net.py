@@ -36,6 +36,11 @@ With ``K`` buckets and ``spread_buckets = Ks``:
   bucket ``mean_bucket * Ks + sub``. Made hands and draws of similar equity
   then get separate inputs and outputs.
 
+Measured on check-down targets of blueprint self-play, perturbed and random
+turn-end states (16k training samples, K = 256), 2-D ``32 x 8`` buckets have 8%
+lower held-out MAE than 1-D ``256`` buckets (``64 x 4``: 5%), so training
+defaults to ``spread_buckets = 8`` (:data:`DEFAULT_SPREAD_BUCKETS`).
+
 ``pct`` (the residual head's input) is ``mrank2 / 2254``. A turn board's
 features need the rank tables of its 48 river boards (``48 * 1326`` hand
 evaluations), computed once per board by :class:`TurnFeatureCache`.
@@ -74,6 +79,8 @@ RIVERS = NUM_CARDS - TURN_LEN  # 48
 SEEN_RIVERS = RIVERS - 2  # river cards a valid combo can see (46)
 TURN_VALID = 1128  # combos disjoint from a 4-card board: C(48, 2)
 KIND = "turn_end"
+# 2-D buckets by default: 32 x 8 beat 1-D 256 by 8% held-out MAE on check-down targets
+DEFAULT_SPREAD_BUCKETS = 8
 _KEY_BASE = torch.tensor([NUM_CARDS**i for i in range(TURN_LEN)], dtype=torch.long)
 
 
@@ -327,7 +334,12 @@ class TurnEndPredictor(ValueNetPredictor):
         dev = torch.device(device) if device is not None else next(net.parameters()).device
         if spread_buckets is None:
             meta = getattr(net, "meta", None) or {}
-            spread_buckets = int(meta.get("turn_features", {}).get("spread_buckets", 1))
+            spread_buckets = meta.get("turn_features", {}).get("spread_buckets")
+            if spread_buckets is None:
+                raise ValueError(
+                    "the net's meta has no turn_features.spread_buckets: pass spread_buckets "
+                    "or load a turn-end checkpoint"
+                )
         if cache is None:
             cache = TurnFeatureCache(dev, spread_buckets)
         elif cache.spread_buckets != int(spread_buckets):
@@ -389,7 +401,7 @@ def train_turn_net(
     out: str | Path | None = None,
     net_cfg: ValueNetConfig | None = None,
     cfg: Any = None,
-    spread_buckets: int = 1,
+    spread_buckets: int = DEFAULT_SPREAD_BUCKETS,
     heldout: str | Path | Sequence[str | Path] | None = None,
     device: str | torch.device = "cuda",
     log: Any = print,
@@ -425,6 +437,7 @@ def train_turn_net(
 
 
 __all__ = [
+    "DEFAULT_SPREAD_BUCKETS",
     "KIND",
     "TurnEndPredictor",
     "TurnFeatureCache",

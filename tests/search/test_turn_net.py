@@ -280,6 +280,8 @@ def test_turn_end_predictor_and_checkpoints(tmp_path):
     odd = _noisy_net(ValueNetConfig(buckets=30, width=16, layers=1))
     with pytest.raises(ValueError, match="multiple"):
         TurnEndPredictor(odd, "cpu", spread_buckets=4)
+    with pytest.raises(ValueError, match="spread_buckets"):
+        TurnEndPredictor(net, "cpu")  # a bare net: the bucket layout is unknown
 
 
 # --------------------------------------------------------------------------- learning
