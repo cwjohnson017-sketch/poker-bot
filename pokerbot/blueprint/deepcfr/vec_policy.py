@@ -40,6 +40,7 @@ def _on_device(pol: SDCFRPolicy, device: torch.device) -> SDCFRPolicy:
         nets,
         reach_weighted=pol.reach_weighted,
         fallback=pol.fallback,
+        policy_head=pol.policy_head,
         device=device,
         preflop=preflop,
     )

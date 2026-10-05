@@ -108,7 +108,9 @@ class NeuralBlueprintAgent(BaseAgent):
             max_iter=max_iter,
             stride=stride,
             device=device,
-            reach_weighted=reach_weighted,
+            # a distilled average-strategy run: one softmax policy net per seat
+            reach_weighted=reach_weighted and bool(meta.get("reach_weighted", True)),
+            policy_head=meta.get("policy_head", "regret"),
             fallback=meta.get("fallback", "uniform"),
         )
         pols = [SDCFRPolicy.from_dir(path, p, **kw) for p in (0, 1)]

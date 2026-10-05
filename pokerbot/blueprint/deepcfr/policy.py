@@ -55,7 +55,13 @@ class SDCFRPolicy:
         fallback: str = "uniform",
         device: torch.device | str = "cpu",
         preflop: tuple[PreflopTree, dict[int, torch.Tensor]] | None = None,
+        policy_head: str = "regret",
     ) -> None:
+        if policy_head not in ("regret", "softmax"):
+            raise ValueError(f"policy_head must be 'regret' or 'softmax', got {policy_head!r}")
+        # "regret": the nets output advantages (regret matching); "softmax": they
+        # output policy logits (a distilled average-strategy net)
+        self.policy_head = policy_head
         nets = sorted(nets, key=lambda x: x[0])
         if last_n:
             nets = nets[-int(last_n) :]
@@ -146,9 +152,12 @@ class SDCFRPolicy:
         legal = feats["legal"]
         adv = self._advantages_all(feats).float()
         T, n, A = adv.shape
-        P = regret_matching(
-            adv.reshape(T * n, A), legal[None].expand(T, n, A).reshape(T * n, A), self.fallback
-        ).reshape(T, n, A)
+        if self.policy_head == "softmax":
+            P = torch.softmax(adv.masked_fill(~legal.bool()[None], float("-inf")), -1)
+        else:
+            P = regret_matching(
+                adv.reshape(T * n, A), legal[None].expand(T, n, A).reshape(T * n, A), self.fallback
+            ).reshape(T, n, A)
         return self._with_tables(P, feats, None)
 
     def _with_tables(
@@ -213,7 +222,11 @@ class SDCFRPolicy:
 
     @torch.no_grad()
     def net_probs(self, feats: dict[str, torch.Tensor], index: int) -> torch.Tensor:
-        """``[n, A]`` regret-matching policy of net ``index`` alone."""
+        """``[n, A]`` policy of net ``index`` alone."""
         feats = {k: v.to(self.device) for k, v in feats.items()}
-        P = regret_matching(self.nets[index](feats).float(), feats["legal"], self.fallback)
+        out = self.nets[index](feats).float()
+        if self.policy_head == "softmax":
+            P = torch.softmax(out.masked_fill(~feats["legal"].bool(), float("-inf")), -1)
+        else:
+            P = regret_matching(out, feats["legal"], self.fallback)
         return self._with_tables(P, feats, index)
