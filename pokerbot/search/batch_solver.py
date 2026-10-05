@@ -379,7 +379,8 @@ class BatchRiverSolver:
         """Values of player ``i`` against the opponent's reach in the buffer.
         ``mode``: "value" plays ``sigma``, "br" maximises at ``i``'s nodes,
         "update" plays ``sigma`` and also updates ``i``'s regrets, strategy sum
-        and current strategy."""
+        and current strategy. A parent's children all lie in one segment, so a
+        segment is updated as soon as its parents' values are summed."""
         v = self.v
         self._terminals(i, v)
         for d in range(self.max_depth, 0, -1):
@@ -392,10 +393,8 @@ class BatchRiverSolver:
                 else:
                     out = (cv * sigma(g)).sum(1)
                 v.index_copy_(0, g.par, out)
-            if mode == "update":
-                for g in self.by_depth[d]:
-                    if g.p == i:
-                        self._update_segment(g, i)
+                if mode == "update" and g.p == i:
+                    self._update_segment(g, cv, out.unsqueeze(1))
         return v
 
     # -- CFR ----------------------------------------------------------------
@@ -416,14 +415,14 @@ class BatchRiverSolver:
         for x, val in zip(self._scal, (a, b, w), strict=True):
             x.fill_(val)
 
-    def _update_segment(self, g: _Seg, i: int) -> None:
-        """Discount, add instantaneous regrets, add to the strategy sum and
-        regret-match the edges of segment ``g`` (``i``'s; values complete)."""
+    def _update_segment(self, g: _Seg, cv: torch.Tensor, vpar: torch.Tensor) -> None:
+        """Discount, add instantaneous regrets ``cv - vpar`` (children and
+        parent values), add to the strategy sum and regret-match the edges of
+        the updating player's segment ``g``."""
         a, b, w = self._scal
-        v = self.v
         R = self._view(self.regret, g)
         sig = self._view(self.sigma, g)
-        inst = self._view(v, g) - v.index_select(0, g.par).unsqueeze(1)
+        inst = cv - vpar
         if self.cfg.algorithm == "dcfr":
             torch.addcmul(inst, R, torch.where(R > 0, a, b), out=R)
         else:
