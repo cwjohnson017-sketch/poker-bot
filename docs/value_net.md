@@ -25,7 +25,8 @@ Cost: one net row per (leaf, river card). That is about 15k rows for the
 **Fallback if that is too slow:** distil `N_R`'s chance average into a
 turn-end net, one row per leaf. That needs no extra solving (the same idea as
 DeepStack's auxiliary net). A turn-start net for `depth_streets: 0` is
-bootstrapped the same way later.
+bootstrapped the same way later. The turn-end net is implemented: see
+section 6.
 
 ## 2. Inputs and outputs
 
@@ -132,3 +133,52 @@ Candidates are mapped onto one shared trunk by the key (action history,
 board). The 6 flop spots of `runs/search_noise` are evaluated, plus more
 boards. Timings per decision are reported. Instances where both reaches are
 negligible are skipped, with a stated error bound.
+
+## 6. Turn-end net: one row per leaf (implemented)
+
+The river evaluator costs 48 net rows per leaf on every solver update. The
+turn-end net `N_TE` (DeepStack's auxiliary net, `search/turn_net.py`)
+predicts the chance average directly, so a leaf is one row:
+
+    ev_TE_p(c) = v_p(c) / (m_{-p}(c) * pot)
+               = sum_x [c avoids x] * m^x_{-p}(c) / (44 * m_{-p}(c)) * N_R(b4 + x, r^x)_p(c)
+
+with `m_{-p} = blocked_sum(r_{-p})` on the 4-card board (the weights sum to 1,
+since `sum_x [c avoids x] m^x(c) = 44 m(c)`). `TurnEndLeafEvaluator` returns
+`v_p = ev_TE_p * m_{-p} * pot`.
+
+* **Targets** are bootstrapped from `N_R` with no solving: the exact chance
+  average of section 1 (`value_leaf.river_average`, the code
+  `ValueLeafEvaluator` uses), 48 river-net rows per sample. With the
+  check-down oracle as `N_R` they are exact check-down values, which the
+  tests check against a dense enumeration and against `BatchRiverSolver`.
+* **States** as in section 3, stopped at the end of turn betting: the
+  self-play hands that reach the river root, without their river card
+  (ranges zero only on the 4-card board), perturbed copies, and DeepStack
+  random ranges along the turn-end strength order. Shards use the river
+  format with `boards [n, 4]`, `exploit = 0` and `kind: turn_end`.
+* **Inputs.** `RiverValueNet` unchanged, with turn-end buckets. For each
+  combo, its river-strength ranks on the 46 river boards it can see give the
+  mean (equity against a random hand, an exact integer sum) and the spread.
+  1-D buckets are percentile buckets of the mean. 2-D buckets
+  (`K / Ks` mean buckets by `Ks` spread quantiles within each) separate
+  draws from made hands of equal equity.
+* **Checkpoints** carry `kind: turn_end` and `spread_buckets` in their meta.
+  The agent loads either kind from `leaf.net` and picks the provider.
+
+**Measured** (CPU, 8 threads, default 4.3 M-parameter nets, a 5,490-node
+100 bb flop tree with 931 leaves): one `values()` call takes 1,650 ms with the
+river net (44,688 rows) and 36 ms with the turn-end net, and a solver
+iteration takes 3.46 s against 0.24 s. On the RTX 4070 Ti, estimated from
+FLOPs: about 15-20 ms against 0.5 ms per call.
+
+**1-D against 2-D buckets**, on check-down targets (16k training and 4k
+held-out samples, K = 256): held-out MAE 0.0300 (1-D), 0.0284 (64 x 4) and
+0.0275 (32 x 8) pot after 2,000 steps, against 0.250 for the zero
+prediction; after 6,000 steps (overfitting) 0.0312, 0.0292 (16 x 16) and
+0.0283 (32 x 8). The 2-D bucket oracle is also lower (0.0037 against
+0.0041). Training defaults to 32 x 8.
+
+Not done yet: a turn-end net trained on a real river net's targets (needs
+the river net), and a turn-start net for `depth_streets: 0`, which would be
+bootstrapped from this one in the same way.

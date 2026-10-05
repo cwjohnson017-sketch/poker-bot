@@ -14,11 +14,13 @@ and for preflop play.
 | `tree.py` | `TreeBuilder` / `build_tree` -> `SubgameTree` (flat tensors), node budget |
 | `showdown.py` | O(n) range-vs-range showdown with card removal (`ShowdownTables`), fold kernel, dense reference |
 | `leaf.py` | depth-limit leaf values from blueprint rollouts with `k` biased continuation strategies |
-| `value_leaf.py` | depth-limit leaf values from a river value net (`leaf.mode: value_net`), `ShowdownOracle` |
+| `value_leaf.py` | depth-limit leaf values from a value net (`leaf.mode: value_net`): river net averaged over the river cards (`ValueLeafEvaluator`, `river_average`) or a turn-end net (`TurnEndLeafEvaluator`), `ShowdownOracle` |
 | `value_net.py` | the river value net: board strength-percentile buckets, `RiverValueNet` (zero-sum output), `ValueNetPredictor` |
 | `value_train.py` | value-net training data (shards), training loop, held-out report |
-| `value_ranges.py` | river-root states for training: blueprint self-play ranges on `VecNLHE`, perturbed and DeepStack-style random ranges |
+| `value_ranges.py` | river-root (or turn-end) states for training: blueprint self-play ranges on `VecNLHE`, perturbed and DeepStack-style random ranges |
 | `value_data.py` | data generation: states batched by pot, solved exactly, written as shards (`scripts/gen_value_data.py`) |
+| `turn_net.py` | the turn-end net (DeepStack's auxiliary net): turn-end buckets (`TurnFeatureCache`), `TurnEndPredictor`, `load_leaf_predictor`, `train_turn_net` |
+| `turn_data.py` | turn-end data with targets bootstrapped from the river net, no solving (`scripts/gen_turn_data.py`) |
 | `batch_solver.py` | `BatchRiverSolver`: DCFR on many river subgames sharing one betting tree, `river_tree` |
 | `exact_eval.py` | exact exploitability of a flop/turn strategy with every river subgame solved (`trunk_exploitability`), `map_sigma` |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
@@ -206,7 +208,10 @@ from `c`. It is computed for all 48 cards from one per-card sum per leaf
 
 The predictor comes from `SearchAgent(..., value_predictor=...)`, or is
 loaded once per agent from `leaf.net` with
-`value_net.ValueNetPredictor.from_path(path, device)`. Its interface:
+`turn_net.load_leaf_predictor(path, device)`: a river net
+(`ValueNetPredictor`) or a turn-end net (`TurnEndPredictor`, below), by the
+checkpoint's `meta` kind. The provider follows the predictor's `kind`
+(`value_leaf.make_leaf_evaluator`). A river predictor's interface:
 
 ```python
 predict(boards: LongTensor[n, 5], ranges: Tensor[n, 2, 1326],  # (OOP, IP), any positive scale
@@ -230,6 +235,74 @@ The evaluator's work is writing the masked net input, one batched matmul and
 a few gathers. The largest item is writing the `[rows, 2, 1326]` fp32 input:
 968 MB at 1,900 leaves, about 2.8 ms. A net that accepted bf16 ranges would
 halve it. One solver iteration makes two calls, one per player.
+
+#### Turn-end net: one row per leaf (`turn_net.py`, `turn_data.py`)
+
+DeepStack's auxiliary net. `river_average(predictor, boards4, c, stack,
+reach)` is the chance average above without a tree (both players, from one
+net pass). A turn-end net `N_TE` learns it directly, in the same units:
+
+    ev_TE_p(c) = v_p(c) / (m_-p(c) * pot),   m_-p = blocked_sum(pi_-p) on b4
+
+so `TurnEndLeafEvaluator` needs one net row per leaf:
+`v_p = ev_TE_p * m_-p * pot`, with the same `ids`, `values()` and `net_every`
+caching as `ValueLeafEvaluator`.
+
+* **Targets** are bootstrapped from the river net: no solving, 48 river-net
+  rows per sample (`turn_data.turn_targets`). With `ShowdownOracle` they are
+  the exact check-down turn-end values.
+* **States**: blueprint self-play stopped at the end of turn betting
+  (`selfplay_river_states(..., turn_end=True)`: the river-root hands without
+  their river card), perturbed copies, and random ranges along the turn-end
+  strength order. Shards are river shards with `boards [n, 4]`, `exploit` 0
+  and `kind: turn_end` in `meta.json`:
+  `scripts/gen_turn_data.py --river-net <ckpt> --blueprint <run> --out <dir> --samples N`.
+* **Features**: the model is `RiverValueNet` unchanged; only the buckets
+  differ. Per combo, its river-strength ranks on the 46 river boards it can
+  see give the mean (equity against a random hand) and the spread. 1-D:
+  percentile buckets of the mean. 2-D (`spread_buckets = Ks`): `K / Ks` mean
+  buckets, each split into `Ks` equal-count spread quantiles, so draws and
+  made hands of equal equity separate. `TurnFeatureCache` keeps the ranks per
+  turn board (48 river boards are evaluated once per new turn board).
+* **Training**: `scripts/train_turn_net.py --data <dir> --out turn.pt
+  --spread-buckets 8` (`turn_net.train_turn_net`). The checkpoint's meta has
+  `kind: turn_end`, so an agent with `leaf.net: turn.pt` uses
+  `TurnEndLeafEvaluator` (`last_stats["value_provider"]`).
+
+**Cost.** Measured on this CPU (8 threads) on a 100 bb flop tree (5,490
+nodes, 931 leaves on 49 turn boards), fp32 reaches, both nets the default
+`ValueNetConfig` (4.3 M parameters, K = 256):
+
+| Provider | Net rows per call | `values()` call | Without the net | Solver iteration |
+|---|---|---|---|---|
+| `ValueLeafEvaluator` (river net x 48) | 44,688 | 1,650 ms | 67 ms | 3.46 s |
+| `TurnEndLeafEvaluator` | 931 | 36 ms | 4 ms | 0.24 s |
+
+A 2,220-node tree (441 leaves): 785 ms against 18 ms per call. The first
+call on new turn boards builds the feature tables (about 0.25 s for 49 turn
+boards on this CPU). On the RTX 4070 Ti (estimated from FLOPs, not measured):
+the net is about 8.5 MFLOP per row, so a river call at 931 leaves is about
+380 GFLOP plus about 3 GB of memory traffic, roughly 15-20 ms with the
+evaluator's own work, i.e. 30-40 ms of every iteration. The turn-end call is
+about 8 GFLOP and 65 MB, so it is bound by kernel launches: roughly 0.5 ms per
+call, 1 ms per iteration.
+
+**1-D or 2-D buckets.** Held-out error on check-down targets (16k training
+samples from `dcfr4_distilled_v2` self-play, perturbed and random states; a
+separate 4k held-out run; K = 256, width 512, 4 layers, 2,000 steps, two
+seeds that agree to 0.0002; pot units):
+
+| Buckets | MAE | wMAE | Bucket oracle MAE |
+|---|---|---|---|
+| 256 (1-D) | 0.0300 | 0.0311 | 0.0041 |
+| 64 x 4 | 0.0284 | 0.0293 | 0.0040 |
+| 32 x 8 | 0.0275 | 0.0285 | 0.0037 |
+
+(zero prediction: MAE 0.250). 32 x 8 is 8% better than 1-D on every source
+(self-play, perturbed, random), so `--spread-buckets 8` is the default. At
+6,000 steps, which overfit the 16k samples, the order is the same: 0.0312
+(1-D), 0.0292 (16 x 16), 0.0283 (32 x 8). The nets are far above the bucket
+oracle, so more data matters more than the bucketing.
 
 ## Safe resolving gadget (`gadget.py`)
 
@@ -430,6 +503,20 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
   * `net_every`, a flop value-net solve, and `leaf_budget_cost` reproducing
     the rollout tree under a binding budget.
   * A value-net agent plays legal hands.
+* `test_turn_net.py` (turn-end net, about 15 s on CPU): covers the following.
+  * `river_average` equals `ValueLeafEvaluator.values` on a flop tree (exact
+    check-down oracle and a nonlinear toy river net; any leaf order).
+  * Turn-end targets bootstrapped from `ShowdownOracle` equal the dense
+    check-down enumeration over river cards and `BatchRiverSolver` on a
+    check-down river.
+  * Turn-end features match their definition (1-D and 2-D buckets), the
+    feature cache, `TurnEndPredictor` and checkpoint kinds.
+  * A small turn-end net learns check-down targets (held-out MAE about 15% of
+    the zero baseline).
+  * `TurnEndLeafEvaluator` with an exact turn-end predictor reproduces the
+    river evaluator's leaf values and solve, and `net_every`.
+  * The agent picks the provider from the checkpoint kind and plays; turn-end
+    self-play states; the data and training CLIs.
 
 ## Shortcuts and limits
 

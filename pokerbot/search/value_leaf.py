@@ -26,25 +26,39 @@ the 48 masked copies come from one per-card sum per leaf:
 ``m^x(c) = m(c) - S[x] + r({x, c1}) + r({x, c2})`` for ``c = {c1, c2}``
 avoiding ``x``, with ``S[x]`` the mass of combos holding ``x``. They are
 never materialised: ``sum_x ev^x * m^x`` is one batched matmul per chunk (see
-:meth:`ValueLeafEvaluator._combine`), so beyond the net the cost of a call is
+:meth:`RiverAverage._combine`), so beyond the net the cost of a call is
 about one write of the net input and one read of the net output.
+
+The same chance average without a tree is :func:`river_average` (states given
+as tensors, both players at once); it is the target of the **turn-end net**
+(:mod:`.turn_net`, DeepStack's auxiliary net), which predicts it directly:
+
+    ev_TE_p(c) = v_p(c) / (m_-p(c) * pot),   m_-p = blocked_sum(pi_-p) on b4
+
+(``sum_x [c avoids x] m^x_-p(c) = 44 m_-p(c)``, so ``ev_TE`` is a convex
+combination of the ``ev^x``). :class:`TurnEndLeafEvaluator` uses such a net,
+one row per leaf instead of 48.
 
 Providers here (anything with ``values(player, reach[2, L, 1326], cached) ->
 [L, 1326]`` works with :class:`~pokerbot.search.solver.TerminalEvaluator`;
 ``cached`` is true for the solver's regret updates, false for every other
 evaluation):
 
-* :class:`ValueLeafEvaluator` - the net, optionally re-run only every
-  ``every`` regret updates per player (cached ``ev`` re-weighted by the
-  current ``m``);
+* :class:`ValueLeafEvaluator` - the river net averaged over the river cards,
+  optionally re-run only every ``every`` regret updates per player (cached
+  ``ev`` re-weighted by the current ``m``);
+* :class:`TurnEndLeafEvaluator` - a turn-end net, one row per leaf;
 * :class:`FixedLeafValues` - precomputed values, ignoring the reaches;
-* :class:`ShowdownOracle` - an exact ``predict`` for a checked-down river,
-  for tests and as a sanity baseline.
+* :class:`ShowdownOracle` - an exact river ``predict`` for a checked-down
+  river, for tests and as a sanity baseline.
+
+:func:`make_leaf_evaluator` picks the provider from the predictor's ``kind``.
 """
 
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 import torch
@@ -82,19 +96,77 @@ class LeafValueProvider(Protocol):
     def values(self, player: int, reach: torch.Tensor, cached: bool = False) -> torch.Tensor: ...
 
 
-class ValueLeafEvaluator:
-    """Values of every ``VALUE`` node of ``tree`` from a river value net.
+def predictor_kind(predictor: Any) -> str:
+    """``"river"`` (river-start net: boards ``[n, 5]``) or ``"turn_end"``
+    (turn-end net: boards ``[n, 4]``), from the predictor's ``kind`` attribute
+    (default river)."""
+    return str(getattr(predictor, "kind", "river"))
 
-    ``values(player, reach)`` takes both players' reaches at the ``VALUE``
-    nodes, ``[2, L, 1326]`` in the order of ``ids`` (the ``VALUE`` node ids
-    sorted by turn board, then node id; :class:`~pokerbot.search.solver.TerminalEvaluator`
-    uses a provider's ``ids`` when it has them), and returns ``player``'s
-    counterfactual values ``[L, 1326]`` in chips (solver convention).
-    ``every > 1`` re-runs the net only on every ``every``-th regret update
-    (``cached=True`` call) per player and otherwise reuses the cached ``ev``
+
+# -- turn-end leaves of a tree ----------------------------------------------------
+
+
+def turn_end_leaves(tree: SubgameTree) -> dict[str, Any]:
+    """The ``VALUE`` nodes of ``tree`` (turn-end leaves) in evaluation order
+    (grouped by turn board, then node id) and their layout: ``nodes``, the
+    distinct ``boards4``, ``leaf_b4`` (board index per leaf), ``c`` and
+    ``stack`` (long ``[L]``), ``oop`` (the OOP seat per leaf) and ``oop_seat``."""
+    dev = tree.device
+    nodes = (tree.kind == VALUE).nonzero().flatten().tolist()
+    b4_index: dict[tuple[int, ...], int] = {}
+    node_b4: dict[int, int] = {}
+    for n in nodes:
+        board = tuple(int(x) for x in tree.boards[int(tree.board_id[n])])
+        if len(board) != TURN_LEN:
+            raise ValueError(
+                f"value-net leaf {n} is on a {len(board)}-card board, but only turn-end "
+                "leaves (4-card boards) are supported (a river net or a turn-end net); a "
+                "flop solve needs depth_streets >= 1 (depth_streets 0 would need a turn-start net)"
+            )
+        node_b4[n] = b4_index.setdefault(board, len(b4_index))
+    # evaluation order: grouped by turn board, so a run of leaves shares its river cards
+    nodes.sort(key=lambda n: (node_b4[n], n))
+    ids = torch.tensor(nodes, dtype=torch.long, device=dev)
+    oop = [1 - int(tree.states[n].button) for n in nodes]
+    contrib = tree.contrib[ids]
+    if nodes and bool((contrib[:, 0] != contrib[:, 1]).any()):
+        raise ValueError("value-net leaves need equal contributions (a river root)")
+    if len(set(oop)) > 1:
+        raise ValueError("value-net leaves of one tree must share the button")
+    return {
+        "nodes": nodes,
+        "ids": ids,
+        "boards4": list(b4_index),
+        "leaf_b4": [node_b4[n] for n in nodes],
+        "c": contrib[:, 0].clone(),
+        "stack": torch.tensor(
+            [min(int(s) for s in tree.states[n].stacks) for n in nodes],
+            dtype=torch.long,
+            device=dev,
+        ),
+        "oop": oop,
+        "oop_seat": oop[0] if oop else 1,
+    }
+
+
+# -- the chance average over river cards --------------------------------------------
+
+
+class RiverAverage:
+    """Turn-end values as the exact chance average of a river predictor.
+
+    Leaves ``l`` are given by ``leaf_b4[l]`` (index into the distinct turn
+    boards ``boards4``; leaves on one board should be consecutive, so a run of
+    them shares its river masks), the committed chips ``c [L]`` and the chips
+    behind ``stack [L]``. ``oop_seat`` says which row of the reaches is the OOP
+    player (0 or 1). :meth:`values` gives one player's values (solver
+    convention, chips), :meth:`values_both` both from one net pass.
+
+    ``every > 1`` re-runs the net only on every ``every``-th ``cached=True``
+    call of :meth:`values` per player and otherwise reuses the cached ``ev``
     (stored as ``cache_dtype``) with the current opponent masses; other calls
-    always run the net. ``every = 1`` is exact. ``chunk`` is the number of net
-    rows per ``predict`` call (rounded down to whole leaves).
+    always run the net. ``chunk`` is the number of net rows per ``predict``
+    call (rounded down to whole leaves).
 
     The predictor must return finite values, also for rows where a player's
     range is empty (unreached leaves), and 0 on combos that conflict with the
@@ -104,45 +176,27 @@ class ValueLeafEvaluator:
 
     def __init__(
         self,
-        tree: SubgameTree,
         predictor: RiverPredictor,
+        boards4: Sequence[Sequence[int]],
+        leaf_b4: Sequence[int],
+        c: torch.Tensor,
+        stack: torch.Tensor,
+        oop_seat: int,
+        device: torch.device | str,
         every: int = 1,
         chunk: int = 16384,
         cache_dtype: torch.dtype = torch.float16,
     ) -> None:
-        dev = tree.device
-        self.device = dev
+        dev = self.device = torch.device(device)
         self.predictor = predictor
         self.every = max(1, int(every))
         self.leaves_per_chunk = max(1, int(chunk) // RIVERS)
         self.cache_dtype = cache_dtype
-        nodes = (tree.kind == VALUE).nonzero().flatten().tolist()
-        L = len(nodes)
+        leaf_b4 = [int(u) for u in leaf_b4]
+        L = len(leaf_b4)
         self.num_leaves = L
-        b4_index: dict[tuple[int, ...], int] = {}
-        node_b4: dict[int, int] = {}
-        for n in nodes:
-            board = tuple(int(x) for x in tree.boards[int(tree.board_id[n])])
-            if len(board) != TURN_LEN:
-                raise ValueError(
-                    f"value-net leaf {n} is on a {len(board)}-card board, but only a river "
-                    "value net (turn-end leaves, 4-card boards) is supported; a flop solve "
-                    "needs depth_streets >= 1 (depth_streets 0 would need a turn net)"
-                )
-            node_b4[n] = b4_index.setdefault(board, len(b4_index))
-        # evaluation order: grouped by turn board, so a run of leaves shares its river cards
-        nodes.sort(key=lambda n: (node_b4[n], n))
-        self.ids = torch.tensor(nodes, dtype=torch.long, device=dev)
-        leaf_b4 = [node_b4[n] for n in nodes]
-        stacks = [min(int(s) for s in tree.states[n].stacks) for n in nodes]
-        oop = [1 - int(tree.states[n].button) for n in nodes]
-        contrib = tree.contrib[self.ids]
-        if L and bool((contrib[:, 0] != contrib[:, 1]).any()):
-            raise ValueError("value-net leaves need equal contributions (a river root)")
-        if len(set(oop)) > 1:
-            raise ValueError("value-net leaves of one tree must share the button")
-        self.oop_seat = oop[0] if oop else 1
-        boards4 = list(b4_index)
+        self.oop_seat = int(oop_seat)
+        boards4 = [tuple(int(x) for x in b) for b in boards4]
         rivers = [[x for x in range(NUM_CARDS) if x not in b] for b in boards4]
         self.boards4 = boards4
         # 5-card board id = (turn board id) * 48 + (river slot)
@@ -173,9 +227,8 @@ class ValueLeafEvaluator:
         self.row_leaf = torch.arange(L, device=dev).repeat_interleave(RIVERS)
         self.row_card = self.cards.flatten()
         self.row_board = (lb[:, None] * RIVERS + slots[None, :]).flatten()
-        self.c = contrib[:, 0].clone()  # [L] long
-        self.stack = torch.tensor(stacks, dtype=torch.long, device=dev)
-        self.oop = torch.tensor(oop, dtype=torch.long, device=dev)
+        self.c = torch.as_tensor(c, device=dev).long().reshape(L)
+        self.stack = torch.as_tensor(stack, device=dev).long().reshape(L)
         self.valid = (
             valid_masks(boards4, dev)[lb] if L else torch.zeros(0, C, dtype=torch.bool, device=dev)
         )
@@ -226,11 +279,11 @@ class ValueLeafEvaluator:
         Qx = self._pair_table(opp, S, cards)
         return m[:, None, :] + Qx[:, :, self.c1] + Qx[:, :, self.c2]
 
-    def net_ev(self, player: int, ordered: torch.Tensor, chunk: int) -> torch.Tensor:
-        """``ev^x_player`` (pot units) of the leaves of chunk ``chunk`` from the
-        net, as a ``[Lc, 48, C]`` view, zero on combos holding ``x``.
-        ``ordered`` is ``[L, 2, C]``: both reaches in ``(OOP, IP)`` order,
-        masked by the leaf boards."""
+    def _net_ev_both(self, ordered: torch.Tensor, chunk: int) -> torch.Tensor:
+        """``ev^x`` (pot units) of both players for the leaves of chunk
+        ``chunk`` from the net, as ``[Lc, 48, 2, C]`` in ``(OOP, IP)`` order,
+        zero on combos holding ``x``. ``ordered`` is ``[L, 2, C]``: both reaches
+        in ``(OOP, IP)`` order, masked by the leaf boards."""
         runs = self._runs[chunk]
         l0, l1 = runs[0][0], runs[-1][1]
         Lc = l1 - l0
@@ -271,14 +324,18 @@ class ValueLeafEvaluator:
                 warnings.warn(
                     "the value-net predictor returns nonzero values on combos that conflict "
                     "with the board; zeroing them",
-                    stacklevel=2,
+                    stacklevel=3,
                 )
-        ev_p = ev[:, :, 0 if player == self.oop_seat else 1]
         if self._zero_output:
             if hit is None:
                 hit = self.card_combos[self.cards[l0:l1]]
-            ev_p.scatter_(2, hit, 0.0)
-        return ev_p
+            ev.scatter_(3, hit[:, :, None, :].expand(-1, -1, 2, -1), 0.0)
+        return ev
+
+    def net_ev(self, player: int, ordered: torch.Tensor, chunk: int) -> torch.Tensor:
+        """``ev^x_player`` of the leaves of chunk ``chunk``, a ``[Lc, 48, C]`` view
+        of :meth:`_net_ev_both`."""
+        return self._net_ev_both(ordered, chunk)[:, :, 0 if player == self.oop_seat else 1]
 
     def _predictor_board_ids(self) -> torch.Tensor | None:
         """Ids of the 5-card boards in a predictor with a board cache
@@ -315,11 +372,28 @@ class ValueLeafEvaluator:
         w += T.gather(1, self.c12[None].expand(Lc, -1, -1)).sum(1)
         return w
 
+    def _prepare(self, reach: torch.Tensor) -> torch.Tensor:
+        L = self.num_leaves
+        if reach.shape != (2, L, C):
+            raise ValueError(f"reach must be [2, {L}, {C}], got {tuple(reach.shape)}")
+        return reach * self.valid
+
+    def _opp_sums(self, rv: torch.Tensor, player: int) -> tuple[torch.Tensor, ...]:
+        """Opponent reach, its per-card sums ``S [L, 52]`` and ``blocked_sum``."""
+        opp = rv[1 - player]
+        S = opp @ incidence(opp.device, rv.dtype)  # [L, 52]: mass holding each card
+        m = opp.sum(1, keepdim=True) - S[:, self.c1] - S[:, self.c2] + opp  # blocked_sum
+        return opp, S, m
+
+    def _ordered(self, rv: torch.Tensor) -> torch.Tensor:
+        o = self.oop_seat
+        return torch.stack([rv[o], rv[1 - o]], 1)  # [L, 2, C], (OOP, IP)
+
     # -- provider -------------------------------------------------------------
 
     @torch.no_grad()
     def values(self, player: int, reach: torch.Tensor, cached: bool = False) -> torch.Tensor:
-        """``player``'s values ``[L, C]`` (chips) at the ``VALUE`` nodes, from both
+        """``player``'s values ``[L, C]`` (chips) at the leaves, from both
         players' reaches ``[2, L, C]``. ``cached=True`` (the solver's regret
         updates) lets ``every > 1`` reuse the ``ev`` of an earlier call. Other
         calls (values, best responses, exploitability) run the net and leave the
@@ -328,10 +402,8 @@ class ValueLeafEvaluator:
         out = reach.new_zeros(L, C)
         if L == 0:
             return out
-        if reach.shape != (2, L, C):
-            raise ValueError(f"reach must be [2, {L}, {C}], got {tuple(reach.shape)}")
+        rv = self._prepare(reach)
         dt = reach.dtype
-        rv = reach * self.valid
         refresh, cache = True, None
         if cached and self.every > 1:
             k = self._calls[player]
@@ -342,13 +414,8 @@ class ValueLeafEvaluator:
                 self._cache[player] = cache
             else:
                 refresh = k % self.every == 0
-        opp = rv[1 - player]
-        S = opp @ incidence(opp.device, dt)  # [L, 52]: mass holding each card
-        m = opp.sum(1, keepdim=True) - S[:, self.c1] - S[:, self.c2] + opp  # blocked_sum
-        ordered = None
-        if refresh:
-            o = self.oop_seat
-            ordered = torch.stack([rv[o], rv[1 - o]], 1)  # [L, 2, C], (OOP, IP)
+        opp, S, m = self._opp_sums(rv, player)
+        ordered = self._ordered(rv) if refresh else None
         scale = self.c.to(dt) * (2.0 / RIVERS_PER_PAIR)  # pot / 44
         for k, runs in enumerate(self._runs):
             l0, l1 = runs[0][0], runs[-1][1]
@@ -362,6 +429,232 @@ class ValueLeafEvaluator:
             w = torch.nan_to_num_(w, nan=0.0, posinf=0.0, neginf=0.0)
             out[l0:l1] = w * scale[l0:l1, None] * self.valid[l0:l1]
         return out
+
+    @torch.no_grad()
+    def values_both(self, reach: torch.Tensor) -> torch.Tensor:
+        """Both players' values ``[2, L, C]`` (chips, rows in the order of
+        ``reach``) from one net pass per chunk (no caching)."""
+        L = self.num_leaves
+        out = reach.new_zeros(2, L, C)
+        if L == 0:
+            return out
+        rv = self._prepare(reach)
+        sums = [self._opp_sums(rv, p) for p in (0, 1)]
+        ordered = self._ordered(rv)
+        scale = self.c.to(reach.dtype) * (2.0 / RIVERS_PER_PAIR)
+        for k, runs in enumerate(self._runs):
+            l0, l1 = runs[0][0], runs[-1][1]
+            ev = self._net_ev_both(ordered, k)
+            for p in (0, 1):
+                opp, S, m = sums[p]
+                ev_p = ev[:, :, 0 if p == self.oop_seat else 1]
+                w = self._combine(ev_p, opp[l0:l1], S[l0:l1], m[l0:l1], self.cards[l0:l1])
+                w = torch.nan_to_num_(w, nan=0.0, posinf=0.0, neginf=0.0)
+                out[p, l0:l1] = w * scale[l0:l1, None] * self.valid[l0:l1]
+        return out
+
+
+class ValueLeafEvaluator(RiverAverage):
+    """Values of every ``VALUE`` node of ``tree`` from a river value net.
+
+    ``values(player, reach)`` takes both players' reaches at the ``VALUE``
+    nodes, ``[2, L, 1326]`` in the order of ``ids`` (the ``VALUE`` node ids
+    sorted by turn board, then node id; :class:`~pokerbot.search.solver.TerminalEvaluator`
+    uses a provider's ``ids`` when it has them), and returns ``player``'s
+    counterfactual values ``[L, 1326]`` in chips (solver convention). See
+    :class:`RiverAverage` for ``every``, ``chunk`` and the predictor contract.
+    """
+
+    def __init__(
+        self,
+        tree: SubgameTree,
+        predictor: RiverPredictor,
+        every: int = 1,
+        chunk: int = 16384,
+        cache_dtype: torch.dtype = torch.float16,
+    ) -> None:
+        lay = turn_end_leaves(tree)
+        self.ids = lay["ids"]
+        super().__init__(
+            predictor,
+            lay["boards4"],
+            lay["leaf_b4"],
+            lay["c"],
+            lay["stack"],
+            lay["oop_seat"],
+            tree.device,
+            every,
+            chunk,
+            cache_dtype,
+        )
+        self.oop = torch.tensor(lay["oop"], dtype=torch.long, device=self.device)
+
+
+@torch.no_grad()
+def river_average(
+    predictor: RiverPredictor,
+    boards4: torch.Tensor,
+    c: torch.Tensor,
+    stack: torch.Tensor,
+    reach: torch.Tensor,
+    oop_first: bool = True,
+    chunk: int = 16384,
+) -> torch.Tensor:
+    """Turn-end values of both players by the exact chance average of a river
+    predictor over the 48 river cards: the same math as
+    :meth:`ValueLeafEvaluator.values`, without a tree.
+
+    ``boards4 [L, 4]``, ``c [L]`` (chips each player committed), ``stack [L]``
+    (chips behind), ``reach [2, L, 1326]`` (any non-negative scale; zeroed on
+    the board's combos) in ``(OOP, IP)`` order when ``oop_first``, else
+    ``(IP, OOP)``. Returns ``[2, L, 1326]`` counterfactual values in chips, rows
+    in the order of ``reach``. ``chunk`` net rows per ``predict`` call (whole
+    leaves; leaves are grouped by board first)."""
+    dev = reach.device
+    b = torch.as_tensor(boards4, device=dev).long().reshape(-1, TURN_LEN)
+    L = b.shape[0]
+    out = reach.new_zeros(2, L, C)
+    if L == 0:
+        return out
+    c = torch.as_tensor(c, device=dev).long().reshape(L)
+    stack = torch.as_tensor(stack, device=dev).long().reshape(L)
+    _, inv = torch.unique(b.sort(1).values, dim=0, return_inverse=True)
+    order = torch.argsort(inv, stable=True)  # leaves grouped by board
+    per = max(1, int(chunk) // RIVERS)
+    for s in range(0, L, per):
+        idx = order[s : s + per]
+        u, local = torch.unique(inv[idx], return_inverse=True)  # sorted: runs stay together
+        first = torch.full((u.numel(),), idx.numel(), dtype=torch.long, device=dev)
+        first.scatter_reduce_(0, local, torch.arange(idx.numel(), device=dev), "amin")
+        core = RiverAverage(
+            predictor,
+            b[idx[first]].tolist(),
+            local.tolist(),
+            c[idx],
+            stack[idx],
+            0 if oop_first else 1,
+            dev,
+            chunk=per * RIVERS,
+        )
+        out[:, idx] = core.values_both(reach[:, idx])
+    return out
+
+
+class TurnEndLeafEvaluator:
+    """Values of every ``VALUE`` node of ``tree`` from a **turn-end** value net:
+    one ``predict`` row per leaf (boards ``[L, 4]``), instead of 48.
+
+    The net predicts ``ev_TE_p(c) = v_p(c) / (m_-p(c) * pot)`` (pot units per
+    unit of disjoint opponent mass on the 4-card board), so
+    ``v_p = ev_TE_p * blocked_sum(pi_-p) * pot``. Same interface, ``ids`` and
+    ``every`` caching (``ev`` cached per player, re-weighted by the current
+    opponent mass) as :class:`ValueLeafEvaluator`.
+    """
+
+    def __init__(
+        self,
+        tree: SubgameTree,
+        predictor: Any,
+        every: int = 1,
+        cache_dtype: torch.dtype = torch.float16,
+    ) -> None:
+        lay = turn_end_leaves(tree)
+        dev = self.device = tree.device
+        self.predictor = predictor
+        self.every = max(1, int(every))
+        self.cache_dtype = cache_dtype
+        self.ids = lay["ids"]
+        L = self.num_leaves = len(lay["nodes"])
+        self.oop_seat = lay["oop_seat"]
+        lb = torch.tensor(lay["leaf_b4"], dtype=torch.long, device=dev)
+        boards4 = torch.tensor(lay["boards4"], dtype=torch.long, device=dev).view(-1, TURN_LEN)
+        self.boards = boards4[lb]  # [L, 4]
+        self.c = lay["c"]
+        self.stack = lay["stack"]
+        self.pot = 2.0 * self.c.double()
+        self.valid = (
+            valid_masks(lay["boards4"], dev)[lb]
+            if L
+            else torch.zeros(0, C, dtype=torch.bool, device=dev)
+        )
+        self._calls = [0, 0]
+        self._cache: list[torch.Tensor | None] = [None, None]
+        self._board_ids: torch.Tensor | None = None
+        self._board_gen: Any = None
+        self.net_calls = 0
+        self.net_rows = 0
+
+    @property
+    def num_rows(self) -> int:
+        return self.num_leaves
+
+    def reset_cache(self) -> None:
+        self._calls = [0, 0]
+        self._cache = [None, None]
+
+    def _predictor_board_ids(self) -> torch.Tensor | None:
+        pred = self.predictor
+        if not hasattr(pred, "predict_ids"):
+            return None
+        cache = getattr(pred, "cache", None)
+        gen = getattr(cache, "generation", None)
+        if self._board_ids is None or gen != self._board_gen:
+            self._board_ids = pred.board_ids(self.boards)
+            self._board_gen = getattr(cache, "generation", None)
+        return self._board_ids
+
+    def net_ev(self, rv: torch.Tensor) -> torch.Tensor:
+        """``ev_TE [L, 2, C]`` (pot units, ``(OOP, IP)``) for the masked reaches ``rv``."""
+        o = self.oop_seat
+        ordered = torch.stack([rv[o], rv[1 - o]], 1)  # [L, 2, C]
+        with torch.no_grad():
+            ids = self._predictor_board_ids()
+            if ids is None:
+                ev = self.predictor.predict(self.boards, ordered, self.c, self.stack)
+            else:
+                ev = self.predictor.predict_ids(ids, ordered, self.c, self.stack)
+        self.net_calls += 1
+        self.net_rows += self.num_leaves
+        return ev.to(rv.dtype)
+
+    @torch.no_grad()
+    def values(self, player: int, reach: torch.Tensor, cached: bool = False) -> torch.Tensor:
+        L = self.num_leaves
+        if L == 0:
+            return reach.new_zeros(0, C)
+        if reach.shape != (2, L, C):
+            raise ValueError(f"reach must be [2, {L}, {C}], got {tuple(reach.shape)}")
+        dt = reach.dtype
+        rv = reach * self.valid
+        refresh, cache = True, None
+        if cached and self.every > 1:
+            k = self._calls[player]
+            self._calls[player] += 1
+            cache = self._cache[player]
+            refresh = cache is None or k % self.every == 0
+        if refresh:
+            ev = self.net_ev(rv)[:, 0 if player == self.oop_seat else 1]
+            if cached and self.every > 1:
+                self._cache[player] = ev.to(self.cache_dtype)
+        else:
+            ev = cache.to(dt)
+        m = blocked_sum(rv[1 - player])
+        w = ev * m * self.pot.to(dt)[:, None]
+        w = torch.nan_to_num_(w, nan=0.0, posinf=0.0, neginf=0.0)
+        return w * self.valid
+
+
+def make_leaf_evaluator(
+    tree: SubgameTree, predictor: Any, every: int = 1, **kwargs: Any
+) -> RiverAverage | TurnEndLeafEvaluator:
+    """The leaf-value provider for ``predictor``: :class:`TurnEndLeafEvaluator`
+    for a turn-end net (``kind == "turn_end"``), else :class:`ValueLeafEvaluator`."""
+    kind = predictor_kind(predictor)
+    if kind == "turn_end":
+        return TurnEndLeafEvaluator(tree, predictor, every=every, **kwargs)
+    if kind == "river":
+        return ValueLeafEvaluator(tree, predictor, every=every, **kwargs)
+    raise ValueError(f"unknown value-net kind {kind!r} (expected river or turn_end)")
 
 
 class FixedLeafValues:
@@ -379,11 +672,14 @@ class ShowdownOracle:
     """Exact ``predict`` for a river that is checked down (both players check,
     showdown): ``ev_p = 0.5 * showdown(r_-p) / m_-p`` in pot units (0 where
     ``m_-p = 0`` and on combos that conflict with the board). Works in the
-    dtype of ``ranges``; showdown tables are cached per board."""
+    dtype of ``ranges``; showdown tables are cached per board (cleared first
+    when adding boards would exceed ``max_boards``, if set)."""
 
+    kind = "river"
     _FIELDS = ("valid", "order", "lo", "hi", "card_list", "cflo", "cfhi")
 
-    def __init__(self) -> None:
+    def __init__(self, max_boards: int | None = None) -> None:
+        self.max_boards = max_boards
         self._index: dict[tuple[int, ...], int] = {}
         self._tables: ShowdownTables | None = None
         self._device: torch.device | None = None
@@ -395,6 +691,9 @@ class ShowdownOracle:
         uniq, inv = torch.unique(boards.long().sort(1).values, dim=0, return_inverse=True)
         keys = [tuple(b) for b in uniq.tolist()]
         new = [k for k in keys if k not in self._index]
+        if new and self.max_boards is not None and len(self._index) + len(new) > self.max_boards:
+            self._index, self._tables = {}, None
+            new = keys
         if new:
             t = ShowdownTables(new, dev)
             if self._tables is None:
@@ -432,7 +731,13 @@ class ShowdownOracle:
 __all__ = [
     "FixedLeafValues",
     "LeafValueProvider",
+    "RiverAverage",
     "RiverPredictor",
     "ShowdownOracle",
+    "TurnEndLeafEvaluator",
     "ValueLeafEvaluator",
+    "make_leaf_evaluator",
+    "predictor_kind",
+    "river_average",
+    "turn_end_leaves",
 ]

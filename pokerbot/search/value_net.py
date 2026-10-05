@@ -91,17 +91,24 @@ def board_strengths(boards: torch.Tensor, chunk: int = 256) -> torch.Tensor:
     return out.masked_fill_(hit > 0, -1)
 
 
+def tie_rank2(s: torch.Tensor) -> torch.Tensor:
+    """``[n, m]`` integer keys (``-1`` = invalid, else ``>= 0``) -> ``[n, m]`` long
+    ``2 * (valid smaller) + ties - 1`` per row (ties count the entry itself),
+    ``-1`` where invalid."""
+    s = s.long()
+    valid = s >= 0
+    n_bad = (~valid).sum(1, keepdim=True)
+    ss = s.sort(1).values  # the -1 entries come first
+    lo = torch.searchsorted(ss, s, right=False) - n_bad  # valid entries strictly smaller
+    hi = torch.searchsorted(ss, s, right=True) - n_bad  # ... smaller or tied (incl. itself)
+    return torch.where(valid, lo + hi - 1, torch.full_like(s, -1))
+
+
 @torch.no_grad()
 def strength_rank2(boards: torch.Tensor) -> torch.Tensor:
     """``[n, 5]`` boards -> ``[n, 1326]`` long ``2 * (valid weaker) + ties - 1``
     (ties count the combo itself), ``-1`` for combos that hit the board."""
-    s = board_strengths(boards)
-    valid = s >= 0
-    n_bad = (~valid).sum(1, keepdim=True)
-    ss = s.sort(1).values  # the -1 entries come first
-    lo = torch.searchsorted(ss, s, right=False) - n_bad  # valid combos strictly weaker
-    hi = torch.searchsorted(ss, s, right=True) - n_bad  # ... weaker or tied (incl. itself)
-    return torch.where(valid, lo + hi - 1, torch.full_like(s, -1))
+    return tie_rank2(board_strengths(boards))
 
 
 def features_from_rank2(
@@ -526,7 +533,14 @@ class ValueNetPredictor:
     or simply ``pred.predict(boards, ranges, c, stack)``. Rows are processed in
     chunks of ``chunk``; the residual head (if the net has one) needs much more
     memory per row, so its chunk is capped at ``head_chunk``.
+
+    ``cache`` supplies the per-board features (``ids`` / ``features``); the
+    default is the river :class:`BoardFeatureCache`. ``kind`` tells the search
+    which leaf provider fits: ``"river"`` here, ``"turn_end"`` for
+    :class:`.turn_net.TurnEndPredictor` (this class with turn-end features).
     """
+
+    kind = "river"
 
     def __init__(
         self,
@@ -537,7 +551,8 @@ class ValueNetPredictor:
     ):
         self.device = torch.device(device) if device is not None else next(net.parameters()).device
         self.net = net.to(self.device).eval()
-        self.cache = cache or BoardFeatureCache(self.device)
+        # not ``cache or ...``: an empty cache has length 0
+        self.cache = cache if cache is not None else BoardFeatureCache(self.device)
         self.buckets = net.cfg.buckets
         self.head_chunk = head_chunk
 

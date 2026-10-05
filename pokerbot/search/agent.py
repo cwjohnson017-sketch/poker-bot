@@ -14,9 +14,10 @@ At every postflop decision:
 3. **Solve** with DCFR within the street's time budget (tree building and
    rollouts count against it; at least ``min_iterations`` are run), with the
    safe-resolving gadget when ``gadget.safe``. Depth-limit leaves are valued
-   by blueprint rollouts (``leaf.mode: rollouts``) or by a river value net on
-   both players' current reaches (``leaf.mode: value_net``, see
-   :mod:`pokerbot.search.value_leaf`).
+   by blueprint rollouts (``leaf.mode: rollouts``) or by a value net on both
+   players' current reaches (``leaf.mode: value_net``, see
+   :mod:`pokerbot.search.value_leaf`): a river net averaged over the river
+   cards, or a turn-end net (one row per leaf), picked by the checkpoint's kind.
 4. **Act.** Read the average strategy of our actual combo at the current node,
    sample a child, and play its concrete action (sizes computed exactly as
    :mod:`pokerbot.env.actions` does). Cache the played strategy (for locking)
@@ -49,7 +50,7 @@ from .gadget import (
 from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
 from .tree import LEAF, VALUE, TreeBuilder
-from .value_leaf import ValueLeafEvaluator
+from .value_leaf import make_leaf_evaluator
 
 
 def _engine_config(engine: Any, config: Any) -> Any:
@@ -86,7 +87,7 @@ class SearchAgent(BaseAgent):
         if self.cfg.tree.leaf_mode != self.cfg.leaf.mode:  # leaf.mode decides
             self.cfg.tree = replace(self.cfg.tree, leaf_mode=self.cfg.leaf.mode)
         self.device = self.cfg.torch_device()
-        # leaf.mode value_net: the river value net (loaded lazily from leaf.net)
+        # leaf.mode value_net: a river or turn-end value net (loaded lazily from leaf.net)
         self.value_predictor = value_predictor
         if self.value_net and value_predictor is None and not self.cfg.leaf.net:
             raise ValueError(
@@ -117,16 +118,25 @@ class SearchAgent(BaseAgent):
         return self.cfg.leaf.mode == "value_net"
 
     def get_value_predictor(self) -> Any:
-        """The river value net (``leaf.mode: value_net``), loaded once from
-        ``leaf.net`` unless one was passed to the constructor."""
+        """The value net (``leaf.mode: value_net``), loaded once from ``leaf.net``
+        unless one was passed to the constructor: a river
+        :class:`~.value_net.ValueNetPredictor` or a turn-end
+        :class:`~.turn_net.TurnEndPredictor`, by the checkpoint's ``meta`` kind."""
         if self.value_predictor is None:
             path = self.cfg.leaf.net
             if not path:
                 raise ValueError("leaf.mode is value_net but leaf.net is not set")
-            from .value_net import ValueNetPredictor
+            from .turn_net import load_leaf_predictor
 
-            self.value_predictor = ValueNetPredictor.from_path(path, self.device)
+            self.value_predictor = load_leaf_predictor(path, self.device)
         return self.value_predictor
+
+    def value_leaf_provider(self, tree: Any) -> Any:
+        """The leaf-value provider of ``tree``'s ``VALUE`` nodes for the value net:
+        :class:`~.value_leaf.TurnEndLeafEvaluator` (one net row per leaf) for a
+        turn-end net, else :class:`~.value_leaf.ValueLeafEvaluator` (the river
+        net averaged over the 48 river cards)."""
+        return make_leaf_evaluator(tree, self.get_value_predictor(), every=self.cfg.leaf.net_every)
 
     def act(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
         if state.street == 0:
@@ -245,9 +255,7 @@ class SearchAgent(BaseAgent):
                 tree, self.blueprint, config, cfg.leaf, engine, self.device
             )
         if bool((tree.kind == VALUE).any()):
-            value_leaves = ValueLeafEvaluator(
-                tree, self.get_value_predictor(), every=cfg.leaf.net_every
-            )
+            value_leaves = self.value_leaf_provider(tree)
         t_leaf = time.perf_counter() - t_leaf
         locks = self._locks(tree, key, seat)
         solver = RangeSolver(
@@ -280,6 +288,8 @@ class SearchAgent(BaseAgent):
             "setup_seconds": t_setup - t_tree,
             "leaf_seconds": t_leaf,
             "value_leaves": 0 if value_leaves is None else value_leaves.num_leaves,
+            "value_provider": None if value_leaves is None else type(value_leaves).__name__,
+            "value_net_rows": 0 if value_leaves is None else value_leaves.net_rows,
             "solve_seconds": solver.solve_time,
             "total_seconds": t_end - t0,
             "cached_root": info["cached"],
