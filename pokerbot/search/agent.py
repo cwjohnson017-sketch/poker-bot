@@ -13,7 +13,10 @@ At every postflop decision:
    strategy we actually played (cached from that solve).
 3. **Solve** with DCFR within the street's time budget (tree building and
    rollouts count against it; at least ``min_iterations`` are run), with the
-   safe-resolving gadget when ``gadget.safe``.
+   safe-resolving gadget when ``gadget.safe``. Depth-limit leaves are valued
+   by blueprint rollouts (``leaf.mode: rollouts``) or by a river value net on
+   both players' current reaches (``leaf.mode: value_net``, see
+   :mod:`pokerbot.search.value_leaf`).
 4. **Act.** Read the average strategy of our actual combo at the current node,
    sample a child, and play its concrete action (sizes computed exactly as
    :mod:`pokerbot.env.actions` does). Cache the played strategy (for locking)
@@ -45,7 +48,8 @@ from .gadget import (
 )
 from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
-from .tree import LEAF, TreeBuilder
+from .tree import LEAF, VALUE, TreeBuilder
+from .value_leaf import ValueLeafEvaluator
 
 
 def _engine_config(engine: Any, config: Any) -> Any:
@@ -68,6 +72,7 @@ class SearchAgent(BaseAgent):
         blueprint: Any,
         config: SearchConfig | dict | str | Path | None = None,
         name: str | None = None,
+        value_predictor: Any = None,
         **overrides: Any,
     ) -> None:
         super().__init__(name)
@@ -78,7 +83,16 @@ class SearchAgent(BaseAgent):
             self.cfg = search_config(config, **overrides)
         if self.cfg.tree.spec is None:  # tree.actions: blueprint
             self.cfg.tree = replace(self.cfg.tree, spec=blueprint.spec)
+        if self.cfg.tree.leaf_mode != self.cfg.leaf.mode:  # leaf.mode decides
+            self.cfg.tree = replace(self.cfg.tree, leaf_mode=self.cfg.leaf.mode)
         self.device = self.cfg.torch_device()
+        # leaf.mode value_net: the river value net (loaded lazily from leaf.net)
+        self.value_predictor = value_predictor
+        if self.value_net and value_predictor is None and not self.cfg.leaf.net:
+            raise ValueError(
+                "leaf.mode is value_net but no value_predictor was given and leaf.net "
+                "(the value-net checkpoint path) is not set"
+            )
         self.cache = ContinualCache()
         self._roots: dict = {}
         self._played: dict = {}
@@ -98,9 +112,27 @@ class SearchAgent(BaseAgent):
         self._roots.clear()
         self._played.clear()
 
+    @property
+    def value_net(self) -> bool:
+        return self.cfg.leaf.mode == "value_net"
+
+    def get_value_predictor(self) -> Any:
+        """The river value net (``leaf.mode: value_net``), loaded once from
+        ``leaf.net`` unless one was passed to the constructor."""
+        if self.value_predictor is None:
+            path = self.cfg.leaf.net
+            if not path:
+                raise ValueError("leaf.mode is value_net but leaf.net is not set")
+            from .value_net import ValueNetPredictor
+
+            self.value_predictor = ValueNetPredictor.from_path(path, self.device)
+        return self.value_predictor
+
     def act(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
         if state.street == 0:
             return self._blueprint_action(state, seat, rng)
+        if self.value_net:
+            self.get_value_predictor()  # load errors are config errors: no fallback
         try:
             return self._search_action(state, seat, rng)
         except Exception:
@@ -205,13 +237,22 @@ class SearchAgent(BaseAgent):
             if cfg.remove_own_blockers:
                 prior = prior * valid_mask(state.hole_cards(seat), self.device)
             gadget = Gadget(1 - seat, prior, info["terminate"])
+        t_leaf = time.perf_counter()
         rollouts = None
+        value_leaves = None
         if bool((tree.kind == LEAF).any()):
             rollouts = build_leaf_rollouts(
                 tree, self.blueprint, config, cfg.leaf, engine, self.device
             )
+        if bool((tree.kind == VALUE).any()):
+            value_leaves = ValueLeafEvaluator(
+                tree, self.get_value_predictor(), every=cfg.leaf.net_every
+            )
+        t_leaf = time.perf_counter() - t_leaf
         locks = self._locks(tree, key, seat)
-        solver = RangeSolver(tree, info["ranges"], cfg.solver, rollouts, gadget, locks)
+        solver = RangeSolver(
+            tree, info["ranges"], cfg.solver, rollouts, gadget, locks, value_leaves=value_leaves
+        )
         t_setup = time.perf_counter()
         solver.solve(iterations=min(cfg.min_iterations, cfg.solver.iterations))
         left = cfg.budget(street) - (time.perf_counter() - t0)
@@ -237,6 +278,8 @@ class SearchAgent(BaseAgent):
             "iterations": solver.iterations_done,
             "tree_seconds": t_tree - t0,
             "setup_seconds": t_setup - t_tree,
+            "leaf_seconds": t_leaf,
+            "value_leaves": 0 if value_leaves is None else value_leaves.num_leaves,
             "solve_seconds": solver.solve_time,
             "total_seconds": t_end - t0,
             "cached_root": info["cached"],
