@@ -72,8 +72,12 @@ def save_shard(path: str | Path, data: dict[str, Any]) -> Path:
     missing = [k for k in SHARD_DTYPES if k not in data]
     if missing:
         raise KeyError(f"shard is missing {missing}")
+    # clone: torch.save writes a view's whole storage (a slice would save its parent)
     out = {
-        k: torch.as_tensor(data[k]).detach().to("cpu", dt).contiguous()
+        k: torch.as_tensor(data[k])
+        .detach()
+        .to("cpu", dt)
+        .clone(memory_format=torch.contiguous_format)
         for k, dt in SHARD_DTYPES.items()
     }
     n = out["boards"].shape[0]
@@ -217,7 +221,7 @@ class ValueData:
             keep &= data["exploit"].float() <= max_exploit
         self.dropped = int((~keep).sum())
         sel = keep.nonzero().squeeze(1)
-        self.cache = BoardFeatureCache(dev, max_boards=None)
+        self.cache = BoardFeatureCache(dev, max_boards=None, tables=False)
         self.board_id = self.cache.ids(data["boards"][sel])
         self.ranges = data["ranges"][sel].to(dev, torch.float16)
         self.targets = data["targets"][sel].to(dev, torch.float16)
@@ -281,7 +285,7 @@ def value_loss(pred: torch.Tensor, b: dict, kind: str = "huber", delta: float = 
 
 def _forward(net: RiverValueNet, b: dict, amp: bool) -> torch.Tensor:
     return net(
-        b["ranges"], b["bucket"], b["pct"], b["onehot"], b["c"], b["stack"], m=b["m"], amp=amp
+        b["ranges"], b["bucket"], b["onehot"], b["c"], b["stack"], pct=b["pct"], m=b["m"], amp=amp
     )
 
 
@@ -429,7 +433,7 @@ def _data_device(spec: str, device: torch.device, n: int) -> torch.device:
         return torch.device(spec)
     if device.type != "cuda":
         return device
-    need = n * (4 * 2 * C * 2 + 8)  # fp16 ranges + targets
+    need = n * (2 * (2 * C * 2) + 2 * C + 64)  # fp16 ranges + targets, int16 rank table
     free, _ = torch.cuda.mem_get_info(device)
     return device if need + (3 << 30) < free else torch.device("cpu")
 

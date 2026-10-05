@@ -102,14 +102,22 @@ def test_board_feature_cache():
     boards = _random_boards(5, 1)
     rows = boards[torch.tensor([0, 1, 2, 3, 4, 2, 0])]
     rows = rows[:, torch.randperm(5)]  # card order does not matter
-    cache = BoardFeatureCache("cpu")
-    ids = cache.ids(rows)
-    assert len(cache) == 5 and ids[0] == ids[6] and ids[2] == ids[5]
-    f = cache.features(ids, 32)
     ref = river_board_features(rows, 32)
-    for k in ("valid", "pct", "bucket", "onehot"):
-        assert torch.equal(f[k], ref[k]), k
-    assert torch.equal(cache.ids(boards), cache.ids(boards)) and len(cache) == 5
+    for tables in (True, False):
+        cache = BoardFeatureCache("cpu", tables=tables)
+        ids = cache.ids(rows)
+        assert len(cache) == 5 and ids[0] == ids[6] and ids[2] == ids[5]
+        for K in (32, 7):  # two bucket tables side by side
+            f = cache.features(ids, K)
+            ref = river_board_features(rows, K)
+            assert f["bucket"].dtype == torch.int32
+            for k in ("valid", "pct", "bucket", "onehot"):
+                assert torch.equal(f[k].to(ref[k].dtype), ref[k]), k
+        more = _random_boards(1500, 9)  # grows the tables past their capacity
+        ids2 = cache.ids(more)
+        assert len(cache) == 1505 and torch.equal(cache.ids(rows), ids)
+        f = cache.features(ids2, 32)
+        assert torch.equal(f["bucket"].long(), river_board_features(more, 32)["bucket"])
     small = BoardFeatureCache("cpu", max_boards=3)
     small.ids(boards[:3])
     gen = small.generation
@@ -128,6 +136,17 @@ def _random_ranges(boards: torch.Tensor, seed: int) -> torch.Tensor:
     return r
 
 
+def test_opponent_mass_is_blocked_sum():
+    boards = _random_boards(4, 10)
+    valid = river_board_features(boards, 8)["valid"]
+    r = normalise_ranges(_random_ranges(boards, 11), valid)
+    m = opponent_mass(r, valid)
+    for p in (0, 1):
+        ref = blocked_sum(r[:, 1 - p].double()) * valid
+        assert torch.allclose(m[:, p].double(), ref, atol=1e-6)
+    assert torch.allclose(r.sum(-1), torch.ones(4, 2), atol=1e-6)
+
+
 def test_zero_sum_layer():
     boards = _random_boards(16, 2)
     f = river_board_features(boards, 64)
@@ -143,7 +162,7 @@ def test_zero_sum_layer():
     for head in (False, True):
         net = _noisy_net(ValueNetConfig(buckets=64, width=64, layers=2, residual_head=head))
         with torch.no_grad():
-            ev = net(r, f["bucket"], f["pct"], f["onehot"], c, stack)
+            ev = net(r, f["bucket"], f["onehot"], c, stack, pct=f["pct"])
         assert ev.abs().mean() > 0.01
         gv = (w * ev).sum((1, 2))
         assert gv.abs().max() < 1e-5 * ev.abs().max(), gv
@@ -232,6 +251,8 @@ def test_shards_and_cli(tmp_path):
     root = tmp_path / "data"
     save_shard(root / "shard_000.pt", {k: v[:100] for k, v in data.items()})
     save_shard(root / "shard_001.pt", {k: v[100:] for k, v in data.items()})
+    # a slice of a larger tensor is stored on its own: ~10.7 kB per sample
+    assert (root / "shard_001.pt").stat().st_size < 60 * 12_000
     (root / "meta.json").write_text(json.dumps({"kind": "checkdown"}))
     held = checkdown_samples(40, seed=13)
     save_shard(tmp_path / "held" / "shard_000.pt", held)

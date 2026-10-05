@@ -29,7 +29,15 @@ units.
 * **Zero-sum layer** (DeepStack). With ``w_p = r_p * m_{-p}`` and the pair mass
   ``Z = sum w_0 = sum w_1``, ``delta = (sum w_0 ev_0 + sum w_1 ev_1) / (2 Z)``
   is subtracted from every ``ev``, so the range-weighted game values of the two
-  players sum to zero.
+  players sum to zero. Without the residual head the shift is applied to the
+  bucket values (``sum_c w ev = sum_k W_k vals_k``), so decoding is the last
+  pass.
+
+Measured on synthetic check-down data (``value_train.checkdown_samples``) the
+pre-LN residual trunk beats the plain MLP (held-out MAE 0.0059 vs 0.0072 pot at
+40k samples, 3k steps); the residual head gains ~12% there but costs ~4x train
+time and ~7x inference time, so both ``block="resnet"`` and
+``residual_head=False`` are the defaults.
 
 :class:`ValueNetPredictor` is the inference entry point for the solver.
 """
@@ -96,9 +104,11 @@ def strength_rank2(boards: torch.Tensor) -> torch.Tensor:
     return torch.where(valid, lo + hi - 1, torch.full_like(s, -1))
 
 
-def features_from_rank2(rank2: torch.Tensor, buckets: int) -> dict[str, torch.Tensor]:
-    """``rank2 [n, 1326]`` -> ``valid`` bool, ``pct`` float, ``bucket`` long
-    (``buckets`` for invalid combos)."""
+def features_from_rank2(
+    rank2: torch.Tensor, buckets: int, index_dtype: torch.dtype = torch.long
+) -> dict[str, torch.Tensor]:
+    """``rank2 [n, 1326]`` -> ``valid`` bool, ``pct`` float, ``bucket``
+    (``index_dtype``; ``buckets`` for invalid combos)."""
     r = rank2.long()
     valid = r >= 0
     den = (2 * (valid.sum(1, keepdim=True) - 1)).clamp(min=1)
@@ -106,7 +116,7 @@ def features_from_rank2(rank2: torch.Tensor, buckets: int) -> dict[str, torch.Te
     pct = rc.float() / den
     bucket = torch.clamp((buckets * rc) // den, max=buckets - 1)
     bucket = torch.where(valid, bucket, torch.full_like(bucket, buckets))
-    return {"valid": valid, "pct": pct, "bucket": bucket}
+    return {"valid": valid, "pct": pct, "bucket": bucket.to(index_dtype)}
 
 
 def river_board_features(boards: torch.Tensor, buckets: int = 256) -> dict[str, torch.Tensor]:
@@ -122,18 +132,27 @@ def river_board_features(boards: torch.Tensor, buckets: int = 256) -> dict[str, 
 
 
 class BoardFeatureCache:
-    """``rank2`` tables of river boards on ``device``, keyed by the sorted board.
+    """Strength tables of river boards on ``device``, keyed by the sorted board.
 
     :meth:`ids` maps ``[n, 5]`` boards to row ids into the cache (computing new
     boards in one batch); :meth:`features` gathers per-row features by id. The
-    cache is ``K``-independent. When adding boards would exceed ``max_boards``
-    the cache is cleared first (``generation`` is incremented), so ids from an
-    earlier call stay valid until a later :meth:`ids` call triggers a reset.
+    base table is ``rank2`` (int16, ``K``-independent). With ``tables`` (the
+    inference default) an int32 bucket table per ``K`` is kept too, so a query
+    is one gather; without (training on many boards) buckets are derived from
+    ``rank2`` per query. When adding boards would exceed ``max_boards`` the cache
+    is cleared first (``generation`` is incremented): ids from an earlier call
+    stay valid until a later :meth:`ids` call triggers a reset.
     """
 
-    def __init__(self, device: torch.device | str = "cpu", max_boards: int | None = 1 << 17):
+    def __init__(
+        self,
+        device: torch.device | str = "cpu",
+        max_boards: int | None = 1 << 15,
+        tables: bool = True,
+    ):
         self.device = torch.device(device)
         self.max_boards = max_boards
+        self.tables = tables
         self.generation = 0
         self.clear()
 
@@ -141,6 +160,8 @@ class BoardFeatureCache:
         self._index: dict[int, int] = {}  # board key -> row
         self._rank2 = torch.empty(0, C, dtype=torch.int16, device=self.device)
         self._boards = torch.empty(0, 5, dtype=torch.long, device=self.device)
+        self._den = torch.empty(0, dtype=torch.float32, device=self.device)
+        self._buckets: dict[int, list] = {}  # K -> [int32 [cap, C] table, rows filled]
         self.generation += 1
 
     def __len__(self) -> int:
@@ -159,11 +180,15 @@ class BoardFeatureCache:
         if n <= cap:
             return
         new = max(n, 2 * cap, 1024)
-        r = torch.empty(new, C, dtype=torch.int16, device=self.device)
-        b = torch.empty(new, 5, dtype=torch.long, device=self.device)
-        r[:cap] = self._rank2
-        b[:cap] = self._boards
-        self._rank2, self._boards = r, b
+
+        def grow(t: torch.Tensor) -> torch.Tensor:
+            g = torch.empty(new, *t.shape[1:], dtype=t.dtype, device=self.device)
+            g[:cap] = t
+            return g
+
+        self._rank2, self._boards, self._den = map(grow, (self._rank2, self._boards, self._den))
+        for t in self._buckets.values():
+            t[0] = grow(t[0])
 
     def _add(self, boards: torch.Tensor, keys: list[int]) -> None:
         start, k = len(self), len(keys)
@@ -172,6 +197,8 @@ class BoardFeatureCache:
         for s in range(0, k, step):
             e = min(k, s + step)
             self._rank2[start + s : start + e] = strength_rank2(boards[s:e])
+        nvalid = (self._rank2[start : start + k] >= 0).sum(1)
+        self._den[start : start + k] = (2 * (nvalid - 1)).clamp(min=1).float()
         self._boards[start : start + k] = boards
         for i, key in enumerate(keys):
             self._index[key] = start + i
@@ -196,10 +223,32 @@ class BoardFeatureCache:
         uid = torch.tensor([self._index[k] for k in keys], dtype=torch.long)
         return uid.to(self.device)[inv]
 
-    def features(self, ids: torch.Tensor, buckets: int) -> dict[str, torch.Tensor]:
-        """Per-row ``valid``, ``pct``, ``bucket`` [n, 1326] and ``onehot`` [n, 52]."""
+    def _bucket_table(self, K: int) -> torch.Tensor:
+        t = self._buckets.get(K)
+        if t is None:
+            t = self._buckets[K] = [
+                torch.empty(self._rank2.shape[0], C, dtype=torch.int32, device=self.device),
+                0,
+            ]
+        n = len(self)
+        if t[1] < n:
+            t[0][t[1] : n] = features_from_rank2(self._rank2[t[1] : n], K, torch.int32)["bucket"]
+            t[1] = n
+        return t[0]
+
+    def features(
+        self, ids: torch.Tensor, buckets: int, pct: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Per-row ``valid`` bool, ``bucket`` int32 (``buckets`` = invalid) and,
+        when ``pct``, ``pct`` float [n, 1326], plus the ``onehot`` [n, 52] board."""
         ids = ids.to(self.device)
-        out = features_from_rank2(self._rank2[ids], buckets)
+        if self.tables:
+            bucket = self._bucket_table(buckets)[ids]
+            out = {"bucket": bucket, "valid": bucket < buckets}
+            if pct:
+                out["pct"] = self._rank2[ids].clamp(min=0).float() / self._den[ids, None]
+        else:
+            out = features_from_rank2(self._rank2[ids], buckets, torch.int32)
         out["onehot"] = board_onehot(self._boards[ids])
         return out
 
@@ -213,7 +262,7 @@ class ValueNetConfig:
     width: int = 1024
     layers: int = 4  # hidden layers of the trunk
     dropout: float = 0.0
-    block: str = "mlp"  # "mlp" (Linear [+ LayerNorm] + act) or "resnet" (pre-LN residual)
+    block: str = "resnet"  # "resnet" (pre-LN residual) or "mlp" (Linear [+ LayerNorm] + act)
     layer_norm: bool = False  # LayerNorm in the "mlp" trunk
     activation: str = "gelu"  # gelu | relu
     count_input: bool = False  # also feed the valid-combo count per bucket (board shape)
@@ -250,19 +299,28 @@ def context_features(c: torch.Tensor, stack: torch.Tensor) -> torch.Tensor:
 
 
 def normalise_ranges(ranges: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """``[n, 2, 1326]`` non-negative reaches (any scale) -> ranges summing to 1
-    over the valid combos; an all-zero range becomes uniform over them."""
-    v = valid[:, None, :].to(torch.float32)
-    r = ranges.float().clamp(min=0) * v
+    """``[n, 2, 1326]`` non-negative reaches (any scale) -> fp32 ranges summing
+    to 1 over the valid combos; an all-zero range becomes uniform over them."""
+    vf = valid[:, None, :].to(torch.float32)
+    r = ranges.to(torch.float32) * vf
     s = r.sum(-1, keepdim=True)
-    uni = v / v.sum(-1, keepdim=True).clamp(min=1.0)
-    return torch.where(s > 0, r / s.clamp(min=1e-30), uni)
+    pos = s > 0
+    inv = torch.where(pos, 1.0 / s.clamp(min=1e-30), torch.zeros_like(s))
+    fill = torch.where(pos, torch.zeros_like(s), 1.0 / vf.sum(-1, keepdim=True).clamp(min=1.0))
+    return r.mul_(inv).addcmul_(vf, fill)
 
 
-def opponent_mass(ranges: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """``m[:, p] = blocked_sum(r_{-p})``: opponent mass disjoint from each combo
-    (zero on invalid combos)."""
-    return blocked_sum(ranges.flip(1).float()) * valid[:, None, :]
+def opponent_mass(ranges: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+    """``m[:, p] = blocked_sum(r_{-p})`` [n, 2, 1326]: opponent mass disjoint from
+    each combo, zeroed on invalid combos when ``valid`` is given. One gemm:
+    ``m = total + r_{-p}(c) - S[x1] - S[x2]`` with ``S[x]`` the mass holding card x."""
+    rf = ranges.flip(1).float()
+    n = rf.shape[0]
+    inc = incidence(rf.device, torch.float32)  # [C, 52]
+    per_card = rf @ inc - 0.5 * rf.sum(-1, keepdim=True)  # the total is split over 2 cards
+    m = torch.addmm(rf.view(2 * n, C), per_card.view(2 * n, NUM_CARDS), inc.t(), alpha=-1.0)
+    m = m.view(n, 2, C)
+    return m * valid[:, None, :] if valid is not None else m
 
 
 def zero_sum(ev: torch.Tensor, ranges: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
@@ -339,46 +397,65 @@ class RiverValueNet(nn.Module):
         self,
         ranges: torch.Tensor,
         bucket: torch.Tensor,
-        pct: torch.Tensor,
         onehot: torch.Tensor,
         c: torch.Tensor,
         stack: torch.Tensor,
+        pct: torch.Tensor | None = None,
         m: torch.Tensor | None = None,
         amp: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``ranges [n, 2, 1326]`` normalised to sum 1 over the valid combos
-        (:func:`normalise_ranges`), ``bucket``/``pct`` [n, 1326] and ``onehot``
-        [n, 52] from the board features, ``c``/``stack`` [n]; ``m`` is
+        """``ranges [n, 2, 1326]`` fp32, normalised to sum 1 over the valid combos
+        (:func:`normalise_ranges`); ``bucket`` [n, 1326] int32/long (``K`` =
+        invalid) and ``onehot`` [n, 52] from the board features; ``c``/``stack``
+        [n]; ``pct`` [n, 1326] (only for the residual head); ``m`` is
         :func:`opponent_mass` (computed when omitted). ``amp`` runs the MLPs in
-        bf16 autocast; everything else is fp32. Returns ``ev [n, 2, 1326]`` fp32
-        in pot units after the zero-sum layer, zero on invalid combos."""
+        bf16 autocast, everything else is fp32. Returns ``ev [n, 2, 1326]`` fp32
+        in pot units after the zero-sum layer, zero on invalid combos (written
+        into ``out`` when given)."""
         cfg = self.cfg
         K = cfg.buckets
         n = ranges.shape[0]
         dev = ranges.device
         r = ranges.float()
-        valid = bucket < K
+        idx = bucket[:, None, :].expand(n, 2, C)
         with torch.autocast(dev.type, enabled=False):
             if m is None:
-                m = opponent_mass(r, valid)
-            idx = bucket[:, None, :].expand(n, 2, C)
-            R = r.new_zeros(n, 2, K + 1).scatter_add_(2, idx, r)[..., :K] * K
+                m = opponent_mass(r)
+            R = r.new_zeros(n, 2, K + 1).scatter_add_(2, idx, r)
             ctx = context_features(c.to(dev), stack.to(dev))
-            parts = [R.reshape(n, 2 * K)]
+            parts = [R[..., :K].reshape(n, 2 * K) * K]
             if cfg.count_input:
-                cnt = r.new_zeros(n, K + 1).scatter_add_(1, bucket, valid.float())[:, :K]
+                valid = (bucket < K).float()
+                cnt = r.new_zeros(n, K + 1).scatter_add_(1, bucket, valid)[:, :K]
                 parts.append(cnt * (K / valid.sum(1, keepdim=True).clamp(min=1)))
             x = torch.cat([*parts, ctx, onehot.float()], 1)
         with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
             vals = self.out(self.trunk(x))
         with torch.autocast(dev.type, enabled=False):
             vals = vals.float().view(n, 2, K)
-            ev = vals.gather(2, bucket.clamp(max=K - 1)[:, None, :].expand(n, 2, C))
-        if self.head is not None:
-            ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
+            pad = vals.new_zeros(n, 2, 1)  # bucket K (invalid combos) decodes to 0
+            if self.head is None:
+                # zero-sum layer at bucket level: sum_c w ev = sum_k W[k] vals[k]
+                W = r.new_zeros(n, 2, K + 1).scatter_add_(2, idx, r * m)[..., :K]
+                tot = W.sum((1, 2))
+                s = (W * vals).sum((1, 2))
+                delta = torch.where(tot > 1e-12, s / tot.clamp(min=1e-12), torch.zeros_like(s))
+                vals = torch.cat([vals - delta[:, None, None], pad], 2)
+                return (
+                    torch.gather(vals, 2, idx, out=out) if out is not None else vals.gather(2, idx)
+                )
+            ev = torch.cat([vals, pad], 2).gather(2, idx)
+        if pct is None:
+            raise ValueError("the residual head needs pct")
+        valid = bucket < K
+        ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
         with torch.autocast(dev.type, enabled=False):
-            ev = zero_sum(ev.float(), r, m)
-            return ev * valid[:, None, :]
+            ev = zero_sum(ev.float(), r, m) * valid[:, None, :]
+        if out is not None:
+            out.copy_(ev)
+            return out
+        return ev
 
     def _head(
         self,
@@ -446,7 +523,9 @@ class ValueNetPredictor:
         ids = pred.board_ids(boards_of_rows)     # [n] (one dict lookup per distinct board)
         ev = pred.predict_ids(ids, ranges, c, stack)
 
-    or simply ``pred.predict(boards, ranges, c, stack)``.
+    or simply ``pred.predict(boards, ranges, c, stack)``. Rows are processed in
+    chunks of ``chunk``; the residual head (if the net has one) needs much more
+    memory per row, so its chunk is capped at ``head_chunk``.
     """
 
     def __init__(
@@ -454,11 +533,13 @@ class ValueNetPredictor:
         net: RiverValueNet,
         device: torch.device | str | None = None,
         cache: BoardFeatureCache | None = None,
+        head_chunk: int = 2048,
     ):
         self.device = torch.device(device) if device is not None else next(net.parameters()).device
         self.net = net.to(self.device).eval()
         self.cache = cache or BoardFeatureCache(self.device)
         self.buckets = net.cfg.buckets
+        self.head_chunk = head_chunk
 
     @classmethod
     def from_path(cls, path: str | Path, device: torch.device | str = "cpu") -> ValueNetPredictor:
@@ -477,7 +558,7 @@ class ValueNetPredictor:
         chunk: int = 8192,
         bf16: bool | None = None,
     ) -> torch.Tensor:
-        """``boards [n, 5]``, ``ranges [n, 2, 1326]`` (OOP, IP; any positive
+        """``boards [n, 5]``, ``ranges [n, 2, 1326]`` (OOP, IP; non-negative, any
         scale), ``c``/``stack`` [n] -> ``ev [n, 2, 1326]`` fp32 (0 on invalid)."""
         return self.predict_ids(self.board_ids(boards), ranges, c, stack, chunk, bf16)
 
@@ -494,6 +575,9 @@ class ValueNetPredictor:
         """As :meth:`predict` with boards given as :meth:`board_ids` ids."""
         dev = self.device
         amp = (dev.type == "cuda") if bf16 is None else bool(bf16)
+        head = self.net.head is not None
+        if head:
+            chunk = min(chunk, self.head_chunk)
         n = ranges.shape[0]
         out = torch.empty(n, 2, C, dtype=torch.float32, device=dev)
         board_ids = board_ids.to(dev)
@@ -501,9 +585,16 @@ class ValueNetPredictor:
         stack = torch.as_tensor(stack, device=dev).reshape(n)
         for lo in range(0, n, chunk):
             hi = min(n, lo + chunk)
-            f = self.cache.features(board_ids[lo:hi], self.buckets)
+            f = self.cache.features(board_ids[lo:hi], self.buckets, pct=head)
             r = normalise_ranges(ranges[lo:hi].to(dev), f["valid"])
-            out[lo:hi] = self.net(
-                r, f["bucket"], f["pct"], f["onehot"], c[lo:hi], stack[lo:hi], amp=amp
+            self.net(
+                r,
+                f["bucket"],
+                f["onehot"],
+                c[lo:hi],
+                stack[lo:hi],
+                pct=f.get("pct"),
+                amp=amp,
+                out=out[lo:hi],
             )
         return out
