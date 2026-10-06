@@ -63,7 +63,7 @@ SHARD_DTYPES: dict[str, torch.dtype] = {
     "exploit": torch.float32,
     "source": torch.uint8,
 }
-SOURCE_NAMES = {0: "blueprint", 1: "perturbed", 2: "random"}
+SOURCE_NAMES = {0: "blueprint", 1: "perturbed", 2: "random", 3: "on-policy"}
 POT_BINS = (100, 250, 500, 1000, 2000, 4000)  # lower edges of the c bins; last is [4000, 10000]
 
 
