@@ -43,7 +43,7 @@ from pokerbot.search.value_leaf import river_average  # noqa: E402
 from pokerbot.search.value_ranges import reachable_c  # noqa: E402
 
 C = NUM_COMBOS
-SOURCES = {0: "self-play", 1: "perturbed", 2: "random"}
+SOURCES = {0: "self-play", 1: "perturbed", 2: "random", 3: "on-policy"}
 POT_BINS = (100, 250, 500, 1000, 2000, 4000, 10001)
 
 
@@ -125,6 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--river-net", required=True)
     ap.add_argument("--turn-net")
     ap.add_argument("--blueprint", required=True)
+    ap.add_argument(
+        "--states-file",
+        help="turn-end states to check instead of fresh ones (e.g. the on-policy "
+        "turn_states.pt of scripts/gen_onpolicy_data.py; source 3)",
+    )
     ap.add_argument("--states", type=int, default=320)
     ap.add_argument("--mix", default="0.5,0.25,0.25")
     ap.add_argument("--iterations", type=int, default=400)
@@ -143,7 +148,19 @@ def main(argv: list[str] | None = None) -> int:
     bp = make_blueprint(f"neural:{args.blueprint}", device=str(dev))
     mix = tuple(float(x) for x in args.mix.split(","))
     seeds = [args.seed, args.seed + 1, args.seed + 2]
-    states = make_turn_states(bp, cfg, args.states, mix, seeds, dev)
+    if args.states_file:
+        st = torch.load(args.states_file, weights_only=True)
+        g = torch.Generator().manual_seed(args.seed)
+        pick = torch.randperm(int(st["c"].shape[0]), generator=g)[: args.states]
+        states = {
+            "boards": st["boards"][pick].long(),
+            "c": st["c"][pick].long(),
+            "stack": st["stack"][pick].long(),
+            "ranges": st["ranges"][pick].float(),
+            "source": torch.full((len(pick),), 3, dtype=torch.uint8),
+        }
+    else:
+        states = make_turn_states(bp, cfg, args.states, mix, seeds, dev)
     states = {k: v.to(dev) for k, v in states.items()}
     valid = valid_masks(states["boards"], dev).float()
     r = states["ranges"] * valid[:, None, :]
