@@ -5,6 +5,8 @@ Goal: replace the noisy blueprint-rollout values at depth-limit leaves
 and ReBeL. The default flop search solves flop and turn (`depth_streets: 1`),
 so its leaves sit at the **end of turn betting**, just before the river card.
 
+Status (2026-10-06): implemented and evaluated; results in `docs/value_net_eval.md`.
+
 ## 1. Which leaves first: a river net, averaged over river cards
 
 **River-start net `N_R`.** It predicts the counterfactual values at the
