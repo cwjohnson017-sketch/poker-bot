@@ -306,7 +306,7 @@ turn-end 4 s 526, rollout 1,463, blueprint 2,257 mbb/hand.
 | **decision time**, 300 iterations (s) | 61.6 | 11.9 | 26.2 | |
 
 * The blueprint now leaves only 1.4 off-tree decisions per hand, but its
-  exploitability rises (2,396 -> 4,045 mbb/hand one-sided, mean of these two
+  exploitability rises (2,730 -> 4,045 mbb/hand one-sided, mean of these two
   spots). The best responder can use the extra flop sizes too.
 * Value-net search improves on the blueprint by 3,605 mbb/hand (one-sided).
 * The river-net fan-out takes 200 ms per iteration at 1,421 leaves, against
