@@ -149,6 +149,7 @@ class SearchAgent(BaseAgent):
             if not self.cfg.fallback_on_error:
                 raise
             self.last_stats = {"fallback": True, "street": int(state.street)}
+            self.stats.append(self.last_stats)
             return self._blueprint_action(state, seat, rng)
 
     # -- helpers ------------------------------------------------------------
