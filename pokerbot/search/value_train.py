@@ -216,7 +216,10 @@ class ValueTrainConfig:
 class ValueData:
     """Samples on ``device`` plus one feature row per distinct board: ``rank2``
     of river boards by default, or the given ``cache`` (an empty feature cache
-    on ``device`` with ``max_boards=None``, e.g. a turn-end one)."""
+    with ``max_boards=None``, e.g. a turn-end one). The cache may live on another
+    device than the samples (``cache_device`` for the default one): with the
+    samples in host memory, board features are still built and gathered on the
+    GPU."""
 
     def __init__(
         self,
@@ -224,6 +227,7 @@ class ValueData:
         device: torch.device | str = "cpu",
         max_exploit: float = 0.0,
         cache: Any = None,
+        cache_device: torch.device | str | None = None,
     ):
         dev = self.device = torch.device(device)
         keep = torch.ones(data["c"].shape[0], dtype=torch.bool)
@@ -237,7 +241,8 @@ class ValueData:
                     f"{data['boards'].shape[1]}-card boards need their own feature cache "
                     "(turn-end shards: pokerbot.search.turn_net.train_turn_net)"
                 )
-            cache = BoardFeatureCache(dev, max_boards=None, tables=False)
+            cdev = torch.device(cache_device) if cache_device is not None else dev
+            cache = BoardFeatureCache(cdev, max_boards=None, tables=False)
         self.cache = cache
         self.board_id = self.cache.ids(data["boards"][sel])
         self.ranges = data["ranges"][sel].to(dev, torch.float16)
@@ -253,7 +258,7 @@ class ValueData:
     def batch(self, idx: torch.Tensor, buckets: int, device: torch.device) -> dict:
         """Model inputs, targets, opponent masses and the loss mask of rows ``idx``."""
         idx = idx.to(self.device)
-        f = self.cache.features(self.board_id[idx], buckets)
+        f = self.cache.features(self.board_id[idx.to(self.board_id.device)], buckets)
         b = {
             "ranges": self.ranges[idx],
             "targets": self.targets[idx],
@@ -479,14 +484,14 @@ def train_value_net(
     raw = raw if raw is not None else load_shards(data)
     ddev = _data_device(cfg.data_device, dev, int(raw["c"].shape[0]))
 
-    def make_cache() -> Any:
-        return cache_factory(ddev) if cache_factory is not None else None
+    def make_cache() -> Any:  # board features on the compute device
+        return cache_factory(dev) if cache_factory is not None else None
 
-    ds = ValueData(raw, ddev, cfg.max_exploit, make_cache())
+    ds = ValueData(raw, ddev, cfg.max_exploit, make_cache(), cache_device=dev)
     del raw
     if heldout is not None or raw_heldout is not None:
         raw_h = raw_heldout if raw_heldout is not None else load_shards(heldout)
-        val_ds = ValueData(raw_h, ddev, cfg.max_exploit, make_cache())
+        val_ds = ValueData(raw_h, ddev, cfg.max_exploit, make_cache(), cache_device=dev)
         del raw_h
         tr, va = torch.arange(len(ds)), torch.arange(len(val_ds))
     else:
