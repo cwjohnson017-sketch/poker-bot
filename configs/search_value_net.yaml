@@ -30,7 +30,7 @@ search:
 
   leaf:
     mode: value_net
-    net: runs/value_net/turn_v1.pt
+    net: runs/value_net/turn_v2w.pt
     net_every: 1
 
   gadget:
