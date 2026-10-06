@@ -48,6 +48,12 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
   2.5 off-tree decisions per hand and inflates its score. The searches solve
   exactly this trunk.
 
+  A check on a 20,000-node trunk keeps the blueprint's flop sizes from 0.5 to
+  2 pot (1.4 off-tree decisions per hand). There the blueprint scores worse,
+  because the best responder gets those sizes too, and value-net search's
+  lead grows to -3,605 mbb/hand on 2 spots. So the coarse trunk does not
+  explain the result.
+
 * **Head to head**, 2,000 hands (duplicate, 1,000 deals): value-net search
   (production config) against its blueprint scores +168 mbb/hand raw
   (95% CI -264 to +580) and +131 luck-adjusted (CI -227 to +492). Positive
@@ -277,6 +283,36 @@ turn-end 4 s 526, rollout 1,463, blueprint 2,257 mbb/hand.
 | BTN vs check (4) | 498 | 525 | 530 | 1421 | 1979 |
 | BTN vs 1/2 lead (4) | 513 | 531 | 487 | 1161 | 1725 |
 
+### Richer trunk: the blueprint's flop sizes kept
+
+`runs/vn_eval/exploit_rich.md`:
+
+* 20,000-node trees (leaves count 1 + k) keep flop bets of 0.5, 0.75, 1, 1.5
+  and 2 pot, the pot re-raise and all-in. 0.25 and 0.33 are dropped, and the
+  turn is still pot re-raise and all-in.
+* Each tree has 5,736 decision nodes and 1,421 leaves (68k river subgames per
+  profile).
+* River solves use 200 iterations; safe resolving; board 0 only.
+
+| spot | value-net (river) | value-net (turn-end) | rollout search | blueprint |
+|---|---:|---:|---:|---:|
+| **BR against the searcher** (mbb/hand) | | | | |
+| board0 BB first | 320 | 370 | 1048 | 3073 |
+| board0 BTN vs check | 560 | 588 | 1901 | 5016 |
+| mean | **440** | 479 | 1474 | 4045 |
+| **two-sided** (mbb/hand) | | | | |
+| board0 BB first | 5264 | 5394 | 5639 | 3921 |
+| board0 BTN vs check | 491 | 526 | 1682 | 3995 |
+| **decision time**, 300 iterations (s) | 61.6 | 11.9 | 26.2 | |
+
+* The blueprint now leaves only 1.4 off-tree decisions per hand, but its
+  exploitability rises (2,396 -> 4,045 mbb/hand one-sided, mean of these two
+  spots). The best responder can use the extra flop sizes too.
+* Value-net search improves on the blueprint by 3,605 mbb/hand (one-sided).
+* The river-net fan-out takes 200 ms per iteration at 1,421 leaves, against
+  about 35 ms for the turn-end net.
+* The two-sided BB-first number again carries the gadget's opponent side.
+
 ### Timing per flop decision (RTX 4070 Ti)
 
 Means over the six spots with safe resolving; trees of 2,680 nodes and 294
@@ -361,9 +397,12 @@ The match took 2 h on the 4070 Ti (about 3.6 s per hand). Separating +100 to
   per leaf: 48 ms/iteration at 343 leaves, and over 100k rows per call at
   20k nodes.
 * **The 6,000-node evaluation trunk is coarse.** The blueprint's other sizes
-  are renormalised (about 2.4 off-tree decisions per hand), which favours the
-  searches; the turn has no opening bet below all-in. PENDING: richer-trunk
-  check.
+  are renormalised (about 2.4 off-tree decisions per hand); the turn has no
+  opening bet below all-in.
+  * The 20,000-node check keeps the blueprint's flop sizes from 0.5 to 2 pot,
+    and value-net search's lead grows there.
+  * Turn opening sizes only appear at about 120k nodes: about 15k leaves and
+    700k river subgames per profile, too many to score exactly.
 * **Turn solves (to showdown, no leaves) get only about 56 iterations per
   second.** The match used 2 s on the turn. The value net does not help there;
   a turn-start net would.
