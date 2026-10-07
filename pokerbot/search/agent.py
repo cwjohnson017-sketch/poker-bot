@@ -71,6 +71,34 @@ def _engine_config(engine: Any, config: Any) -> Any:
     )
 
 
+def played_lock(
+    acts: list[tuple[int, int]], slot: int, old_acts: list[tuple[int, int]], old: torch.Tensor
+) -> torch.Tensor:
+    """``[C, len(acts)]`` lock of one of our earlier decisions on this street: the
+    strategy ``old`` we played there (over ``old_acts``) on the new tree's
+    children ``acts``, of which ``slot`` is the action we took.
+
+    The taken action keeps its exact probability, so our range below it is the
+    one we really have. When the new tree lacks some sizes we could have played
+    (a forced off-tree branch can push the budget into dropping them), their
+    mass goes to the other children in proportion to what they already have
+    (uniformly where they have none), never to the taken action."""
+    C = old.shape[0]
+    strat = torch.zeros(C, len(acts), dtype=old.dtype)
+    for j, a in enumerate(acts):
+        if a in old_acts:
+            strat[:, j] = old[:, old_acts.index(a)]
+    missing = (old.sum(1) - strat.sum(1)).clamp(min=0)  # [C]
+    others = [j for j in range(len(acts)) if j != slot]
+    if not others or float(missing.max()) <= 0:
+        return strat
+    rest = strat[:, others]
+    tot = rest.sum(1, keepdim=True)
+    share = torch.where(tot > 0, rest / tot.clamp(min=1e-30), 1.0 / len(others))
+    strat[:, others] = rest + missing[:, None] * share
+    return strat
+
+
 class SearchAgent(BaseAgent):
     name = "search"
 
@@ -254,10 +282,7 @@ class SearchAgent(BaseAgent):
             played = self._played.get((key, tree.histories[node]))
             strat = torch.zeros(NUM_COMBOS, len(acts))
             if played is not None:
-                old_acts, old = played
-                for j, a in enumerate(acts):
-                    if a in old_acts:
-                        strat[:, j] = old[:, old_acts.index(a)]
+                strat = played_lock(acts, _slot, *played)
             if played is None or float(strat.sum()) <= 0:
                 st = tree.states[node]
                 P = policy_matrix(self.blueprint, st, seat).expand(NUM_COMBOS, -1)
