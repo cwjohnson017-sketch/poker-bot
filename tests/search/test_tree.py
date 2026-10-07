@@ -94,3 +94,33 @@ def test_turn_tree_runs_to_the_end_with_every_river_card():
     kids = tree.children[chance[0], :48]
     assert sorted(tree.deal_card[kids].tolist()) == [c for c in range(52) if c not in s.board]
     assert abs(float(tree.chance_weight[kids[0]]) - 1 / 44) < 1e-7
+
+
+def test_keep_open_drops_the_reraise_on_a_tie():
+    """A turn with a pot-sized open and a pot-sized re-raise: the budget keeps one
+    sized action, the re-raise by default and the open with ``keep_open``."""
+    from pokerbot.env.actions import ActionSpec
+
+    engine = get_engine()
+    cfg = engine.GameConfig()
+    s = _flop(engine, cfg)
+    street = (
+        ("fold",),
+        ("check_call",),
+        ("raise", 1.0, "open"),
+        ("raise", 1.0, "reraise"),
+        ("allin",),
+    )
+    pre = (("fold",), ("check_call",), ("raise_x", 2.5), ("allin",))
+    spec = ActionSpec(streets=(pre, street, street, street), max_raises=2)
+    full = build_tree(cfg, s.button, s.board, s.history, TreeConfig(spec=spec, max_nodes=10**6))
+    budget = full.num_nodes - 1  # forces exactly one drop on the turn
+    kept = {}
+    for keep_open in (False, True):
+        tc = TreeConfig(spec=spec, max_nodes=budget, keep_open=keep_open)
+        tree = build_tree(cfg, s.button, s.board, s.history, tc)
+        sized = [tuple(a) for a in tree.street_actions[2] if a[0] == "raise"]
+        kept[keep_open] = sized
+        assert tree.num_nodes <= budget
+    assert kept[False] == [("raise", 1.0, "reraise")]
+    assert kept[True] == [("raise", 1.0, "open")]

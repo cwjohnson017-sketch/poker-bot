@@ -97,6 +97,13 @@ goes all-in only, and finally subsamples chance cards (`min_chance_cards`).
 The final action sets are in `tree.street_actions` and `tree.raise_caps`.
 `tree.summary()` reports the node count by kind.
 
+Sizes equally far from pot-sized tie, and by default the spec's order then
+drops the first. With the dcfr4 blueprint's spec that is the turn's 1.0 open,
+before the 1.0 re-raise: at every flop-search budget the turn's only opening
+bet is all-in. `tree.keep_open: true` drops re-raise entries first on such ties.
+On the board0 spots, the 6000 / 10000 / 20000 budgets then give 3,108 / 6,066 /
+16,122 nodes, with fewer flop sizes than today's 5,802 / 8,478 / 18,294.
+
 ## Solver
 
 Ranges are `[2, 1326]` vectors. Regrets, current strategy and strategy sums

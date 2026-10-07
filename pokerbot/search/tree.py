@@ -79,6 +79,10 @@ class TreeConfig:
     # depth_streets of trees rooted on the turn (None: depth_streets). 0 gives turn
     # solves VALUE (or LEAF) nodes at the end of turn betting; >= 1 solves to showdown
     depth_streets_turn: int | None = None
+    # node budget: among sizes equally far from pot-sized, drop re-raise entries before
+    # opening ones (False: the spec's order decides, which drops the turn's 1.0 open
+    # before its 1.0 re-raise and leaves all-in as the turn's only opening bet)
+    keep_open: bool = False
 
 
 @dataclass
@@ -159,10 +163,14 @@ class SubgameTree:
         return [(int(self.action_kind[c]), int(self.action_amount[c])) for c in range(s, s + n)]
 
 
-def _size_rank(a: tuple) -> float:
-    """Drop order for sized raises: farthest from pot-sized first, larger on ties."""
+def _size_rank(a: tuple, keep_open: bool = False) -> float:
+    """Drop order for sized raises: farthest from pot-sized first, larger on ties;
+    with ``keep_open``, a re-raise entry before an opening one of the same size."""
     f = float(a[1])
-    return abs(math.log(f)) + 1e-6 * f
+    r = abs(math.log(f)) + 1e-6 * f
+    if keep_open and len(a) > 2 and a[2] == "reraise":
+        r += 1e-9
+    return r
 
 
 class TreeBuilder:
@@ -314,7 +322,7 @@ class TreeBuilder:
 
         for s in streets:  # 1: drop bet sizes deepest-first, keep one
             while sk.count > budget and len(sized(s)) > 1:
-                drop = max(sized(s), key=_size_rank)
+                drop = max(sized(s), key=lambda a: _size_rank(a, self.tc.keep_open))
                 self.street_actions[s].remove(drop)
                 sk = self._skeleton()
         for s in streets:  # 2: lower raise caps deepest-first
