@@ -60,6 +60,14 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
   but not significant at this sample size. All 2,508 search decisions
   searched, with no blueprint fallback; flop decisions took 4.03 s on
   average and 4.08 s at most.
+* **Follow-up (2026-10-06):**
+  * 4.2x the river data, including 73k on-policy leaf samples, and a retrained,
+    wider turn-end net.
+  * The production leaf model's error at search leaf states fell 22% against
+    exact solves.
+  * Exploitability on the six spots with safe resolving off fell from 115 to
+    **101** mbb/hand (blueprint 1,981), at the same 4.0 s per flop decision.
+  * See "Follow-up" below.
 
 ## What was built
 
@@ -357,6 +365,130 @@ leaves on average.
 The match took 2 h on the 4070 Ti (about 3.6 s per hand). Separating +100 to
 +200 mbb/hand from zero needs roughly 12–26k hands (the CI half-width shrinks with the square root of the hand count).
 
+## Follow-up (2026-10-06): more river data, on-policy data, turn-end net v2
+
+**Data added**
+
+| set | samples | DCFR iterations | mean solve exploitability (pot) | notes |
+|---|---:|---:|---:|---|
+| `river_b` | 573,440 | 300 | 0.21% | same mix as `river_a`, seed 1; 40 samples/s (1.5x faster than 400 iterations) |
+| `river_onpolicy` | 72,602 | 300 | 0.15% | **on-policy** (source 3): turn-end leaf reaches recorded during 422 value-net flop searches (300 duplicate deals against the blueprint, turn-end net v1 as the leaf model), 2 random river cards each |
+| `river_heldout` | 16,384 | 400 | 0.14% | fixed held-out set (seed 999), same mix |
+| `river_onpolicy_heldout` | 12,589 | 400 | 0.10% | on-policy held-out from 59 other searches (other deals) |
+| `turn_b` | 1,500,000 | - | - | turn-end states, targets bootstrapped from river v2 (252 samples/s) |
+| `turn_onpolicy` (+ held-out) | 36,304 (+6,296) | - | - | the recorded turn-end leaf states themselves, labelled with river v2 |
+
+The recorder (`search/leaf_recorder.py`) wraps the leaf provider. On every
+20th regret update it stores 8 random turn-end leaves whose reach is
+non-negligible for both players. Those are exactly the inputs the net is
+queried with.
+
+**River net v2** (`river_v2.pt`: `river_a` + `river_b` + `river_onpolicy`,
+850k samples; 40k steps, 13.5 min, samples in host memory). The comparison
+below uses the same 29k held-out samples (`scripts/eval_value_net.py`); pot
+units per combo.
+
+| | v1 MAE | v2 MAE | v1 wMAE | v2 wMAE | v1 game value | v2 game value |
+|---|---:|---:|---:|---:|---:|---:|
+| all held-out | 0.0391 | 0.0347 | 0.0317 | 0.0299 | 0.0088 | 0.0081 |
+| blueprint ranges | 0.0219 | 0.0205 | 0.0203 | 0.0195 | 0.0044 | 0.0041 |
+| perturbed | 0.0247 | 0.0229 | 0.0228 | 0.0217 | 0.0048 | 0.0046 |
+| random | 0.0573 | 0.0472 | 0.0329 | 0.0290 | 0.0089 | 0.0076 |
+| on-policy | 0.0490 | 0.0437 | 0.0415 | 0.0397 | 0.0129 | 0.0120 |
+
+On-policy states are the hardest: their bucket-oracle floor is 0.019 against
+0.008 for blueprint ranges, because the ranges are wider and blockers matter
+more. 4x the data gave a modest gain. Training loss rose from 0.0006 to 0.0009,
+so the net now overfits less and capacity starts to matter (see the capacity
+test below).
+
+**Turn-end net v2** (`turn_v2.pt`: `turn_b` + `turn_onpolicy`, 1.49M samples;
+40k steps, 6 min). Held-out against its own bootstrapped targets: MAE 0.0285
+(v1: 0.0327), range-weighted 0.0289 (0.0321), game value 0.0067 (0.0079).
+
+**Exact turn-end leaf check** (`scripts/check_turn_leaves.py`): 400 states,
+each against all 48 river subgames solved exactly; the same states for v1 and
+v2.
+
+| states | leaf model | MAE v1 -> v2 | wMAE v1 -> v2 | game value v1 -> v2 |
+|---|---|---|---|---|
+| training-style mix | river net x river cards | 0.0149 -> 0.0136 | 0.0124 -> 0.0122 | 0.0030 -> 0.0031 |
+| training-style mix | turn-end net | 0.0355 -> 0.0312 | 0.0339 -> 0.0308 | 0.0085 -> 0.0069 |
+| **on-policy** (search leaf states) | river net x river cards | 0.0278 -> 0.0242 | 0.0231 -> 0.0229 | 0.0076 -> 0.0067 |
+| **on-policy** (search leaf states) | turn-end net | **0.0543 -> 0.0446** | 0.0502 -> 0.0448 | **0.0172 -> 0.0131** |
+
+The turn-end net, the production leaf model, improved most on the states
+search actually queries: -18% MAE and -24% game-value error.
+
+**Exploitability**, the six original spots with safe resolving off, two-sided
+(mbb/hand; `runs/vn_eval/exploit6_unsafe_v2.md`):
+
+| spot | turn-end v1 | **turn-end v2** | river v1 | river v2 | rollout search | blueprint |
+|---|---:|---:|---:|---:|---:|---:|
+| board0 BB first | 128 | 118 | 100 | 99 | 1137 | 2614 |
+| board0 BTN vs check | 138 | 125 | 107 | 103 | 1252 | 2611 |
+| board0 BTN vs 1/2 lead | 153 | 143 | 133 | 128 | 904 | 1858 |
+| board1 BB first | 98 | 86 | 74 | 74 | 977 | 1593 |
+| board1 BTN vs check | 95 | 85 | 71 | 70 | 1000 | 1655 |
+| board1 BTN vs 1/2 lead | 79 | 67 | 63 | 57 | 1085 | 1553 |
+| **mean** | 115 | **104** | 91 | 88 | 1059 | 1981 |
+
+Turn-end net v2 is 10% less exploitable than v1 and better on every spot. The
+opponent's best response against the searcher fell from 237 to 225 mbb/hand
+(blueprint 2,397). The river-card fan-out improved 3%.
+
+**Capacity test** (width 2048 instead of 1024, same data, steps and held-out
+split): held-out MAE in pot units.
+
+| net | width 1024 | width 2048 | on-policy, 1024 -> 2048 | parameters | training time |
+|---|---:|---:|---:|---:|---:|
+| turn-end | 0.0285 | **0.0258** | 0.0369 -> 0.0344 | 4.3M -> 14.8M | 6 -> 9 min |
+| river | 0.0347 | 0.0336 | 0.0437 -> 0.0425 | 4.3M -> 14.8M | 13.5 -> 16 min |
+
+* The wide turn-end net (`turn_v2w.pt`) also wins against exact solves:
+  * on-policy states: MAE 0.0446 -> 0.0423, game value 0.0131 -> 0.0125;
+  * training-style mix: MAE 0.0312 -> 0.0288, game value 0.0069 -> 0.0064.
+* It runs one row per leaf, so its extra cost does not show: flop decisions
+  are still 4.03 s with about 156 iterations.
+* The wide river net gains only 3% but would make the 48-row fan-out 3.5x
+  dearer, so it is not used.
+* The production config (`configs/search_value_net.yaml`) now uses
+  `turn_v2w.pt`.
+
+**Exploitability of the wide turn-end net** (`runs/vn_eval/exploit6_unsafe_v2w.md`;
+same six spots, unsafe, two-sided, mbb/hand):
+
+| spot | turn-end v1 | turn-end v2 | **turn-end v2 wide** |
+|---|---:|---:|---:|
+| board0 BB first | 128 | 118 | 111 |
+| board0 BTN vs check | 138 | 125 | 119 |
+| board0 BTN vs 1/2 lead | 153 | 143 | 138 |
+| board1 BB first | 98 | 86 | 87 |
+| board1 BTN vs check | 95 | 85 | 83 |
+| board1 BTN vs 1/2 lead | 79 | 67 | 68 |
+| **mean** | 115 | 104 | **101** |
+
+The opponent's best response against the searcher is 237 -> 225 -> 222 mbb/hand
+across the three versions. The retrained turn-end net closes about 40% of the
+gap between the v1 turn-end net (115) and the river-card fan-out (v2: 88),
+at the turn-end net's speed: 19 ms per iteration against 49.
+
+**Summary of the follow-up**
+
+* 4.2x the river data (205k -> 862k), including 73k on-policy samples, made
+  the river net 11% more accurate on held-out data and 13% more accurate at
+  on-policy turn-end leaves.
+* 5x the turn-end data, bootstrapped from the better river net and including
+  on-policy states, plus a wider net, made the production leaf model 22% more
+  accurate at on-policy leaves against exact solves (MAE 0.054 -> 0.042, game
+  value 0.017 -> 0.0125).
+* Exploitability fell 12% (115 -> 101 mbb/hand, unsafe two-sided) with
+  unchanged decision time.
+* The remaining error is mostly at on-policy states, which are wide ranges
+  where blockers matter. Their bucket-oracle floor is 0.019, against 0.008 for
+  blueprint ranges, so a per-combo (blocker-aware) output is the next accuracy
+  lever. More data alone gives diminishing returns: 4x the data gave -11%.
+
 ## What worked, what didn't
 
 **Worked**
@@ -412,14 +544,15 @@ The match took 2 h on the 4070 Ti (about 3.6 s per hand). Separating +100 to
 
 ## Next steps
 
-1. **More river data, then retrain.**
-   * 1M samples is about 10 h at the current rate.
-   * Add on-policy samples: leaf reaches recorded during value-net flop
-     searches (ReBeL style). The net is queried on the solver's iterates,
-     which the self-play, perturbed and random mix only approximates.
-2. **Retrain the turn-end net on millions of bootstrapped samples.** Targets
-   cost 48 river-net rows, no solving; this would close most of its 2.4x gap to
-   the fan-out. The random-range states can be generated without self-play.
+1. **Done (2026-10-06):** more river data, on-policy samples, a turn-end net
+   retrained on 1.5M samples, and a wider turn-end net (see "Follow-up").
+   Remaining lever for accuracy: **blocker-aware per-combo outputs**.
+   * On-policy states have a bucket-oracle floor of 0.019 pot, so bucket-level
+     outputs cannot fit them.
+   * The residual head exists (`--residual-head`). It is too slow for the
+     48-row river fan-out, but cheap for the turn-end net's one row per leaf.
+2. **More on-policy data from the current leaf model**, iterated (ReBeL style).
+   The first 73k samples were recorded with the v1 leaf model.
 3. **Better first-decision gadget values.** For example, evaluate the
    blueprint's trunk strategy with value-net leaves instead of 256 rollouts, or
    use unsafe resolving when the root ranges are the blueprint's own. The
