@@ -23,6 +23,7 @@ and for preflop play.
 | `turn_data.py` | turn-end data with targets bootstrapped from the river net, no solving (`scripts/gen_turn_data.py`) |
 | `batch_solver.py` | `BatchRiverSolver`: DCFR on many river subgames sharing one betting tree, `river_tree` |
 | `exact_eval.py` | exact exploitability of a flop/turn strategy with every river subgame solved (`trunk_exploitability`), `map_sigma` |
+| `tree_policy.py` | the blueprint's strategy on every decision node of a tree (`blueprint_profile`), batched for distilled neural blueprints (`node_policies`) |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
 | `gadget.py` | safe resolving gadget, continual-resolving cache |
 | `agent.py` | `SearchAgent`, `make_search_agent` (match runner: `search:<blueprint spec>`) |
@@ -72,6 +73,12 @@ are depth-sorted and a node's children are contiguous):
 | `cont`, `folder` | continuation strategy index, player who folded |
 | `level_start` | node ids of each depth |
 | `current_node`, `path_nodes` | the observed decision node, and the (node, slot) pairs along the observed path |
+| `states`, `histories`, `boards` | engine state per decision / leaf node, concrete action history from the root, distinct boards (`board_id` indexes them) |
+
+`states[n]` below a chance node is the chance **template's** engine state: its
+betting is right, but its board has whatever card the builder dealt. Take a
+node's board from `boards[board_id[n]]`, e.g. `CardView(states[n], board)`
+for a blueprint query (`tree_policy.blueprint_profile` does).
 
 Building happens in two steps. A recursive walk over scalar-engine states
 (`poker_engine` or the reference engine) produces a skeleton. Betting never
@@ -324,8 +331,23 @@ tests check it drops from 52 to 0.015 chips on a 200 pot.
   stores our reach, the opponent's reach and the opponent's
   **best-response** values at every chance child under the action we take.
   The next street starts from exactly those vectors.
-* Without a cached solve (the first flop decision), `T` is the opponent's
-  blueprint-vs-blueprint value from `gadget.rollouts` rollouts.
+* Without a cached solve (the first decision of a street, e.g. the first flop
+  decision), `gadget.terminate` says where `T` comes from. It is computed
+  once per street root and reused by later decisions on that street.
+  * `rollouts` (default): the opponent's blueprint-vs-blueprint value from
+    `gadget.rollouts` rollouts.
+  * `blueprint`: the opponent's counterfactual values in the search tree itself,
+    with its own leaves, when both players play the blueprint
+    (`tree_policy.blueprint_profile`, then `gadget.tree_terminate_values`).
+    It has no rollout noise and comes from the same game as the entry values.
+  * `blueprint_br`: the same with the opponent best-responding to the
+    blueprint. This is CFR-D's `T`: the re-solve is then no more exploitable
+    than the blueprint in the search's game.
+  * `unsafe`: no gadget at such decisions. The root ranges there are the
+    blueprint's own, the case unsafe resolving assumes.
+
+  `last_stats["gadget"]` records the source (`cache` after a solved earlier
+  street), and `terminate_seconds` the time spent on `T`.
 * `prior` is the opponent's range mixed with `prior_mix` uniform.
 * `safe: false` (unsafe resolving) skips the gadget: the opponent's root
   range is the cached or blueprint range.
@@ -517,6 +539,15 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
     river evaluator's leaf values and solve, and `net_every`.
   * The agent picks the provider from the checkpoint kind and plays; turn-end
     self-play states; the data and training CLIs.
+* `test_tree_policy.py`: covers the following.
+  * The batched blueprint profile equals per-node `policy_matrix` queries on
+    every combo that can reach a node, and the fallback path for other
+    blueprints.
+  * Turn nodes are queried on their own board, not the chance template's.
+  * Terminate values computed in the tree; each `gadget.terminate` mode in the
+    agent.
+  * A `blueprint_br` re-solve keeps every opponent combo below its terminate
+    value.
 
 ## Shortcuts and limits
 
@@ -524,8 +555,10 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
   Pluribus. The searcher's continuation is the plain blueprint.
 * Ranges at the first flop root come from the blueprint, not from our
   actual preflop play. Later streets use the cached solve.
-* The first gadget terminate values are blueprint-vs-blueprint rollout
-  values, not a best response to the blueprint, so they are noisy.
+* By default the first gadget terminate values are blueprint-vs-blueprint
+  rollout values, not a best response to the blueprint, so they are noisy.
+  `gadget.terminate: blueprint | blueprint_br` computes them in the search
+  tree instead (see "Safe resolving gadget").
 * Sampled run-outs (`max_runouts`, rollouts) and subsampled chance cards
   give an unbiased but noisy game. The solver treats that sampled game as
   exact.
