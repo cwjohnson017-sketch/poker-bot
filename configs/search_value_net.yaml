@@ -34,6 +34,12 @@ search:
     net_every: 1
 
   gadget:
-    safe: true
+    safe: true              # safe resolving from the previous street's cached solve
     prior_mix: 0.05
     rollouts: 256
+    # first decision of a street without a cached solve (the root ranges are the
+    # blueprint's): no gadget. On 6 flop spots (docs/value_net_eval.md, 2026-10-07)
+    # this beat terminate values from 256 or 4096 rollouts and from the search tree
+    # in strength and in per-hand excess over the blueprint, and leaves the whole
+    # 4 s to DCFR (about 185 iterations).
+    terminate: unsafe
