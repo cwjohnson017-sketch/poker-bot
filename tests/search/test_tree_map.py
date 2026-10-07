@@ -20,6 +20,9 @@ from pokerbot.search.tree_map import (
     _Info,
     action_set_differences,
     match_nodes,
+    offtree_edges,
+    path_nodes,
+    subtree_nodes,
     translate_action,
     translate_sigma,
 )
@@ -259,3 +262,48 @@ def test_roots_must_agree():
     c_tree = build_tree(cfg, s2.button, s2.board, s2.history, tc)
     with pytest.raises(ValueError, match="same public state"):
         match_nodes(a.tree, c_tree)
+
+
+def test_offtree_edges_and_subtrees(coarse_rich):
+    src, dst, sig = coarse_rich
+    st, dt = src.tree, dst.tree
+    m = match_nodes(st, dt)
+    edges = offtree_edges(m, dt, BTN)
+    # brute force: the button acts on the flop after a history src has exactly, with
+    # an action src lacks there
+    want = []
+    for n in range(1, dt.num_nodes):
+        p = int(dt.parent[n])
+        if int(dt.kind[p]) != DECISION or int(dt.actor[p]) != BTN or int(dt.street[p]) != 1:
+            continue
+        s = m.src_of[p]
+        if s < 0 or st.histories[s] != dt.histories[p]:
+            continue
+        if dt.child_actions(p)[int(dt.slot[n])] not in st.child_actions(s):
+            want.append(n)
+    assert edges == want and len(edges) > 2
+    hist = {dt.histories[n] for n in edges}
+    assert ((1, BB, CHECK_CALL, 0), (1, BTN, RAISE, 375)) in hist  # 0.75 pot after a check
+    bb = offtree_edges(m, dt, BB)  # the other player's: the big blind's extra sizes
+    assert ((1, BB, RAISE, 375),) in {dt.histories[n] for n in bb} and not set(bb) & set(edges)
+    assert offtree_edges(match_nodes(dt, dt), dt, BTN) == []
+    # no edge lies below another, and each subtree is closed under children
+    for e in edges:
+        sub = subtree_nodes(dt, e)
+        assert sub[0] == e and not set(sub[1:]) & set(edges)
+        inside = set(sub)
+        assert all(int(dt.parent[x]) in inside for x in sub[1:])
+        path = path_nodes(dt, e)
+        assert path[0] == 0 and int(dt.parent[e]) == path[-1]
+    # translating only a subtree: those rows as in the full translation, the rest fallback
+    e = edges[0]
+    sub = subtree_nodes(dt, e)
+    full, _ = translate_sigma(src, dst, BB, sig)
+    fb = _random_sigma(dst, 7)
+    part, rep = translate_sigma(src, dst, BB, sig, fallback=fb, nodes=sub)
+    inside = set(sub)
+    n_dec = 0
+    for d, n in enumerate(dst.dec_nodes.tolist()):
+        assert torch.equal(part[d], full[d] if n in inside else fb[d]), n
+        n_dec += n in inside
+    assert sum(rep["decision_nodes"].values()) == n_dec

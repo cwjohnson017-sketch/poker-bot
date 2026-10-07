@@ -51,11 +51,17 @@ each ``src`` child's probability goes to one ``dst`` child:
 Unmatched nodes play ``fallback`` (default: uniform). Only the betting part of
 ``tree.states`` (pot, street bets, legal raise range) is read, which does not
 depend on the cards; chance children are matched by ``tree.deal_card``.
+
+For re-searching as the agent does in play (:mod:`pokerbot.search.size_eval`),
+:func:`offtree_edges` lists one player's first off-tree actions in ``dst``
+(after a history ``src`` has exactly), :func:`subtree_nodes` the nodes below
+one, and ``translate_sigma(..., nodes=...)`` translates only those.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -311,6 +317,7 @@ def translate_sigma(
     strict: bool = True,
     fallback: torch.Tensor | None = None,
     match: NodeMatch | None = None,
+    nodes: Collection[int] | None = None,
     chunk: int = 8192,
 ) -> tuple[torch.Tensor, dict]:
     """``src``'s strategy (its average strategy unless ``src_sigma``) on
@@ -322,7 +329,9 @@ def translate_sigma(
     :class:`StrategySnapshot`) on trees rooted at the same public state.
     ``searcher`` is the player whose lost mass ``strict`` refuses. ``fallback``
     (``[D, A, C]`` on ``dst``, default uniform) is played at unmatched nodes and
-    where a renormalised row has no mass left. See the module docstring.
+    where a renormalised row has no mass left. With ``nodes`` (``dst`` node ids)
+    only those decision nodes are translated and counted; the others play
+    ``fallback``. See the module docstring.
 
     The report (JSON-ready): ``decision_nodes``, ``translated_nodes`` (matched
     nodes reached through at least one translated action), ``unmatched_nodes``
@@ -350,7 +359,12 @@ def translate_sigma(
     lost_s: list[int] = []
     lost_i: list[int] = []
     unmatched: list[int] = []
+    skipped: list[int] = []
+    only = None if nodes is None else set(nodes)
     for d, n in enumerate(dst.dec_nodes.tolist()):
+        if only is not None and n not in only:
+            skipped.append(d)
+            continue
         role = _role(di.actor[n], searcher)
         count["decision"][role] += 1
         s = m.src_of[n]
@@ -428,8 +442,8 @@ def translate_sigma(
         part = out[ids]
         tot = part.sum(1, keepdim=True)
         out[ids] = torch.where(tot > 0, part / tot.clamp(min=1e-30), fb[ids].to(dtype))
-    if unmatched:
-        ids = torch.tensor(unmatched, device=dev)
+    if unmatched or skipped:
+        ids = torch.tensor(unmatched + skipped, device=dev)
         out[ids] = fb[ids].to(dtype)
     report = {
         "searcher": int(searcher),
@@ -441,6 +455,50 @@ def translate_sigma(
         "steps": dict(m.steps),
     }
     return out, report
+
+
+def offtree_edges(
+    match: NodeMatch, dst_tree: SubgameTree, actor: int, street: int | None = None
+) -> list[int]:
+    """The first off-tree ``actor`` edges of ``dst_tree`` on ``street`` (default:
+    the root street), as the ``dst`` child nodes they lead to: ``actor`` acts at
+    a matched ``dst`` decision node whose whole history ``src`` has exactly, with
+    an action ``src`` lacks there. No two of them are nested."""
+    st = dst_tree.root_street if street is None else int(street)
+    di = _Info(dst_tree)
+    out = []
+    for n in range(1, dst_tree.num_nodes):
+        p = di.parent[n]
+        if di.kind[p] != DECISION or di.actor[p] != actor or di.street[p] != st:
+            continue
+        if match.src_of[p] < 0 or match.translated[p] or di.kind[n] not in _WALK_KINDS:
+            continue
+        if match.src_of[n] < 0 or match.translated[n]:
+            out.append(n)
+    return out
+
+
+def subtree_nodes(tree: SubgameTree, root: int) -> list[int]:
+    """``root`` and every node below it (ids ascending; BFS order puts
+    descendants after their ancestors)."""
+    parent = tree.parent.tolist()
+    inside = {root}
+    out = [root]
+    for n in range(root + 1, tree.num_nodes):
+        if parent[n] in inside:
+            inside.add(n)
+            out.append(n)
+    return out
+
+
+def path_nodes(tree: SubgameTree, node: int) -> list[int]:
+    """The strict ancestors of ``node``, root first."""
+    out = []
+    p = int(tree.parent[node])
+    while p >= 0:
+        out.append(p)
+        p = int(tree.parent[p])
+    return out[::-1]
 
 
 def action_set_differences(src_tree: SubgameTree, dst_tree: SubgameTree) -> list[str]:
@@ -468,6 +526,9 @@ __all__ = [
     "action_set_differences",
     "harmonic_choice",
     "match_nodes",
+    "offtree_edges",
+    "path_nodes",
+    "subtree_nodes",
     "translate_action",
     "translate_sigma",
 ]

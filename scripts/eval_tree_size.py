@@ -19,6 +19,9 @@ python scripts/eval_tree_size.py --blueprint runs/dcfr4_distilled_v2 --oracle sh
 Spots: --spots <board>:<type> ... picks spots by board index and type
 (bb_first, btn_vs_check, btn_vs_lead); without it, --boards x --spot-types.
 --iters N adds a fixed-N-iteration search per size as a reference.
+Each smaller budget search is also scored re-searched, as the agent plays: the same
+agent searches again wherever the opponent takes a flop size its tree lacks
+(--no-research: translated only).
 --search '{"gadget": {"safe": false}}' overrides the config for every search.
 
 --oracle showdown values every leaf as a checked-down river; --oracle untrained
@@ -126,6 +129,11 @@ def main(argv: list[str] | None = None) -> int:
         help='extra search config overrides as JSON, e.g. \'{"gadget": {"safe": false}}\'',
     )
     ap.add_argument("--strict", action="store_true", help="fail on mass lost in translation")
+    ap.add_argument(
+        "--no-research",
+        action="store_true",
+        help="score translated strategies only (no re-search at off-tree opponent actions)",
+    )
     ap.add_argument("--no-spot-warmup", action="store_true", help="no per-spot cache warm-up")
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
     ap.add_argument("--out-md", default="runs/tree_size/size.md")
@@ -153,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         river_batch=args.river_batch,
         eval_max_runouts=args.eval_runouts or None,
         strict=args.strict,
+        research=not args.no_research,
         spot_warmup=not args.no_spot_warmup,
         device=args.device,
         search=args.search,

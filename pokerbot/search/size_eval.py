@@ -20,18 +20,34 @@ For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
    sizes by the deterministic pseudo-harmonic rule, and unmatched nodes (none
    in the production trees) play the blueprint. The blueprint is mapped with
    :func:`~pokerbot.search.spot_eval.blueprint_profile`;
-3. scores every profile with :func:`~pokerbot.search.spot_eval.score_profile`.
+3. **re-searches** as the agent does in play (``research``, budget searches
+   only): at every first off-tree opponent flop edge of the trunk (the
+   opponent picks a size the smaller tree lacks, after a history that tree has
+   exactly; :func:`~pokerbot.search.tree_map.offtree_edges`), the state is
+   replayed to that point and the SAME agent acts again. Its tree is rooted at
+   the flop with the observed path forced in, so the size is an extra branch;
+   the root info (ranges, gadget terminate values) comes from the agent's
+   cache, and the searcher's earlier flop decisions on the path are locked to
+   what it played (the first search's root strategy, and for any later
+   decisions on the path the first search's average strategy there, seeded
+   into ``SearchAgent._played``). The ``<size>_research`` profile takes each
+   re-search's strategy below its edge (translated by the same walk, exact
+   along the path) and the first search's translated strategy everywhere else;
+4. scores every profile with :func:`~pokerbot.search.spot_eval.score_profile`.
    Every (leaf, river card) river subgame is solved exactly, and best
    responses are backed up through the trunk on the plain root ranges. The
    **one-sided** number is the best response of the searcher's opponent (the
    searcher is the player to act); its differences between profiles are exact
    differences in the searcher's exploitability in the trunk's game. The
-   **two-sided** number is ``(BR_0 + BR_1) / 2``.
+   **two-sided** number is ``(BR_0 + BR_1) / 2``. A ``_research`` profile with
+   no re-search (the trunk's own size) is the translated one and is not scored
+   twice.
 
-The trunk's game gives the opponent every size of the largest tree, so a
-smaller tree is charged for its translation of the sizes it lacks. The real
-agent would re-solve at its next decision instead (with the observed size
-added to the tree), so the smaller trees' numbers are pessimistic there.
+The trunk's game gives the opponent every size of the largest tree. The
+translated profiles charge a smaller tree for answering a size it lacks with
+its strategy for the nearest size it has; the re-searched profiles answer it
+as the agent would. Only off-tree edges are re-searched: the agent re-searches
+at its on-tree decisions too, for every size, which this leaves out.
 
 Before the measured searches of a spot, a short search on it warms the
 blueprint's caches (``spot_warmup``), so every size starts from the same cache
@@ -48,21 +64,27 @@ import inspect
 import json
 import time
 import traceback
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ..config import REPO_ROOT
+from ..engine_select import get_engine
+from .abstract import make_state, to_action
 from .config import SearchConfig, search_config
+from .gadget import history_key
 from .spot_eval import (
     EXACT_FLOP_RUNOUTS,
     HUGE_BUDGET,
     SPOT_NAMES,
     SPOT_TYPES,
     EvalSettings,
+    SearchRun,
     Spot,
     _f,
     _free,
@@ -74,13 +96,23 @@ from .spot_eval import (
     _write_json,
     _write_text,
     blueprint_profile,
+    capture_solvers,
     exploit_spots,
     offtree_mass,
     run_search,
     scoring_solver,
 )
-from .tree import DECISION, VALUE
-from .tree_map import StrategySnapshot, action_set_differences, translate_sigma
+from .tree import DECISION, VALUE, SubgameTree
+from .tree_map import (
+    NodeMatch,
+    StrategySnapshot,
+    action_set_differences,
+    match_nodes,
+    offtree_edges,
+    path_nodes,
+    subtree_nodes,
+    translate_sigma,
+)
 
 DEFAULT_CONFIG = "configs/search_value_net.yaml"
 DEFAULT_SIZES = (6000, 10000, 20000)
@@ -102,6 +134,7 @@ class SizeSettings:
     river_batch: int = 256  # halved automatically on CUDA out-of-memory
     eval_max_runouts: int | None = EXACT_FLOP_RUNOUTS  # None: the search's solver.max_runouts
     strict: bool = False  # raise when a search's strategy loses mass on the trunk
+    research: bool = True  # re-search at off-tree opponent flop actions (budget searches)
     spot_warmup: bool = True  # warm the blueprint caches on each spot first
     device: str = "auto"
     search: dict = field(default_factory=dict)  # extra search_config overrides (every search)
@@ -219,6 +252,223 @@ def select_spots(
     return [by[w] for w in want]
 
 
+# -- re-searches at off-tree opponent actions --------------------------------------
+
+RESEARCH = "_research"
+
+
+def research_name(name: str) -> str:
+    """``"6000"`` -> ``"6000_research"``: the profile with the re-searches."""
+    return f"{name}{RESEARCH}"
+
+
+def street_root_state(engine: Any, game_config: Any, state: Any) -> Any:
+    """``state`` at the start of its street: the same button, hole cards, board
+    and earlier streets, with none of this street's actions."""
+    street = int(state.street)
+    pre = [h for h in state.history if int(h[0]) < street]
+    holes = [list(state.hole_cards(0)), list(state.hole_cards(1))]
+    return make_state(engine, game_config, state.button, list(state.board), pre, holes)
+
+
+def replay(engine: Any, game_config: Any, state: Any, history: Sequence) -> Any:
+    """``state``'s street start with ``history`` applied: ``(street, player, kind,
+    amount)`` steps from the street root, as in ``SubgameTree.histories``."""
+    s = street_root_state(engine, game_config, state)
+    for _street, player, kind, amount in history:
+        if int(s.current_player) != int(player):
+            raise ValueError(f"history {history} does not fit the state (player {player})")
+        s.apply(to_action(engine, int(kind), int(amount)))
+    return s
+
+
+def played_key(state: Any) -> tuple:
+    """The key of ``SearchAgent._roots`` and ``_played`` for ``state``'s street."""
+    street = int(state.street)
+    pre = [h for h in state.history if int(h[0]) < street]
+    return (history_key(pre), tuple(int(c) for c in state.board))
+
+
+def act_again(name: str, agent: Any, state: Any, game_config: Any) -> SearchRun:
+    """Another decision of ``agent`` in the same hand, at ``state``, without
+    ``new_hand`` (its root info, played strategies and caches carry over), with
+    the solver captured."""
+    from ..eval.masking import MaskedState
+
+    seat = int(state.current_player)
+    with capture_solvers() as got:
+        rng = np.random.default_rng(0)
+        t0 = time.perf_counter()
+        agent.act(MaskedState(state, seat, game_config, rng), seat, rng)
+        dt = time.perf_counter() - t0
+    if not got:
+        raise RuntimeError(f"{name}: the agent built no solver (did it search?)")
+    return SearchRun(name, got[-1], agent, dict(agent.last_stats), dt)
+
+
+def seed_played(
+    agent: Any,
+    key: tuple,
+    first: StrategySnapshot,
+    match: NodeMatch,
+    trunk: SubgameTree,
+    node: int,
+    seat: int,
+) -> int:
+    """Put the first search's average strategy into ``agent._played`` at every
+    decision of ``seat`` on the root street on the path to trunk node ``node``
+    that it has not played yet (only the first search's own decision is there),
+    so the re-search locks them to it. The path must be in ``first``'s tree
+    exactly. Returns how many were added."""
+    s_index = {n: d for d, n in enumerate(first.dec_nodes.tolist())}
+    added = 0
+    for q in path_nodes(trunk, node):
+        if int(trunk.kind[q]) != DECISION or int(trunk.actor[q]) != seat:
+            continue
+        if int(trunk.street[q]) != trunk.root_street:
+            continue
+        k = (key, trunk.histories[q])
+        if k in agent._played:
+            continue
+        s = match.src_of[q]
+        if s < 0 or match.translated[q]:
+            raise ValueError(f"trunk node {q} is not in the first search's tree exactly")
+        n = int(first.tree.num_children[s])
+        strat = first.sigma[s_index[s], :n].t().contiguous().cpu()
+        agent._played[k] = (first.tree.child_actions(s), strat)
+        added += 1
+    return added
+
+
+@dataclass
+class Research:
+    edge: int  # the trunk node the off-tree opponent action leads to
+    history: tuple  # its history from the street root (ending with that action)
+    stats: dict  # the agent's last_stats
+    seconds: float  # wall time of act()
+    snapshot: StrategySnapshot
+    seeded: int  # played strategies seeded into the agent for its locks
+
+
+def research_offtree(
+    name: str,
+    agent: Any,
+    first: StrategySnapshot,
+    trunk: SubgameTree,
+    state: Any,
+    game_config: Any,
+    engine: Any = None,
+    match: NodeMatch | None = None,
+    log: Callable[[str], None] = print,
+) -> list[Research]:
+    """Re-search with ``agent`` (the one whose first decision at ``state`` gave
+    ``first``) at every first off-tree opponent edge of ``trunk`` on this street
+    (:func:`~pokerbot.search.tree_map.offtree_edges` of ``first``'s tree against
+    the trunk): replay the hand to just after the opponent's action and act
+    again (see the module docstring)."""
+    engine = engine or get_engine()
+    seat = int(state.current_player)
+    m = match_nodes(first.tree, trunk) if match is None else match
+    key = played_key(state)
+    out = []
+    for n in offtree_edges(m, trunk, 1 - seat):
+        hist = tuple(trunk.histories[n])
+        seeded = seed_played(agent, key, first, m, trunk, n, seat)
+        s = replay(engine, game_config, state, hist)
+        if int(s.current_player) != seat:
+            raise ValueError(f"after {hist} seat {int(s.current_player)} acts, not {seat}")
+        run = act_again(f"{name} at {hist}", agent, s, game_config)
+        out.append(
+            Research(n, hist, run.stats, run.seconds, StrategySnapshot.of(run.solver), seeded)
+        )
+        st = run.stats
+        log(
+            f"    {name} re-search after {_show_action(hist[-1])} (history {len(hist)} "
+            f"actions): {st.get('total_seconds', run.seconds):.2f}s, {st.get('iterations')} "
+            f"iterations, {st.get('nodes')} nodes, {seeded} locks seeded"
+        )
+        del run
+        _free()
+    return out
+
+
+def compose_research(
+    base: torch.Tensor,
+    researches: Sequence[Research],
+    trunk_solver: Any,
+    seat: int,
+    strict: bool = False,
+    fallback: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, list[dict]]:
+    """``base`` (a strategy on ``trunk_solver``'s tree) with every decision node
+    at or below each re-search's edge replaced by that re-search's strategy,
+    translated onto the trunk (:func:`~pokerbot.search.tree_map.translate_sigma`
+    restricted to the subtree). Returns it (on ``base``'s device) and one
+    translation report per re-search, with ``path_exact`` (the re-search's tree
+    has the edge's history exactly, as it must) and ``subtree_decision_nodes``."""
+    out = base.clone()
+    tree = trunk_solver.tree
+    d_index = {n: d for d, n in enumerate(trunk_solver.dec_nodes.tolist())}
+    reports = []
+    for r in researches:
+        sub = [x for x in subtree_nodes(tree, r.edge) if x in d_index]
+        m = match_nodes(r.snapshot.tree, tree)
+        sig, rep = translate_sigma(
+            r.snapshot, trunk_solver, seat, strict=strict, fallback=fallback, match=m, nodes=sub
+        )
+        ids = torch.tensor([d_index[x] for x in sub], dtype=torch.long)
+        out[ids] = sig[ids.to(sig.device)].to(out.device, out.dtype)
+        rep["path_exact"] = bool(m.src_of[r.edge] >= 0 and not m.translated[r.edge])
+        rep["subtree_decision_nodes"] = len(sub)
+        reports.append(rep)
+        del sig
+    return out, reports
+
+
+def _show_action(step: Sequence) -> str:
+    _street, player, kind, amount = (int(x) for x in step)
+    what = {0: "fold", 1: "check/call"}.get(kind, f"raise to {amount}")
+    return f"seat {player} {what}"
+
+
+def _research_summary(researches: Sequence[Research], reports: Sequence[dict]) -> dict:
+    secs = [r.stats.get("total_seconds", r.seconds) for r in researches]
+    its = [r.stats.get("iterations") for r in researches]
+    edges = []
+    for r, rep in zip(researches, reports, strict=True):
+        t = r.snapshot.tree
+        edges.append(
+            {
+                "node": r.edge,
+                "history": [list(h) for h in r.history],
+                "action": _show_action(r.history[-1]),
+                "iterations": r.stats.get("iterations"),
+                "nodes": r.stats.get("nodes"),
+                "leaves": int((t.kind == VALUE).sum()),
+                "flop_sizes": flop_sizes(t.street_actions),
+                "total_seconds": r.stats.get("total_seconds", r.seconds),
+                "solve_seconds": r.stats.get("solve_seconds"),
+                "act_seconds": r.seconds,
+                "seeded_locks": r.seeded,
+                "translate": rep,
+            }
+        )
+    fill: Counter = Counter()
+    for rep in reports:
+        fill.update(rep["fill"])
+    return {
+        "count": len(researches),
+        "total_seconds": sum(secs),
+        "mean_seconds": _mean(secs),
+        "mean_iterations": _mean(its),
+        "seeded_locks": sum(r.seeded for r in researches),
+        "subtree_decision_nodes": sum(rep["subtree_decision_nodes"] for rep in reports),
+        "all_paths_exact": all(rep["path_exact"] for rep in reports),
+        "fill": dict(fill),
+        "edges": edges,
+    }
+
+
 # -- one spot -------------------------------------------------------------------------
 
 
@@ -256,7 +506,7 @@ def evaluate_sizes(
     ``predictor_factory()`` gives each search its leaf predictor (``None``: the
     agent loads ``leaf.net`` itself, ``net_path`` when given). ``river_spec``
     defaults to ``blueprint.spec``. ``keep`` (a dict) receives the scoring
-    solver, the snapshots and the sigmas, for tests."""
+    solver, the snapshots, the re-searches and the sigmas, for tests."""
     t_spot = time.perf_counter()
     state = spot.state
     seat = int(state.current_player)
@@ -276,6 +526,7 @@ def evaluate_sizes(
 
     searches: dict[str, dict] = {}
     snaps: dict[str, StrategySnapshot] = {}
+    agents: dict[str, Any] = {}  # first-decision agents of the sizes to re-search
     eval_solver = None
     for name, size, iters in plan:
         cfg = size_config(settings, size, net_path, iters)
@@ -299,6 +550,8 @@ def evaluate_sizes(
         snaps[name] = StrategySnapshot.of(run.solver, "cpu")
         if name == trunk_name:
             eval_solver = scoring_solver(run.solver, settings.eval_max_runouts)
+        elif settings.research and iters is None:
+            agents[name] = run.agent
         del run
         _free()
     assert eval_solver is not None
@@ -317,14 +570,22 @@ def evaluate_sizes(
     bp_sigma, dropped = _blueprint_on(eval_solver, blueprint, game_config)
     t_bp = time.perf_counter() - t_bp
     sigmas: dict[str, torch.Tensor] = {}
+    matches: dict[str, NodeMatch] = {}
     for name, snap in snaps.items():
         t0 = time.perf_counter()
+        matches[name] = match_nodes(snap.tree, ttree)
         sig, rep = translate_sigma(
-            snap, eval_solver, seat, strict=settings.strict, fallback=bp_sigma
+            snap,
+            eval_solver,
+            seat,
+            strict=settings.strict,
+            fallback=bp_sigma,
+            match=matches[name],
         )
         rep["seconds"] = time.perf_counter() - t0
         searches[name]["translate"] = rep
         sigmas[name] = sig.cpu()
+        del sig
         lost = rep["lost_mass"]
         log(
             f"  {name} -> trunk: translated nodes {rep['translated_nodes']['searcher']} / "
@@ -332,11 +593,54 @@ def evaluate_sizes(
             f"{sum(rep['unmatched_nodes'].values())}, lost-mass nodes "
             f"{lost['searcher']['nodes']} / {lost['opponent']['nodes']}"
         )
+
+    # re-searches at the opponent's off-tree flop actions, as in play
+    researched: dict[str, list[Research]] = {}
+    if settings.research:
+        for name, _size, iters in plan:
+            if iters is not None:
+                continue
+            if name not in agents:  # the trunk's own size: nothing is off its tree
+                searches[name]["research"] = _research_summary([], [])
+                continue
+            rs = research_offtree(
+                name,
+                agents.pop(name),
+                snaps[name],
+                ttree,
+                state,
+                game_config,
+                match=matches[name],
+                log=log,
+            )
+            comp, reports = compose_research(
+                sigmas[name], rs, eval_solver, seat, settings.strict, bp_sigma
+            )
+            summary = _research_summary(rs, reports)
+            searches[name]["research"] = summary
+            if rs:
+                sigmas[research_name(name)] = comp
+            if keep is not None:
+                researched[name] = rs
+            del rs, comp
+            log(
+                f"  {name}: {summary['count']} re-searches ({_f(summary['total_seconds'], 1)}s), "
+                f"{summary['subtree_decision_nodes']} trunk decision nodes below them"
+                + ("" if summary["all_paths_exact"] else "; WARNING: a path was not exact")
+            )
+            _free()
     sigmas["blueprint"] = bp_sigma.cpu()
     offtree = offtree_mass(eval_solver, bp_sigma, dropped)
     if keep is not None:
-        keep.update(eval_solver=eval_solver, snaps=snaps, sigmas=sigmas, dropped=dropped)
-    del snaps, trunk, bp_sigma, dropped
+        keep.update(
+            eval_solver=eval_solver,
+            snaps=snaps,
+            sigmas=sigmas,
+            dropped=dropped,
+            researches=researched,
+            matches=matches,
+        )
+    del snaps, trunk, bp_sigma, dropped, researched, agents
     _free()
 
     # scoring
@@ -344,7 +648,11 @@ def evaluate_sizes(
     batch = [settings.river_batch]
     mbb = 1000.0 / float(game_config.big_blind)
     profiles: dict[str, dict] = {}
-    for name in [*searches, "blueprint"]:
+    for name in profile_order(settings):
+        if name not in sigmas:  # a re-searched profile without re-searches: the same
+            base = name[: -len(RESEARCH)]
+            profiles[name] = {**profiles[base], "same_as": base}
+            continue
         res = _score_with_retry(
             batch,
             log,
@@ -466,8 +774,22 @@ def run_size_evaluation(
 # -- markdown -------------------------------------------------------------------------
 
 
+def profile_order(settings: SizeSettings) -> list[str]:
+    """Profile names in report order: per budget size the translated and the
+    re-searched profile, then the fixed-iteration references, then the blueprint."""
+    out = []
+    for name, _size, iters in search_plan(settings):
+        out.append(name)
+        if settings.research and iters is None:
+            out.append(research_name(name))
+    return [*out, "blueprint"]
+
+
 def display_name(name: str) -> str:
-    """``"6000"`` -> ``"6000"``, ``"6000_it300"`` -> ``"6000, 300 it"``."""
+    """``"6000"`` -> ``"6000"``, ``"6000_it300"`` -> ``"6000, 300 it"``,
+    ``"6000_research"`` -> ``"6000, re-searched"``."""
+    if name.endswith(RESEARCH):
+        return f"{name[: -len(RESEARCH)]}, re-searched"
     size, _, it = name.partition("_it")
     return f"{size}, {it} it" if it else name
 
@@ -490,12 +812,13 @@ def flop_sizes(street_actions: Sequence[Sequence]) -> str:
 
 
 def _columns(spots: Sequence[dict]) -> list[str]:
+    """Every profile name but the blueprint's, in first-seen order."""
     cols: list[str] = []
     for s in spots:
         for name in s["profiles"]:
             if name != "blueprint" and name not in cols:
                 cols.append(name)
-    return [*cols, "blueprint"] if spots else cols
+    return cols
 
 
 def _groups(spots: Sequence[dict]) -> list[tuple[str, list[dict]]]:
@@ -511,16 +834,49 @@ def _row(cells: Sequence[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
+def _metric(s: dict, c: str, key: str) -> float | None:
+    p = s["profiles"].get(c)
+    return None if p is None else p[key]
+
+
+def _table(
+    spots: Sequence[dict],
+    cols: Sequence[str],
+    key: str,
+    heads: Sequence[str],
+    base: str | None = None,
+) -> list[str]:
+    """Rows per spot and group means of profile metric ``key`` for ``cols``
+    (headed ``heads``) and the blueprint, plus each column minus ``base``."""
+    diff = [c for c in cols if base is not None and c != base]
+    bhead = heads[list(cols).index(base)] if base in cols else ""
+    head = ["spot", *heads, "blueprint", *[f"{heads[list(cols).index(c)]} - {bhead}" for c in diff]]
+    out = [_row(head), "|---|" + "---:|" * (len(head) - 1)]
+
+    def row(label: str, g: Sequence[dict]) -> str:
+        vals = {c: _mean([_metric(s, c, key) for s in g]) for c in [*cols, "blueprint"]}
+        cells = [label] + [_f(vals[c]) for c in [*cols, "blueprint"]]
+        b = vals.get(base) if base else None
+        cells += [_f(None if vals[c] is None or b is None else vals[c] - b) for c in diff]
+        return _row(cells)
+
+    out += [row(s["label"], [s]) for s in spots]
+    out += [row(name, g) for name, g in _groups(spots)]
+    return out
+
+
 def render_markdown(data: dict) -> str:
     """The report: one-sided and two-sided exploitability per spot and size
-    (mbb/hand) with means, the searches (iterations, seconds, trees), the
-    translation onto the trunk and the scoring details."""
+    (mbb/hand) with means, re-searched and translated, the re-searches, the
+    searches (iterations, seconds, trees), the translation onto the trunk and
+    the scoring details."""
     st = data["settings"]
     meta = data.get("meta", {})
     spots = data["spots"]
     cols = _columns(spots)
-    budget_cols = [c for c in cols if c != "blueprint" and "_it" not in c]
-    base = budget_cols[0] if budget_cols else None
+    res_cols = [c for c in cols if c.endswith(RESEARCH)]
+    tr_cols = [c for c in cols if not c.endswith(RESEARCH)]
+    budget_cols = [c for c in tr_cols if "_it" not in c]
     lines = ["# Flop tree size under a fixed time budget", ""]
     lines.append(
         f"Blueprint `{meta.get('blueprint')}`, leaf model `{meta.get('leaf_model')}`, "
@@ -548,55 +904,88 @@ def render_markdown(data: dict) -> str:
         f"DCFR iterations, {st['mix']:g} uniform mixed into both river ranges), best responses "
         f"backed up through the trunk on the plain root ranges; all-ins over {allin}."
     )
-    groups = _groups(spots)
-
-    def one(s: dict, c: str) -> float | None:
-        p = s["profiles"].get(c)
-        return None if p is None else p["one_sided_mbb"]
-
-    def two(s: dict, c: str) -> float | None:
-        p = s["profiles"].get(c)
-        return None if p is None else p["mbb"]
-
-    diff_cols = [c for c in cols if c not in ("blueprint", base)]
-    lines += [
-        "",
-        "## Best response against the searcher (mbb/hand)",
-        "",
+    if res_cols:
+        lines += [
+            "",
+            "**Re-searched** profiles are what the agent plays: when the opponent takes a flop "
+            "size the search's tree lacks (after a history the tree has), the same agent "
+            "searches again there, with that size forced into its tree, its root info reused "
+            "and its own earlier flop decisions locked to what it played. Below each such "
+            "action the profile is the re-search's strategy; elsewhere the first search's. "
+            "**Translated** profiles answer those sizes with the first search's strategy for "
+            "the nearest size it has. Only off-tree actions are re-searched (the agent also "
+            "re-searches at on-tree decisions, for every size).",
+        ]
+    one_txt = (
         "Best response of the opponent of the player to act against that player's trunk "
         "strategy, in the trunk's game. The game value is the same for every column, so "
-        "differences are exact differences in the searcher's exploitability. Lower is better.",
-        "",
-    ]
-    head = ["spot", *[display_name(c) for c in cols]]
-    head += [f"{display_name(c)} - {base}" for c in diff_cols]
-    lines += [_row(head), "|---|" + "---:|" * (len(head) - 1)]
+        "differences are exact differences in the searcher's exploitability. Lower is better."
+    )
+    two_txt = (
+        "(BR_0 + BR_1) / 2, both players playing the profile. With safe resolving the "
+        "opponent's side carries the gadget's unrefined subgame strategy "
+        "(see docs/value_net_eval.md)."
+    )
 
-    def orow(label: str, g: Sequence[dict]) -> str:
-        vals = {c: _mean([one(s, c) for s in g]) for c in cols}
-        cells = [label] + [_f(vals[c]) for c in cols]
-        b = vals.get(base) if base else None
-        cells += [_f(None if vals[c] is None or b is None else vals[c] - b) for c in diff_cols]
-        return _row(cells)
+    def sizes_of(cs: Sequence[str]) -> list[str]:
+        return [c[: -len(RESEARCH)] if c.endswith(RESEARCH) else display_name(c) for c in cs]
 
-    lines += [orow(s["label"], [s]) for s in spots]
-    lines += [orow(name, g) for name, g in groups]
+    tables = []
+    if res_cols:
+        tables.append(("re-searched (as played)", res_cols))
+    tables.append(("translated only" if res_cols else "", tr_cols))
+    for metric, title, txt in (
+        ("one_sided_mbb", "Best response against the searcher", one_txt),
+        ("mbb", "Two-sided exploitability", two_txt),
+    ):
+        for kind, cs in tables:
+            head = f"## {title}{', ' + kind if kind else ''} (mbb/hand)"
+            base = cs[0] if cs else None
+            lines += ["", head, "", txt, ""]
+            lines += _table(spots, cs, metric, sizes_of(cs), base)
 
-    lines += [
-        "",
-        "## Two-sided exploitability (mbb/hand)",
-        "",
-        "(BR_0 + BR_1) / 2, both players playing the translated search strategy. With safe "
-        "resolving the opponent's side carries the gadget's unrefined subgame strategy "
-        "(see docs/value_net_eval.md).",
-        "",
-    ]
-    head = ["spot", *[display_name(c) for c in cols]]
-    lines += [_row(head), "|---|" + "---:|" * (len(head) - 1)]
-    for s in spots:
-        lines.append(_row([s["label"], *[_f(two(s, c)) for c in cols]]))
-    for name, g in groups:
-        lines.append(_row([name, *[_f(_mean([two(s, c) for s in g])) for c in cols]]))
+    # re-searches
+    names = list(tr_cols)
+    if res_cols:
+        lines += ["", "## Re-searches at off-tree opponent actions", ""]
+        rh = [
+            "spot",
+            "search",
+            "re-searches",
+            "trunk decision nodes below",
+            "mean iterations",
+            "mean s",
+            "total s",
+            "locks seeded",
+            "opponent actions",
+        ]
+        lines += [_row(rh), "|---|---|" + "---:|" * 6 + "---|"]
+        for s in spots:
+            for name in budget_cols:
+                r = s["searches"].get(name, {}).get("research")
+                if r is None:
+                    continue
+                acts = ", ".join(e["action"].split(" ", 2)[-1] for e in r["edges"]) or "-"
+                lines.append(
+                    _row(
+                        [
+                            s["label"],
+                            name,
+                            str(r["count"]),
+                            str(r["subtree_decision_nodes"]),
+                            _f(r["mean_iterations"]),
+                            _f(r["mean_seconds"], 2),
+                            _f(r["total_seconds"], 1),
+                            str(r["seeded_locks"]),
+                            acts,
+                        ]
+                    )
+                )
+        lines += [
+            "",
+            "Each re-search is a full decision of the same agent (tree, setup and solve within "
+            "the flop budget); the opponent actions are raise-to amounts in chips.",
+        ]
 
     # searches
     lines += ["", "## Searches", ""]
@@ -615,7 +1004,6 @@ def render_markdown(data: dict) -> str:
         "own game (mbb)",
     ]
     lines += [_row(th), "|---|---|" + "---:|" * 3 + "---|" + "---:|" * (len(th) - 6)]
-    names = [c for c in cols if c != "blueprint"]
 
     def srow(label: str, name: str, xs: Sequence[dict]) -> str:
         def m(key: str) -> float | None:
@@ -721,9 +1109,9 @@ def render_markdown(data: dict) -> str:
     ]
     lines += [_row(dh), "|---|---|" + "---:|" * (len(dh) - 2)]
     for s in spots:
-        for c in cols:
+        for c in [*cols, "blueprint"]:
             p = s["profiles"].get(c)
-            if p is None:
+            if p is None or p.get("same_as"):
                 continue
             lines.append(
                 _row(
@@ -742,6 +1130,12 @@ def render_markdown(data: dict) -> str:
                     ]
                 )
             )
+    if res_cols:
+        lines += [
+            "",
+            "A re-searched profile without re-searches (the trunk's own size) is the translated "
+            "one and is scored once.",
+        ]
     total = sum(s["seconds"] for s in spots)
     lines += ["", f"{len(spots)} spots, {total / 60:.1f} min of evaluation."]
     if data.get("errors"):
@@ -753,16 +1147,27 @@ def render_markdown(data: dict) -> str:
 __all__ = [
     "DEFAULT_CONFIG",
     "DEFAULT_SIZES",
+    "RESEARCH",
+    "Research",
     "SizeSettings",
+    "act_again",
+    "compose_research",
     "config_path",
     "display_name",
     "evaluate_sizes",
     "flop_sizes",
+    "played_key",
+    "profile_order",
     "render_markdown",
+    "replay",
+    "research_name",
+    "research_offtree",
     "run_size_evaluation",
     "search_name",
     "search_plan",
+    "seed_played",
     "select_spots",
     "size_config",
     "size_overrides",
+    "street_root_state",
 ]
