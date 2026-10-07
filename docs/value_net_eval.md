@@ -489,6 +489,258 @@ at the turn-end net's speed: 19 ms per iteration against 49.
   blueprint ranges, so a per-combo (blocker-aware) output is the next accuracy
   lever. More data alone gives diminishing returns: 4x the data gave -11%.
 
+## Round 2 (2026-10-07)
+
+Branch `claude/value-net-r2`. Raw results are in `runs/vn_eval/r2_*`,
+`runs/tree_size/size3.*` and `runs/value_net/*r2*` / `*v3*` (gitignored). All
+exploitability numbers use the exact-river evaluation above. Unless noted, the
+settings are the six original flop spots, 300 search iterations on the
+6,000-node evaluation trunk (leaves count 1 + k), river solves of 200
+iterations, and the production leaf net `turn_v2w`.
+
+### Correction: the blueprint baseline was mis-scored
+
+* **Cause.** `tree.states[n]` below a chance node is the engine state of the
+  chance *template*: its betting is right, but its board has whatever card the
+  tree builder dealt. The old `spot_eval.blueprint_profile` queried the
+  blueprint with that state. So at 864 of the 888 decision nodes of a typical
+  flop tree, the blueprint played its turn strategy for the wrong turn card.
+* **Scope.** Only the blueprint column of every earlier table above is
+  affected. The searches use the right boards (leaves, rollouts and gadget
+  read `tree.boards`).
+* **Fix.** `tree_policy.blueprint_profile` takes each node's board from
+  `tree.boards`. It also batches every node into a few network calls via
+  `vec_rollouts`: 1–2 s instead of 3–7 s per evaluation tree. A regression
+  test checks that turn nodes are queried on their own board.
+
+| spot | blueprint one-sided, old | **corrected** | blueprint two-sided, old | **corrected** |
+|---|---:|---:|---:|---:|
+| board0 BB first | 1335 | **1082** | 2614 | **1450** |
+| board0 BTN vs check | 4125 | **2025** | 2611 | **1421** |
+| board0 BTN vs 1/2 lead | 3532 | **1151** | 1858 | **632** |
+| board1 BB first | 825 | **446** | 1593 | **993** |
+| board1 BTN vs check | 2391 | **1396** | 1655 | **976** |
+| board1 BTN vs 1/2 lead | 2177 | **1042** | 1553 | **837** |
+| **mean** | 2398 | **1190** | 1981 | **1051** |
+
+The blueprint is about half as exploitable as reported. Value-net search is
+still far less exploitable, but by smaller factors:
+
+* two-sided, unsafe: 101 against 1,051 mbb/hand, about 10x rather than 20x;
+* one-sided, production: 221 against 1,190.
+
+The 12-spot and richer-trunk "better than the blueprint" margins above are
+overstated by a similar factor and have not been re-run.
+
+### 1. Gadget terminate values at the first decision of a street
+
+New `gadget.terminate` modes (`pokerbot/search/README.md`, "Safe resolving
+gadget"):
+
+* `rollouts`: 256 (or more) blueprint-vs-blueprint rollouts, as before;
+* `blueprint`: the opponent's values with both players on the blueprint, computed
+  in the search tree itself with its own net leaves;
+* `blueprint_br`: the opponent's best response to the blueprint there (CFR-D's
+  `T`);
+* `unsafe`: no gadget when no earlier solve is cached.
+
+All modes were searched on one trunk per spot (`eval_search_exploit.py --extra`).
+
+The safety columns use the new per-hand metric (`spot_eval.safety_vs`). For each
+hand the searcher's opponent may hold, it is how much more that hand's best
+response gets against the profile than against the blueprint, in the exact
+game. Safe resolving promises zero for every hand. The excess is weighted by
+the assumed opponent range, or by a uniformly random hand for an opponent
+whose range differs.
+
+**Opponent's best response against the searcher (one-sided), mbb/hand:**
+
+| spot | rollouts 256 (old prod.) | rollouts 4096 | blueprint (tree) | blueprint BR (tree) | **unsafe** | blueprint |
+|---|---:|---:|---:|---:|---:|---:|
+| board0 BB first | 392 | 156 | -11 | 251 | **-97** | 1082 |
+| board0 BTN vs check | 501 | 1161 | 531 | 1132 | **443** | 2025 |
+| board0 BTN vs 1/2 lead | 639 | 1727 | 777 | 889 | **647** | 1151 |
+| board1 BB first | 384 | 27 | -41 | 73 | **-113** | 446 |
+| board1 BTN vs check | 694 | 982 | 251 | 606 | **193** | 1396 |
+| board1 BTN vs 1/2 lead | 868 | 1279 | 257 | 828 | **255** | 1042 |
+| **mean** | 580 | 889 | 294 | 630 | **221** | 1190 |
+
+**Two-sided, safety and cost** (means over the six spots):
+
+| mode | two-sided | excess, assumed range | excess, uniform hand | worst hand | hands worse by > 1% pot | violation in own game (chips) | T seconds | flop iterations in 4 s |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rollouts 256 | 1468 | 139 | 147 | 2563 | 11% | 159 | 0.87 | 141 |
+| rollouts 4096 | 1359 | 216 | 246 | 1876 | 36% | 116 | about 14 | - |
+| blueprint (tree) | 401 | 7.0 | 7.6 | 33 | 4.8% | 19 | 2.62 | 52 |
+| blueprint BR (tree) | 793 | 21 | 24 | 898 | 8.2% | 2.5 | 2.63 | 51 |
+| **unsafe** | **101** | **5.5** | **5.7** | **8** | 4.3% | - | 0 | **190** |
+
+Timing is per production decision (5.8k-node trees, `scripts/time_flop_search.py`,
+12 decisions each on an idle machine). "Worst hand" is the mean over spots of
+the largest per-hand excess.
+
+* **The rollout gadget was the worst option, on strength and on safety.** Its
+  terminate values come from blueprint play to showdown, while the entry values
+  come from the search's own game (net leaves). The two disagree systematically,
+  and 4096 rollouts are no better than 256: this is bias, not noise. Some
+  opponent hands gained 2.5 bb/hand more than against the blueprint.
+* **Terminate values computed in the search tree** remove that mismatch.
+  * `blueprint`: one-sided 294, excess 7 mbb.
+  * `blueprint_br`: almost exactly safe in its own game (violation 0–12
+    chips). In the exact game it is less safe than `blueprint` because of the
+    net's error, and weaker. Loose terminate values let most opponent hands
+    terminate, so the re-solve stops refining against them.
+  * Both cost about 2.6 s of the 4 s budget (a batched blueprint pass over
+    2,572 nodes plus one best-response pass): only about 50 iterations.
+* **Unsafe resolving at the first decision is best on every measure.** At the
+  first flop decision the root ranges are the blueprint's own, so its solve is
+  near-equilibrium against the right range. Per hand it is about as safe as the
+  blueprint (excess 5.5 mbb, uniform 5.7), and it leaves the whole budget to
+  DCFR.
+* **Production change.** `configs/search_value_net.yaml` sets
+  `gadget.terminate: unsafe`. The searcher's own exploitability on these spots
+  falls from 580 to 221 mbb/hand (-62%). On the 6,000-node tree, flop decisions
+  get 190 instead of 141 iterations. Later streets still re-solve safely from
+  the cached solve.
+
+### 2. Blocker-aware turn-end net
+
+`train_turn_net.py --residual-head` (per-combo head with blocker features) on
+`turn_b` + `turn_onpolicy`, 40k steps, same split as `turn_v2w`:
+
+| net | held-out MAE | on-policy rows | exact MAE, on-policy states | exact game value, on-policy | exact MAE, training mix | iterations in 4 s | training time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `turn_v2w` (2048, production) | 0.0258 | 0.0344 | 0.0423 | 0.0125 | 0.0288 | 180 | 9 min |
+| `turn_v2r` (1024 + head) | 0.0281 | 0.0366 | 0.0438 | 0.0127 | 0.0313 | 151 | 29 min |
+| `turn_v2wr` (2048 + head) | 0.0252 | 0.0339 | 0.0420 | 0.0130 | 0.0283 | 149 | 34 min |
+
+"Exact" columns: `check_turn_leaves.py` on the same 400 held-out on-policy
+states as before (and 400 fresh training-mix states), each against all 48
+river subgames solved exactly. River-net fan-out there: 0.0242 and 0.0136.
+
+**Six spots, safe resolving off** (mbb/hand; `runs/vn_eval/r2_turnres6_unsafe.md`):
+
+| | `turn_v2w` | `turn_v2r` | `turn_v2wr` |
+|---|---:|---:|---:|
+| two-sided mean | 101 | 103 | 99 |
+| one-sided mean | 222 | 224 | 221 |
+
+* **The head does not help.** Against exact solves at on-policy states it gains
+  0.7% MAE and loses 4% in game value. Exploitability is unchanged within 2%,
+  and it costs 17% of the flop iterations.
+* **Why.** The turn-end net's targets are bootstrapped from the bucket-level
+  river net, averaged over river cards with exact card removal. A per-combo
+  head can learn only the blocker structure that is in its targets, and these
+  hold little beyond the exact card-removal weights.
+* **What would help.** Blocker-aware *targets*: a residual-head river net for
+  bootstrapping (its 7x inference cost only matters offline), or exact 48-river
+  solves at on-policy states.
+* **Production.** Stays on `turn_v2w`.
+
+### 3. Second on-policy round
+
+(Running. The recording uses the new production search: unsafe first
+decisions, 20000-node flop trees and `turn_v2w`. It is followed by
+`river_v3`, the turn data relabelled with it, and `turn_v3w`. Results to
+follow.)
+
+### 4. Production tree size
+
+`scripts/eval_tree_size.py` (`runs/tree_size/size3.md`) setup:
+
+* **Searches.** Production searches (turn-end net, one-row leaves, unsafe first
+  decision) at `max_nodes` 6000 / 10000 / 20000, under the 4 s flop budget.
+* **Spots.** board0 BB first, board0 BTN vs check, board1 BB first.
+* **Trunk.** The 20000-node tree: 18,294 nodes, 2,009 leaves, and the blueprint's
+  whole flop abstraction (opens 0.25 to 2 pot, the pot re-raise, all-in). The
+  smaller trees keep subsets of its sizes; the turn is the same in all.
+* **Translated.** A smaller tree's strategy is put on the trunk with
+  `tree_map.translate_sigma`. An opponent size it lacks maps to its nearest size
+  (pseudo-harmonic), for 68% (6000) / 54% (10000) of trunk nodes. This is
+  pessimistic: it answers a 0.25-pot bet as if it were 0.75.
+* **Re-searched.** The same agent searches again at every off-tree opponent flop
+  action, with that size forced into its tree and its own earlier decisions
+  locked, as it does in play: 5 re-searches per spot at 6000, 4 at 10000.
+  These columns are the ones to compare.
+
+**Mean over the three spots** (mbb/hand; one-sided = opponent's best response
+against the searcher):
+
+| flop tree | nodes | leaves | iterations in 4 s | one-sided, re-searched | one-sided, translated | two-sided, re-searched | own game |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 6000 (old production) | 5,802 | 637 | 188 | 209 | 966 | 677 | 16 |
+| 10000 | 8,478 | 931 | 159 | 221 | 585 | 482 | 57 |
+| **20000** | 18,294 | 2,009 | **65** | **147** | 147 | **186** | 103 |
+| blueprint | | | | 2,878 | 2,878 | 2,987 | |
+
+| spot | 6000 | 10000 | 20000 | 20000 - 6000 |
+|---|---:|---:|---:|---:|
+| board0 BB first (one-sided / two-sided) | -26 / 707 | -0 / 494 | -107 / 178 | -81 / -529 |
+| board0 BTN vs check | 673 / 548 | 664 / 400 | 595 / 168 | -78 / -381 |
+| board1 BB first | -20 / 776 | -0 / 551 | -47 / 213 | -27 / -563 |
+
+* **Richer trees beat more iterations.** The 20000 tree gets only 65 DCFR
+  iterations (54 ms each against 19) and is the least converged in its own
+  game. Even so, it is the least exploitable searcher in all three spots:
+  * one-sided, 30% below the 6000 tree;
+  * two-sided, 73% below;
+  * 10000 sits in between on two-sided and level with 6000 on one-sided.
+* **Production change.** `tree.max_nodes_flop: 20000` (new option) gives flop
+  searches the whole flop abstraction. Turn and river trees keep
+  `max_nodes: 6000`, since this test covers flop decisions only.
+* **Caveat.** The trunk itself keeps the turn's all-in-only opening
+  (see `keep_open` below), so turn bet sizing is untested here.
+* The blueprint is far more exploitable on this richer trunk (2,878 one-sided
+  against 1,190 on the coarse trunk): the best responder gets every flop size
+  too.
+
+### 5. Head-to-head
+
+(Queued: 10,000 hands against the blueprint with the final production config.)
+
+### 6. Turn-start net and batched turn solves (stretch)
+
+Code and CPU tests only so far; design and measurements are in
+`docs/turn_start_net.md`.
+
+* `BatchTurnSolver` (`search/batch_turn_solver.py`) solves B turn subgames
+  with turn-end-net leaves and exact river-averaged all-ins. Per instance it
+  matches `RangeSolver` to 1e-13.
+* The turn-start data pipeline (`scripts/gen_turn_start_data.py`) and
+  `TurnStartPredictor` (`kind: turn_start`).
+* `FlopEndLeafEvaluator` averages a turn-start net over the 49 turn cards.
+* `tree.depth_streets_turn` and `leaf.turn_net` give depth-limited turn
+  solves with turn-end-net leaves. `configs/search_turn_start.yaml` is the
+  flop `depth_streets: 0` setup.
+* GPU data generation and training are queued after the second on-policy
+  round, so they can bootstrap from the better turn-end net.
+
+### Other changes
+
+* **Lock fix** (`agent.played_lock`). When a re-search's forced off-tree branch
+  pushes the budget into dropping one of our earlier played sizes, the played
+  strategy used to be renormalised over the remaining actions. That inflated
+  the action we took and distorted our range below it. Now the action taken
+  keeps its exact probability.
+* **`tree.keep_open`** (off). With the blueprint's spec, the node budget drops
+  the turn's 1.0 open before its 1.0 re-raise (a tie in the drop order). So at
+  every flop-search budget the turn's only opening bet is all-in.
+  * `keep_open` drops the re-raise instead.
+  * At the 6000 / 10000 / 20000 budgets that gives 3,108 / 6,066 / 16,122
+    nodes with fewer flop sizes.
+  * Evaluating it needs a scoring trunk with turn opens (34k nodes, 4,655
+    leaves).
+* **Tooling.**
+  * `spot_eval`: `--extra NAME=JSON` variants on one trunk, `--no-rollout`, and
+    the per-hand safety table.
+  * `scripts/time_flop_search.py`: production decision timing.
+  * `scripts/eval_tree_size.py`: tree size under a time budget, translated and
+    re-searched (`search/tree_map.py`, `search/size_eval.py`).
+  * `check_turn_leaves.py` compares several turn nets on one set of exact
+    solves.
+  * `label_turn_states.py --shards` relabels existing turn data with a new
+    river net, about 7x faster than regenerating it.
+
 ## What worked, what didn't
 
 **Worked**
