@@ -43,3 +43,4 @@ search:
     safe: true
     prior_mix: 0.05
     rollouts: 256
+    terminate: unsafe       # as configs/search_value_net.yaml: no gadget without a cached solve
