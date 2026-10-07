@@ -639,10 +639,58 @@ river subgames solved exactly. River-net fan-out there: 0.0242 and 0.0136.
 
 ### 3. Second on-policy round
 
-(Running. The recording uses the new production search: unsafe first
-decisions, 20000-node flop trees and `turn_v2w`. It is followed by
-`river_v3`, the turn data relabelled with it, and `turn_v3w`. Results to
-follow.)
+ReBeL style: record the leaf states the current production search queries,
+solve them exactly, retrain, and re-bootstrap (`runs/value_net/r2_onpolicy.cmd`).
+
+* **Recording.** The new production search (unsafe first decisions,
+  20000-node flop trees, `turn_v2w`) played 300 duplicate deals against the
+  blueprint, seeds new. It recorded 8 turn-end leaves every 7 regret updates:
+  76,880 turn-end states from 407 flop searches. Two random river cards each
+  gave 153,747 river subgames, solved exactly at 300 iterations (mean
+  exploitability 0.14% of the pot). A held-out set of 40 other deals gave
+  8,760 turn states and 17,520 river samples at 400 iterations.
+* **`river_v3`.** `river_a` + `river_b` + both on-policy rounds: 1.0M samples,
+  same architecture and 40k steps as `river_v2`.
+* **Turn data.** `turn_b`'s 1.5M states relabelled with `river_v3`
+  (`label_turn_states.py --shards`, 12 min instead of 99 for new data), plus
+  both rounds' on-policy turn states (113k).
+* **`turn_v3w`.** 2048 wide, no head, 40k steps.
+
+**River net on fixed held-out data** (46.5k samples including both rounds'
+on-policy held-out; pot units):
+
+| | MAE | on-policy MAE | on-policy game value | blueprint ranges MAE |
+|---|---:|---:|---:|---:|
+| `river_v2` | 0.0347 | 0.0384 | 0.0103 | 0.0205 |
+| `river_v3` | 0.0343 | 0.0377 | 0.0101 | 0.0207 |
+
+**Turn-end leaves against exact 48-river solves** (400 held-out on-policy
+states per round; pot units):
+
+| states | model | MAE | game value |
+|---|---|---:|---:|
+| round 1 (old production search) | river net fan-out, v2 / v3 | 0.0242 / 0.0240 | 0.0067 / 0.0066 |
+| round 1 | `turn_v2w` / **`turn_v3w`** | 0.0423 / 0.0419 | 0.0125 / 0.0127 |
+| round 2 (new production search) | river net fan-out, v3 | 0.0197 | 0.0053 |
+| round 2 | `turn_v2w` / **`turn_v3w`** | 0.0371 / **0.0354** | 0.0109 / **0.0100** |
+
+**Six spots, unsafe** (mbb/hand; `runs/vn_eval/r2_onpolicy6_unsafe.md`):
+`turn_v3w` scores 99 two-sided and 219 one-sided, against 101 and 222 for
+`turn_v2w`. It is better or equal in every spot, with the same per-hand excess
+over the blueprint (5.4 mbb).
+
+* **A small gain.** On the states today's production search queries,
+  `turn_v3w` cuts the leaf error by 5% (game value 8%); exploitability falls 2%.
+  `configs/search_value_net.yaml` now uses `turn_v3w`.
+* **The river net has saturated in this form.** 18% more data, all of it
+  on-policy, gave -2% at on-policy states. Its on-policy bucket-oracle floor
+  is 0.015.
+* **The turn-end net is about twice the river fan-out's error** at the same
+  states (0.035 against 0.020). That gap is its own fit to the bootstrapped
+  targets, not the river net.
+* **The new production states are easier.** Round-2 leaf states, from 20000-node
+  flop trees with unsafe first decisions, show lower errors for every model
+  than round 1's.
 
 ### 4. Production tree size
 
