@@ -17,11 +17,20 @@ from .tree import LEAF_MODES, TreeConfig
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "search_default.yaml"
 
 
+GADGET_TERMINATE = ("rollouts", "blueprint", "blueprint_br", "unsafe")
+
+
 @dataclass
 class GadgetConfig:
     safe: bool = True
     prior_mix: float = 0.05  # uniform mixed into the opponent prior at the gadget
     rollouts: int = 256  # blueprint rollouts for terminate values when nothing is cached
+    # terminate values when no earlier solve is cached (the first decision of a street):
+    # "rollouts": blueprint-vs-blueprint rollouts (``rollouts`` of them); "blueprint": the
+    # opponent's values with both players on the blueprint, in the search tree with its own
+    # leaves; "blueprint_br": the opponent's best response to the blueprint there;
+    # "unsafe": no gadget at such decisions (the root ranges are the blueprint's own)
+    terminate: str = "rollouts"
 
 
 @dataclass
@@ -97,6 +106,10 @@ def search_config(data: dict | str | Path | None = None, **overrides: Any) -> Se
     tcfg = _sub(TreeConfig, tree, TreeConfig(spec=spec))
     scfg = _sub(SolverConfig, data.pop("solver", None))
     gcfg = _sub(GadgetConfig, data.pop("gadget", None))
+    if gcfg.terminate not in GADGET_TERMINATE:
+        raise ValueError(
+            f"unknown gadget.terminate {gcfg.terminate!r} (expected one of {GADGET_TERMINATE})"
+        )
     tb = data.pop("time_budget", None)
     cfg = _sub(SearchConfig, data)
     if tb is not None:

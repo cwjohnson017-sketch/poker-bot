@@ -306,15 +306,21 @@ class RangeSolver:
         self.avoid = avoids_card(dev).to(self.dtype)
         self._levels()
         self.terminals = terminals or TerminalEvaluator(tree, self.cfg, rollouts, value_leaves)
-        self.gadget = gadget
-        if gadget is not None:
-            self.g_prior = gadget.prior.to(dev, self.dtype) * root_valid
-            self.g_term = gadget.terminate.to(dev, self.dtype)
-            self.g_regret = torch.zeros(2, C, device=dev, dtype=self.dtype)
-            self.g_enter = torch.full((C,), 0.5, device=dev, dtype=self.dtype)
+        self.set_gadget(gadget)
         self.t = 0
         self.iterations_done = 0
         self.solve_time = 0.0
+
+    def set_gadget(self, gadget: Any) -> None:
+        """Attach the safe-resolving gadget (or ``None``) before solving, e.g. once
+        its terminate values have been computed on this solver's own tree."""
+        self.gadget = gadget
+        if gadget is not None:
+            dev = self.device
+            self.g_prior = gadget.prior.to(dev, self.dtype) * self.board_valid_root
+            self.g_term = gadget.terminate.to(dev, self.dtype)
+            self.g_regret = torch.zeros(2, C, device=dev, dtype=self.dtype)
+            self.g_enter = torch.full((C,), 0.5, device=dev, dtype=self.dtype)
 
     # -- setup --------------------------------------------------------------
 

@@ -271,20 +271,6 @@ def test_incremental_reach_rollouts_match_history_replay(tiny_neural_run, one_th
     assert checked >= 6
 
 
-@pytest.fixture(scope="module")
-def tiny_distilled_run(tiny_neural_run, tmp_path_factory):
-    from pokerbot.blueprint.deepcfr.distill import DistillConfig, distill
-
-    out = tmp_path_factory.mktemp("distilled")
-    threads = torch.get_num_threads()
-    try:
-        cfg = DistillConfig(rows=3000, n_envs=64, steps=40, batch=256, holdout=0.1)
-        distill(tiny_neural_run, out, cfg, device="cpu", log=None)
-    finally:
-        torch.set_num_threads(threads)
-    return out
-
-
 def test_lockstep_rollout_policies_match_policy_matrix(tiny_distilled_run, one_thread):
     """The lockstep rollouts' per-step range policy (VecNLHE slots replayed to
     the state) equals the scalar path's policy_matrix at the same states."""

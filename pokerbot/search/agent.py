@@ -46,10 +46,12 @@ from .gadget import (
     history_key,
     mixed_prior,
     normalise_entry,
+    tree_terminate_values,
 )
 from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
 from .tree import LEAF, VALUE, TreeBuilder
+from .tree_policy import blueprint_profile
 from .value_leaf import make_leaf_evaluator
 
 
@@ -227,9 +229,18 @@ class SearchAgent(BaseAgent):
             config, state.button, board, pre, cur, cfg.tree, seat, engine, self.device
         ).build()
         t_tree = time.perf_counter()
-        gadget = None
+        # safe resolving: terminate values from the previous street's solve (continual
+        # resolving), or computed once per street root as gadget.terminate says
+        mode = "off"  # stats: where this decision's terminate values come from
+        compute = None
+        t_term = 0.0
         if cfg.gadget.safe:
-            if info["terminate"] is None:
+            if info["terminate"] is None and info.get("terminate_source") is None:
+                compute = cfg.gadget.terminate
+                info["terminate_source"] = compute
+            mode = info.get("terminate_source") or "cache"
+            if compute == "rollouts":
+                t_term = time.perf_counter()
                 info["terminate"] = blueprint_terminate_values(
                     tree.states[0],
                     board,
@@ -242,12 +253,7 @@ class SearchAgent(BaseAgent):
                     self.device,
                     cfg.seed,
                 )
-            prior = mixed_prior(
-                info["ranges"][1 - seat], valid_mask(board, self.device), cfg.gadget.prior_mix
-            )
-            if cfg.remove_own_blockers:
-                prior = prior * valid_mask(state.hole_cards(seat), self.device)
-            gadget = Gadget(1 - seat, prior, info["terminate"])
+                t_term = time.perf_counter() - t_term
         t_leaf = time.perf_counter()
         rollouts = None
         value_leaves = None
@@ -260,8 +266,24 @@ class SearchAgent(BaseAgent):
         t_leaf = time.perf_counter() - t_leaf
         locks = self._locks(tree, key, seat)
         solver = RangeSolver(
-            tree, info["ranges"], cfg.solver, rollouts, gadget, locks, value_leaves=value_leaves
+            tree, info["ranges"], cfg.solver, rollouts, None, locks, value_leaves=value_leaves
         )
+        if compute in ("blueprint", "blueprint_br"):
+            # terminate values in this tree's own game: the opponent against the blueprint
+            t0_term = time.perf_counter()
+            sigma_bp = blueprint_profile(solver, self.blueprint, config)[0]
+            info["terminate"] = tree_terminate_values(
+                solver, sigma_bp, 1 - seat, best_response=compute == "blueprint_br"
+            )
+            del sigma_bp
+            t_term = time.perf_counter() - t0_term
+        if info["terminate"] is not None and cfg.gadget.safe:  # "unsafe": no gadget here
+            prior = mixed_prior(
+                info["ranges"][1 - seat], valid_mask(board, self.device), cfg.gadget.prior_mix
+            )
+            if cfg.remove_own_blockers:
+                prior = prior * valid_mask(state.hole_cards(seat), self.device)
+            solver.set_gadget(Gadget(1 - seat, prior, info["terminate"]))
         t_setup = time.perf_counter()
         solver.solve(iterations=min(cfg.min_iterations, cfg.solver.iterations))
         left = cfg.budget(street) - (time.perf_counter() - t0)
@@ -295,6 +317,8 @@ class SearchAgent(BaseAgent):
             "total_seconds": t_end - t0,
             "cached_root": info["cached"],
             "cache_entries": stored,
+            "gadget": mode,
+            "terminate_seconds": t_term,
         }
         self.stats.append(self.last_stats)
         return to_action(engine, kind, amount)
