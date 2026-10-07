@@ -19,6 +19,8 @@ error, overall, per source and per pot bin.
 
 python scripts/check_turn_leaves.py --river-net runs/value_net/river_v1.pt \
     --turn-net runs/value_net/turn_v1.pt --blueprint runs/dcfr4_distilled_v2 --states 320
+
+--turn-net may be repeated: every net is scored on the same exact solves.
 """
 
 from __future__ import annotations
@@ -123,7 +125,9 @@ def summarise(st: dict, sel: torch.Tensor) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--river-net", required=True)
-    ap.add_argument("--turn-net")
+    ap.add_argument(
+        "--turn-net", action="append", default=[], help="turn-end net (repeat to compare)"
+    )
     ap.add_argument("--blueprint", required=True)
     ap.add_argument(
         "--states-file",
@@ -180,9 +184,11 @@ def main(argv: list[str] | None = None) -> int:
     river = load_leaf_predictor(args.river_net, dev)
     rv = river_average(river, states["boards"], c_used, states["stack"], ranges.transpose(0, 1))
     preds["river net x 44 rivers"] = to_ev(rv.transpose(0, 1), ranges, c_used)
-    if args.turn_net:
-        turn = load_leaf_predictor(args.turn_net, dev)
-        preds["turn-end net"] = turn.predict(states["boards"], ranges, c_used, states["stack"])
+    for path in args.turn_net:
+        turn = load_leaf_predictor(path, dev)
+        name = "turn-end net" if len(args.turn_net) == 1 else f"turn-end net {Path(path).stem}"
+        preds[name] = turn.predict(states["boards"], ranges, c_used, states["stack"])
+        del turn
     src = states["source"].cpu()
     cb = torch.bucketize(c_used.cpu(), torch.tensor(POT_BINS[1:]), right=True)
     report: dict = {"states": args.states, "iterations": args.iterations, "models": {}}
