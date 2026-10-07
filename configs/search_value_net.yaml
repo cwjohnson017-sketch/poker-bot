@@ -35,7 +35,7 @@ search:
 
   leaf:
     mode: value_net
-    net: runs/value_net/turn_v2w.pt
+    net: runs/value_net/turn_v3w.pt    # turn-end net, round 2 (docs/value_net_eval.md, 2026-10-07)
     net_every: 1
 
   gadget:
