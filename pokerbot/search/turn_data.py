@@ -181,10 +181,13 @@ def make_turn_states(
     c_range: tuple[int, int] = (vr.C_MIN, vr.C_MAX),
     stats: dict[str, float] | None = None,
     log: Callable[[str], Any] | None = None,
+    turn_start: bool = False,
 ) -> dict[str, torch.Tensor]:
     """``n`` turn-end states (CPU): ``boards [n, 4]``, ``c``, ``stack``,
     ``ranges`` and ``source``, in source order (self-play, perturbed, random).
-    ``bp`` may be ``None`` when ``mix`` has no self-play share."""
+    ``bp`` may be ``None`` when ``mix`` has no self-play share. ``turn_start``
+    stops self-play at the turn root instead (turn-start states,
+    :mod:`.turn_start_data`); the random states are the same either way."""
     dev = torch.device(device)
     n_sp, n_pert, n_rand = mix_counts(n, mix)
     game = vr._game(game_config)
@@ -203,7 +206,8 @@ def make_turn_states(
             n_envs=n_envs,
             stats=stats,
             log=log,
-            turn_end=True,
+            turn_end=not turn_start,
+            turn_start=turn_start,
         )
         src = torch.full((n_sp + n_pert,), SOURCE_SELFPLAY, dtype=torch.uint8)
         ranges = sp["ranges"]

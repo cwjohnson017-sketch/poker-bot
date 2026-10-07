@@ -48,9 +48,10 @@ def _config(bp):
     )
 
 
-def _check_against_range_reach(bp, config, states, atol):
+def _check_against_range_reach(bp, config, states, atol, street=3):
     """Every sample's ranges equal range_reach replayed on its history, and the
-    replayed state is the river root with the sample's c and stack."""
+    replayed state is the river root (the root of ``street``) with the sample's
+    c and stack."""
     engine = get_engine()
     m = states["ranges"].shape[0]
     for i in range(m):
@@ -60,8 +61,8 @@ def _check_against_range_reach(bp, config, states, atol):
         for j in range(int(states["hist_len"][i])):
             kind = int(states["hist_kind"][i, j])
             state.apply(to_action(engine, kind, int(states["hist_amount"][i, j])))
-        assert not state.is_terminal and int(state.street) == 3
-        assert all(int(s) < 3 for s, _p, _a in state.history)
+        assert not state.is_terminal and int(state.street) == street
+        assert all(int(s) < street for s, _p, _a in state.history)
         contrib = contributions(state, config)
         assert contrib[0] == contrib[1] == int(states["c"][i])
         assert min(int(s) for s in state.stacks) == int(states["stack"][i]) > 0
@@ -103,6 +104,31 @@ def test_lockstep_ranges_match_range_reach(tiny_distilled_run, one_thread):
     _check_against_range_reach(bp, config, states, atol=1e-6)
 
 
+def test_lockstep_turn_start_states(tiny_distilled_run, one_thread):
+    """turn_start=True: hands stopped at the turn root, 4-card boards."""
+    bp = make_blueprint(f"neural:{tiny_distilled_run}")
+    config = _config(bp)
+    stats = {}
+    states = vrg.selfplay_river_states(
+        bp,
+        config,
+        8,
+        device="cpu",
+        seed=4,
+        explore=0.1,
+        n_envs=256,
+        replay_chunk=4,
+        stats=stats,
+        turn_start=True,
+    )
+    assert states["boards"].shape == (8, 4)
+    _check_shapes(states, 8, 2000)
+    assert stats["hands"] == stats["kept"] + stats["folded"] + stats["allin"]
+    _check_against_range_reach(bp, config, states, atol=1e-6, street=2)
+    with pytest.raises(ValueError, match="exclusive"):
+        vrg.selfplay_river_states(bp, config, 1, turn_end=True, turn_start=True)
+
+
 def _passive_blueprint():
     """A card-dependent blueprint without the lockstep path that mostly checks
     and calls (so most hands reach the river) and never gives an action zero
@@ -130,6 +156,20 @@ def test_scalar_path_matches_range_reach():
     _check_shapes(states, 4, 10000)
     assert stats["hands"] == stats["kept"] + stats["folded"] + stats["allin"]
     _check_against_range_reach(bp, config, states, atol=1e-7)
+
+
+def test_scalar_turn_start_states():
+    bp = _passive_blueprint()
+    config = get_engine().GameConfig(
+        num_players=2, stacks=[10000, 10000], small_blind=50, big_blind=100
+    )
+    stats = {}
+    states = vrg.selfplay_river_states(
+        bp, config, 4, seed=6, explore=0.2, stats=stats, turn_start=True
+    )
+    assert states["boards"].shape == (4, 4)
+    _check_shapes(states, 4, 10000)
+    _check_against_range_reach(bp, config, states, atol=1e-7, street=2)
 
 
 def test_uniform_blueprint_gives_uniform_ranges():
