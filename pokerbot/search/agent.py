@@ -237,8 +237,9 @@ class SearchAgent(BaseAgent):
         if cfg.gadget.safe:
             if info["terminate"] is None and info.get("terminate_source") is None:
                 compute = cfg.gadget.terminate
+            mode = compute or info.get("terminate_source") or "cache"
+            if compute == "unsafe":
                 info["terminate_source"] = compute
-            mode = info.get("terminate_source") or "cache"
             if compute == "rollouts":
                 t_term = time.perf_counter()
                 info["terminate"] = blueprint_terminate_values(
@@ -253,6 +254,7 @@ class SearchAgent(BaseAgent):
                     self.device,
                     cfg.seed,
                 )
+                info["terminate_source"] = compute
                 t_term = time.perf_counter() - t_term
         t_leaf = time.perf_counter()
         rollouts = None
@@ -275,6 +277,7 @@ class SearchAgent(BaseAgent):
             info["terminate"] = tree_terminate_values(
                 solver, sigma_bp, 1 - seat, best_response=compute == "blueprint_br"
             )
+            info["terminate_source"] = compute
             del sigma_bp
             t_term = time.perf_counter() - t0_term
         if info["terminate"] is not None and cfg.gadget.safe:  # "unsafe": no gadget here
