@@ -67,6 +67,7 @@ class TreeConfig:
     spec: ActionSpec = DEFAULT_SPEC
     depth_streets: int = 1  # streets beyond the current one; the river is always solved fully
     max_nodes: int = 40000
+    max_nodes_flop: int | None = None  # node budget of trees rooted on the flop (None: max_nodes)
     chance_cards: int | None = None  # None: every card; int: subsample per chance node
     min_chance_cards: int = 4  # floor when the budget forces subsampling
     num_continuations: int = 4  # k continuation strategies at depth-limit leaves
@@ -314,6 +315,8 @@ class TreeBuilder:
     def build_skeleton(self) -> _Skel:
         """Skeleton within the node budget (see module docstring)."""
         budget = int(self.tc.max_nodes)
+        if self.root_street == 1 and self.tc.max_nodes_flop is not None:
+            budget = int(self.tc.max_nodes_flop)
         sk = self._skeleton()
         streets = list(range(self.last_street, self.root_street - 1, -1))
 

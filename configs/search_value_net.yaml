@@ -18,7 +18,12 @@ search:
   tree:
     actions: blueprint      # the blueprint's own abstraction (dcfr4: 12 actions per street)
     depth_streets: 1        # flop solves: flop + turn, value-net leaves at the end of the turn
-    max_nodes: 6000         # value-net leaves count 1 node each
+    max_nodes: 6000         # turn and river trees (to showdown); value-net leaves count 1 node
+    # flop trees: 20000 keeps the blueprint's whole flop abstraction (18.3k nodes, 2,009
+    # leaves, about 65 DCFR iterations in 4 s). On 3 spots scored on that trunk it beat
+    # 6000 (186 iterations) and 10000 (158) even with re-searches of off-tree sizes
+    # (docs/value_net_eval.md, 2026-10-07)
+    max_nodes_flop: 20000
     chance_cards: null
     min_chance_cards: 4
 

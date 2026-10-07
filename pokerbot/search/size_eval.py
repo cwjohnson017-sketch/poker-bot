@@ -209,7 +209,7 @@ def size_overrides(
         "seed": settings.seed,
     }
     o = _merge(o, settings.search)
-    o = _merge(o, {"tree": {"max_nodes": int(max_nodes)}})
+    o = _merge(o, {"tree": {"max_nodes": int(max_nodes), "max_nodes_flop": int(max_nodes)}})
     if iters is None:
         o = _merge(o, {"time_budget": {"flop": float(settings.budget)}})
     else:

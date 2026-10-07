@@ -89,7 +89,8 @@ showdown. At the limit a `LEAF` sits where the next street's card would be
 dealt. It is a decision of the leaf chooser (the searcher's opponent) among
 `k` `CONTINUATION` children.
 
-**Node budget** (`max_nodes`). The skeleton gives exact expanded counts
+**Node budget** (`max_nodes`; `max_nodes_flop` for trees rooted on the flop,
+when set). The skeleton gives exact expanded counts
 cheaply, so the builder reduces the abstraction until the count fits. It
 first drops bet sizes deepest street first, farthest from pot-sized first,
 down to one size per street. Then it lowers raise caps deepest-first, then

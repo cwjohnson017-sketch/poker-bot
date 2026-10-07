@@ -124,3 +124,23 @@ def test_keep_open_drops_the_reraise_on_a_tie():
         assert tree.num_nodes <= budget
     assert kept[False] == [("raise", 1.0, "reraise")]
     assert kept[True] == [("raise", 1.0, "open")]
+
+
+def test_max_nodes_flop_sets_the_flop_budget_only():
+    engine = get_engine()
+    cfg = engine.GameConfig()
+    s = _flop(engine, cfg)
+    small, big = 3000, 20000
+    flop = build_tree(
+        cfg, s.button, s.board, s.history, TreeConfig(max_nodes=small, max_nodes_flop=big)
+    )
+    plain = build_tree(cfg, s.button, s.board, s.history, TreeConfig(max_nodes=big))
+    assert flop.num_nodes == plain.num_nodes > small
+    t = s.clone()
+    t.apply(engine.Action.check_call())
+    t.apply(engine.Action.check_call())  # the turn
+    assert int(t.street) == 2
+    turn = build_tree(
+        cfg, t.button, t.board, t.history, TreeConfig(max_nodes=small, max_nodes_flop=big)
+    )
+    assert turn.num_nodes <= small
