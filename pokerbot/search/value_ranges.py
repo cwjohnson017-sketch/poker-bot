@@ -149,6 +149,7 @@ def selfplay_river_states(
     max_hands: int | None = None,
     log: Callable[[str], Any] | None = None,
     turn_end: bool = False,
+    turn_start: bool = False,
 ) -> dict[str, torch.Tensor]:
     """``n`` river-root states from blueprint self-play (see the module docstring).
 
@@ -159,8 +160,14 @@ def selfplay_river_states(
     the hands played (default ``1000 * n + 100000``): a blueprint that never
     reaches the river raises instead of looping forever. ``turn_end`` stops at
     the end of turn betting instead: 4-card boards, ranges masked by them only.
+    ``turn_start`` stops at the **turn root** (after the turn card, before any
+    turn action; kept when it is reached without an all-in): 4-card boards,
+    ``c`` and ``stack`` there, and the history up to the turn root.
     """
-    nb = 4 if turn_end else 5
+    if turn_end and turn_start:
+        raise ValueError("turn_end and turn_start are exclusive")
+    nb = 4 if turn_end or turn_start else 5
+    stop = 2 if turn_start else 3  # the street whose root ends play
     stats = stats if stats is not None else {}
     stats.update({k: v for k, v in _new_stats().items() if k not in stats})
     t0 = time.time()
@@ -172,16 +179,16 @@ def selfplay_river_states(
         return _empty_states(nb)
     if _lockstep_ok(bp):
         hands = _play_lockstep(
-            bp, game_config, n, dev, seed, explore, n_envs, bf16, stats, max_hands, log
+            bp, game_config, n, dev, seed, explore, n_envs, bf16, stats, max_hands, log, stop
         )
         t1 = time.time()
         stats["phase1_s"] += t1 - t0
         out = _replay_ranges(
-            bp, game_config, hands, dev, bf16, replay_chunk, slots_per_call, stats, nb
+            bp, game_config, hands, dev, bf16, replay_chunk, slots_per_call, stats, nb, stop
         )
         stats["phase2_s"] += time.time() - t1
     else:
-        out = _play_scalar(bp, game_config, n, seed, explore, stats, max_hands, nb)
+        out = _play_scalar(bp, game_config, n, seed, explore, stats, max_hands, nb, stop)
     stats["seconds"] += time.time() - t0
     return out
 
@@ -234,10 +241,11 @@ def _play_lockstep(
     stats: dict[str, float],
     max_hands: int,
     log: Callable[[str], Any] | None,
+    stop_street: int = 3,
 ) -> dict[str, torch.Tensor]:
     """Phase 1: lockstep self-play with one network row per decision (the
     actor's actual hand). Returns the deal and abstract actions of ``n`` hands
-    that reach the river root without an all-in.
+    that reach the river root (the root of ``stop_street``) without an all-in.
 
     Hands are numbered when dealt. Once ``n`` are kept no new hands are dealt,
     the hands in progress are played out, and the first ``n`` kept hands in
@@ -271,7 +279,7 @@ def _play_lockstep(
     counted = torch.zeros(env.n, dtype=torch.bool, device=dev)  # finished hand already counted
     while True:
         live = ~env.done
-        root = live & (env.street == 3)  # just reached the river root: record and stop
+        root = live & (env.street == stop_street)  # just reached the root: record and stop
         finished = (env.done & ~counted) | root
         if bool(finished.any()):
             ridx = root.nonzero().squeeze(1)
@@ -429,10 +437,12 @@ def _replay_ranges(
     slots_per_call: int,
     stats: dict[str, float],
     board_cards: int = 5,
+    stop_street: int = 3,
 ) -> dict[str, torch.Tensor]:
     """Phase 2: replay the kept hands in lockstep and build both players'
     1326-combo reach from the policy columns of the actions taken (states on
-    the first ``board_cards`` board cards: 5 at the river root, 4 at turn end)."""
+    the first ``board_cards`` board cards: 5 at the river root, 4 at turn end
+    or at the turn root, ``stop_street = 2``)."""
     agent = bp.agent
     spec = agent.spec
     fc = agent.features
@@ -460,17 +470,19 @@ def _replay_ranges(
         if bank is not None:  # flop and turn columns of every hand in one lookup
             keys = []
             for b in boards.tolist():
-                keys += [(1, tuple(b[:3])), (2, tuple(b[:4]))]
+                keys += [(1, tuple(b[:3]))]
+                if stop_street > 2:  # turn decisions are replayed
+                    keys += [(2, tuple(b[:4]))]
             bank.fill(keys)
         j = 0
         while ids.numel():
             fin = L[ids] == j
             if bool(fin.any()):
                 f = fin.nonzero().squeeze(1)
-                at_root = (env.street[f] == 3) & ~env.done[f]
+                at_root = (env.street[f] == stop_street) & ~env.done[f]
                 contrib = env.contrib[f]
                 if not bool(at_root.all()) or not bool((contrib[:, 0] == contrib[:, 1]).all()):
-                    raise RuntimeError("a replayed hand did not end at the river root")
+                    raise RuntimeError("a replayed hand did not end at its street root")
                 c[ids[f]] = contrib[:, 0]
                 stack[ids[f]] = env.stacks[f].min(1).values
                 keep = (~fin).nonzero().squeeze(1)
@@ -543,9 +555,11 @@ def _play_scalar(
     stats: dict[str, float],
     max_hands: int,
     board_cards: int = 5,
+    stop_street: int = 3,
 ) -> dict[str, torch.Tensor]:
     """Scalar-engine self-play for any blueprint with ``policy_matrix``, one
-    hand at a time (slow; for tests and blueprints without the lockstep path)."""
+    hand at a time (slow; for tests and blueprints without the lockstep path),
+    stopped at the root of ``stop_street``."""
     from ..engine_select import get_engine
     from .abstract import contributions, legal_options, to_action
     from .blueprint import policy_matrix
@@ -574,9 +588,10 @@ def _play_scalar(
                 else:
                     stats["allin"] += 1
                 break
-            if int(state.street) == 3 and not any(int(s) == 3 for s, _p, _a in state.history):
+            st = int(state.street)
+            if st == stop_street and not any(int(s) == st for s, _p, _a in state.history):
                 if min(int(s) for s in state.stacks) <= 0:
-                    raise RuntimeError("river root with a player all-in")
+                    raise RuntimeError("street root with a player all-in")
                 contrib = contributions(state, config)
                 rows.append(
                     {

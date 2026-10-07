@@ -183,4 +183,6 @@ prediction; after 6,000 steps (overfitting) 0.0312, 0.0292 (16 x 16) and
 
 Not done yet: a turn-end net trained on a real river net's targets (needs
 the river net), and a turn-start net for `depth_streets: 0`, which would be
-bootstrapped from this one in the same way.
+bootstrapped from this one in the same way. The turn-start net's code
+(batched turn solves with turn-end-net leaves, data, training, flop-end
+leaves) is in place but not trained yet: see `docs/turn_start_net.md`.

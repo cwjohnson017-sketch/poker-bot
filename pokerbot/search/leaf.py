@@ -64,6 +64,10 @@ class LeafConfig:
     # (one row per leaf), by the checkpoint's meta kind (turn_net.load_leaf_predictor)
     net: str | None = None
     net_every: int = 1  # value_net: run the net every n regret updates per player (1 = exact)
+    # value_net: a second net for trees rooted on the turn (a turn-end or river net), loaded
+    # lazily; needed when leaf.net is a turn-start net (flop solves with depth_streets 0)
+    # and turn solves have leaves (tree.depth_streets_turn 0). None: leaf.net for every tree
+    turn_net: str | None = None
 
 
 def runout_scale(board_len: int) -> float:

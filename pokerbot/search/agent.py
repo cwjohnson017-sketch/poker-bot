@@ -18,6 +18,10 @@ At every postflop decision:
    players' current reaches (``leaf.mode: value_net``, see
    :mod:`pokerbot.search.value_leaf`): a river net averaged over the river
    cards, or a turn-end net (one row per leaf), picked by the checkpoint's kind.
+   A turn-start net in ``leaf.net`` values the flop-end leaves of flop solves
+   with ``tree.depth_streets: 0`` (averaged over the turn cards); trees rooted
+   on the turn then use ``leaf.turn_net`` (a turn-end net) when it is set, for
+   turn solves with ``tree.depth_streets_turn: 0``.
 4. **Act.** Read the average strategy of our actual combo at the current node,
    sample a child, and play its concrete action (sizes computed exactly as
    :mod:`pokerbot.env.actions` does). Cache the played strategy (for locking)
@@ -52,7 +56,7 @@ from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
 from .tree import LEAF, VALUE, TreeBuilder
 from .tree_policy import blueprint_profile
-from .value_leaf import make_leaf_evaluator
+from .value_leaf import make_leaf_evaluator, predictor_kind
 
 
 def _engine_config(engine: Any, config: Any) -> Any:
@@ -76,6 +80,7 @@ class SearchAgent(BaseAgent):
         config: SearchConfig | dict | str | Path | None = None,
         name: str | None = None,
         value_predictor: Any = None,
+        turn_value_predictor: Any = None,
         **overrides: Any,
     ) -> None:
         super().__init__(name)
@@ -96,6 +101,9 @@ class SearchAgent(BaseAgent):
                 "leaf.mode is value_net but no value_predictor was given and leaf.net "
                 "(the value-net checkpoint path) is not set"
             )
+        # trees rooted on the turn: a turn-end (or river) net from leaf.turn_net, if any
+        self.turn_value_predictor = turn_value_predictor
+        self._leaf_nets_checked = False
         self.cache = ContinualCache()
         self._roots: dict = {}
         self._played: dict = {}
@@ -133,18 +141,65 @@ class SearchAgent(BaseAgent):
             self.value_predictor = load_leaf_predictor(path, self.device)
         return self.value_predictor
 
+    def get_turn_value_predictor(self) -> Any:
+        """The value net of trees rooted on the turn: the constructor's
+        ``turn_value_predictor``, else loaded once from ``leaf.turn_net``;
+        ``None`` when neither is set (``leaf.net`` then serves every tree)."""
+        if self.turn_value_predictor is None and self.cfg.leaf.turn_net:
+            from .turn_net import load_leaf_predictor
+
+            self.turn_value_predictor = load_leaf_predictor(self.cfg.leaf.turn_net, self.device)
+        return self.turn_value_predictor
+
+    def _check_leaf_nets(self) -> None:
+        """Config errors of the turn-start options, raised before any search
+        (so they are not hidden by ``fallback_on_error``): a turn-start
+        ``leaf.net`` needs ``depth_streets: 0`` and, when turn solves have
+        leaves, a turn-end ``leaf.turn_net``. Other setups are not checked."""
+        if self._leaf_nets_checked:
+            return
+        tc = self.cfg.tree
+        main = predictor_kind(self.get_value_predictor())
+        turn = self.get_turn_value_predictor()
+        if turn is not None and predictor_kind(turn) not in ("turn_end", "river"):
+            raise ValueError(
+                f"leaf.turn_net must be a turn-end or river net, got {predictor_kind(turn)}"
+            )
+        if main == "turn_start":
+            if int(tc.depth_streets) != 0:
+                raise ValueError(
+                    "leaf.net is a turn-start net, which values flop-end leaves: set "
+                    "tree.depth_streets: 0"
+                )
+            turn_depth = (
+                tc.depth_streets if tc.depth_streets_turn is None else tc.depth_streets_turn
+            )
+            if int(turn_depth) == 0 and turn is None:
+                raise ValueError(
+                    "turn solves end at turn-end leaves (tree.depth_streets_turn 0) but "
+                    "leaf.turn_net (a turn-end net) is not set; set it, or "
+                    "tree.depth_streets_turn: 1 to solve the turn to showdown"
+                )
+        self._leaf_nets_checked = True
+
     def value_leaf_provider(self, tree: Any) -> Any:
         """The leaf-value provider of ``tree``'s ``VALUE`` nodes for the value net:
         :class:`~.value_leaf.TurnEndLeafEvaluator` (one net row per leaf) for a
-        turn-end net, else :class:`~.value_leaf.ValueLeafEvaluator` (the river
-        net averaged over the 48 river cards)."""
-        return make_leaf_evaluator(tree, self.get_value_predictor(), every=self.cfg.leaf.net_every)
+        turn-end net, :class:`~.value_leaf.FlopEndLeafEvaluator` (49 rows per
+        leaf) for a turn-start net, else :class:`~.value_leaf.ValueLeafEvaluator`
+        (the river net averaged over the 48 river cards). Trees rooted on the
+        turn use the turn net (``leaf.turn_net``) when one is set."""
+        pred = self.get_turn_value_predictor() if tree.root_street == 2 else None
+        if pred is None:
+            pred = self.get_value_predictor()
+        return make_leaf_evaluator(tree, pred, every=self.cfg.leaf.net_every)
 
     def act(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
         if state.street == 0:
             return self._blueprint_action(state, seat, rng)
         if self.value_net:
             self.get_value_predictor()  # load errors are config errors: no fallback
+            self._check_leaf_nets()
         try:
             return self._search_action(state, seat, rng)
         except Exception:

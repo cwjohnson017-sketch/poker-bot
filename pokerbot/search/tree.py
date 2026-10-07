@@ -76,6 +76,9 @@ class TreeConfig:
     # nodes a depth-limit leaf counts for in the budget (None: 1 + k for rollouts,
     # 1 for value_net; 1 + k gives a value-net tree the rollout tree's abstraction)
     leaf_budget_cost: int | None = None
+    # depth_streets of trees rooted on the turn (None: depth_streets). 0 gives turn
+    # solves VALUE (or LEAF) nodes at the end of turn betting; >= 1 solves to showdown
+    depth_streets_turn: int | None = None
 
 
 @dataclass
@@ -200,8 +203,11 @@ class TreeBuilder:
             raise ValueError("search subgames start on the flop; preflop uses the blueprint")
         if len(self.board) != BOARD_LEN[self.root_street]:
             raise ValueError("board does not match the street of the root")
-        self.last_street = min(3, self.root_street + max(0, int(self.tc.depth_streets)))
-        if self.root_street == 2 and self.tc.depth_streets >= 1:
+        depth = int(self.tc.depth_streets)
+        if self.root_street == 2 and self.tc.depth_streets_turn is not None:
+            depth = int(self.tc.depth_streets_turn)
+        self.last_street = min(3, self.root_street + max(0, depth))
+        if self.root_street == 2 and depth >= 1:
             self.last_street = 3
         if searcher is None:
             searcher = int(self.root_state.current_player)

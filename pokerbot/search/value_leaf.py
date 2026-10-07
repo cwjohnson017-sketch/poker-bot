@@ -48,6 +48,11 @@ evaluation):
   optionally re-run only every ``every`` regret updates per player (cached
   ``ev`` re-weighted by the current ``m``);
 * :class:`TurnEndLeafEvaluator` - a turn-end net, one row per leaf;
+* :class:`FlopEndLeafEvaluator` - flop-end leaves (a flop solve with
+  ``depth_streets: 0``, 3-card boards): a **turn-start** net (``kind ==
+  "turn_start"``, :class:`~.turn_net.TurnStartPredictor`) averaged over the 49
+  turn cards by the same identity (:class:`RiverAverage` with
+  ``board_len = 3``: ``1 / 45`` per turn card avoiding both hands);
 * :class:`FixedLeafValues` - precomputed values, ignoring the reaches;
 * :class:`ShowdownOracle` - an exact river ``predict`` for a checked-down
   river, for tests and as a sanity baseline.
@@ -77,6 +82,7 @@ from .tree import VALUE, SubgameTree
 
 C = NUM_COMBOS
 TURN_LEN = 4
+FLOP_LEN = 3
 RIVERS = NUM_CARDS - TURN_LEN  # river cards per turn board (48)
 RIVERS_PER_PAIR = NUM_CARDS - TURN_LEN - 4  # river cards avoiding two disjoint hands (44)
 
@@ -97,9 +103,10 @@ class LeafValueProvider(Protocol):
 
 
 def predictor_kind(predictor: Any) -> str:
-    """``"river"`` (river-start net: boards ``[n, 5]``) or ``"turn_end"``
-    (turn-end net: boards ``[n, 4]``), from the predictor's ``kind`` attribute
-    (default river)."""
+    """``"river"`` (river-start net: boards ``[n, 5]``), ``"turn_end"``
+    (turn-end net: boards ``[n, 4]``) or ``"turn_start"`` (turn-start net:
+    boards ``[n, 4]``, values at the turn root), from the predictor's ``kind``
+    attribute (default river)."""
     return str(getattr(predictor, "kind", "river"))
 
 
@@ -111,18 +118,37 @@ def turn_end_leaves(tree: SubgameTree) -> dict[str, Any]:
     (grouped by turn board, then node id) and their layout: ``nodes``, the
     distinct ``boards4``, ``leaf_b4`` (board index per leaf), ``c`` and
     ``stack`` (long ``[L]``), ``oop`` (the OOP seat per leaf) and ``oop_seat``."""
+    return _value_leaf_layout(
+        tree,
+        TURN_LEN,
+        "only turn-end leaves (4-card boards) are supported (a river net or a turn-end "
+        "net); a flop solve with depth_streets 0 needs a turn-start net (FlopEndLeafEvaluator)",
+    )
+
+
+def flop_end_leaves(tree: SubgameTree) -> dict[str, Any]:
+    """:func:`turn_end_leaves` for the ``VALUE`` nodes at the end of flop
+    betting (3-card boards; a flop solve with ``depth_streets: 0``): the same
+    keys, ``boards4`` / ``leaf_b4`` holding the distinct flop boards and the
+    board index per leaf."""
+    return _value_leaf_layout(
+        tree,
+        FLOP_LEN,
+        "a turn-start net values only flop-end leaves (3-card boards, depth_streets 0 on "
+        "the flop); turn-end leaves need a turn-end or river net (leaf.turn_net for turn "
+        "decisions)",
+    )
+
+
+def _value_leaf_layout(tree: SubgameTree, board_len: int, why: str) -> dict[str, Any]:
     dev = tree.device
     nodes = (tree.kind == VALUE).nonzero().flatten().tolist()
     b4_index: dict[tuple[int, ...], int] = {}
     node_b4: dict[int, int] = {}
     for n in nodes:
         board = tuple(int(x) for x in tree.boards[int(tree.board_id[n])])
-        if len(board) != TURN_LEN:
-            raise ValueError(
-                f"value-net leaf {n} is on a {len(board)}-card board, but only turn-end "
-                "leaves (4-card boards) are supported (a river net or a turn-end net); a "
-                "flop solve needs depth_streets >= 1 (depth_streets 0 would need a turn-start net)"
-            )
+        if len(board) != board_len:
+            raise ValueError(f"value-net leaf {n} is on a {len(board)}-card board, but {why}")
         node_b4[n] = b4_index.setdefault(board, len(b4_index))
     # evaluation order: grouped by turn board, so a run of leaves shares its river cards
     nodes.sort(key=lambda n: (node_b4[n], n))
@@ -155,6 +181,13 @@ def turn_end_leaves(tree: SubgameTree) -> dict[str, Any]:
 class RiverAverage:
     """Turn-end values as the exact chance average of a river predictor.
 
+    The class is generic in the street: ``board_len`` (class attribute, 4
+    here) is the leaves' board length, the predictor gets boards of
+    ``board_len + 1`` cards, and the chance weight is ``1 / (52 - board_len -
+    4)`` per dealt card avoiding both hands. :class:`FlopEndLeafEvaluator`
+    (``board_len = 3``) averages a turn-start net over the turn cards the same
+    way; names below say "river" for the dealt card.
+
     Leaves ``l`` are given by ``leaf_b4[l]`` (index into the distinct turn
     boards ``boards4``; leaves on one board should be consecutive, so a run of
     them shares its river masks), the committed chips ``c [L]`` and the chips
@@ -174,6 +207,8 @@ class RiverAverage:
     is issued and those entries are zeroed in place from then on.
     """
 
+    board_len = TURN_LEN
+
     def __init__(
         self,
         predictor: RiverPredictor,
@@ -190,7 +225,9 @@ class RiverAverage:
         dev = self.device = torch.device(device)
         self.predictor = predictor
         self.every = max(1, int(every))
-        self.leaves_per_chunk = max(1, int(chunk) // RIVERS)
+        R = self.cards_per_leaf = NUM_CARDS - self.board_len  # dealt cards per board (48)
+        self.cards_per_pair = R - 4  # dealt cards avoiding two disjoint hands (44)
+        self.leaves_per_chunk = max(1, int(chunk) // R)
         self.cache_dtype = cache_dtype
         leaf_b4 = [int(u) for u in leaf_b4]
         L = len(leaf_b4)
@@ -204,10 +241,10 @@ class RiverAverage:
             [list(b) + [x] for b, xs in zip(boards4, rivers, strict=True) for x in xs],
             dtype=torch.long,
             device=dev,
-        ).view(-1, 5)
+        ).view(-1, self.board_len + 1)
         lb = torch.tensor(leaf_b4, dtype=torch.long, device=dev)
-        slots = torch.arange(RIVERS, device=dev)
-        rivers_t = torch.tensor(rivers, dtype=torch.long, device=dev).view(-1, RIVERS)
+        slots = torch.arange(R, device=dev)
+        rivers_t = torch.tensor(rivers, dtype=torch.long, device=dev).view(-1, R)
         self.cards = rivers_t[lb]
         self._river_avoid = avoids_card(dev)[rivers_t]  # [B4, 48, C] bool
         self._river_avoid_f: dict[torch.dtype, torch.Tensor] = {}
@@ -224,16 +261,16 @@ class RiverAverage:
             self._runs.append(runs)
         self._zero_output: bool | None = None  # None until the first net call checks
         # one row per (leaf, river card), leaf-major: row = leaf * 48 + slot
-        self.row_leaf = torch.arange(L, device=dev).repeat_interleave(RIVERS)
+        self.row_leaf = torch.arange(L, device=dev).repeat_interleave(R)
         self.row_card = self.cards.flatten()
-        self.row_board = (lb[:, None] * RIVERS + slots[None, :]).flatten()
+        self.row_board = (lb[:, None] * R + slots[None, :]).flatten()
         self.c = torch.as_tensor(c, device=dev).long().reshape(L)
         self.stack = torch.as_tensor(stack, device=dev).long().reshape(L)
         self.valid = (
             valid_masks(boards4, dev)[lb] if L else torch.zeros(0, C, dtype=torch.bool, device=dev)
         )
-        self.row_c = self.c.float().repeat_interleave(RIVERS)
-        self.row_stack = self.stack.float().repeat_interleave(RIVERS)
+        self.row_c = self.c.float().repeat_interleave(R)
+        self.row_stack = self.stack.float().repeat_interleave(R)
         self.avoid = avoids_card(dev)  # [52, C] bool
         # the 51 combos holding each card
         self.card_combos = incidence(dev).t().nonzero()[:, 1].view(NUM_CARDS, NUM_CARDS - 1)
@@ -251,7 +288,7 @@ class RiverAverage:
 
     @property
     def num_rows(self) -> int:
-        return self.num_leaves * RIVERS
+        return self.num_leaves * self.cards_per_leaf
 
     def reset_cache(self) -> None:
         self._calls = [0, 0]
@@ -287,15 +324,16 @@ class RiverAverage:
         runs = self._runs[chunk]
         l0, l1 = runs[0][0], runs[-1][1]
         Lc = l1 - l0
-        n = Lc * RIVERS
+        R = self.cards_per_leaf
+        n = Lc * R
         dt = ordered.dtype
         avoid = self._river_avoid_f.get(dt)
         if avoid is None:
             avoid = self._river_avoid_f[dt] = self._river_avoid.to(dt)
-        ranges = ordered.new_empty(Lc, RIVERS, 2, C)
+        ranges = ordered.new_empty(Lc, R, 2, C)
         for a, b, u in runs:  # leaves on one turn board share the 48 river masks
             torch.mul(ordered[a:b, None], avoid[u][None, :, None, :], out=ranges[a - l0 : b - l0])
-        rows = slice(l0 * RIVERS, l1 * RIVERS)
+        rows = slice(l0 * R, l1 * R)
         with torch.no_grad():
             ids = self._predictor_board_ids()
             if ids is None:
@@ -314,7 +352,7 @@ class RiverAverage:
                 )
         self.net_calls += 1
         self.net_rows += n
-        ev = ev.to(dt).reshape(Lc, RIVERS, 2, C)
+        ev = ev.to(dt).reshape(Lc, R, 2, C)
         hit = None
         if self._zero_output is None:  # first call: does the predictor keep the contract?
             hit = self.card_combos[self.cards[l0:l1]]  # [Lc, 48, 51]
@@ -366,7 +404,7 @@ class RiverAverage:
         holding ``x``."""
         Lc = ev.shape[0]
         Qx = self._pair_table(opp, S, cards)  # [Lc, R, 52]
-        Q1 = torch.cat([Qx, Qx.new_ones(Lc, RIVERS, 1)], 2)  # [Lc, R, 53]
+        Q1 = torch.cat([Qx, Qx.new_ones(Lc, self.cards_per_leaf, 1)], 2)  # [Lc, R, 53]
         T = torch.matmul(Q1.transpose(1, 2), ev)  # [Lc, 53, C]
         w = m * T[:, NUM_CARDS]
         w += T.gather(1, self.c12[None].expand(Lc, -1, -1)).sum(1)
@@ -410,13 +448,14 @@ class RiverAverage:
             self._calls[player] += 1
             cache = self._cache[player]
             if cache is None:
-                cache = torch.empty(L, RIVERS, C, device=self.device, dtype=self.cache_dtype)
+                R = self.cards_per_leaf
+                cache = torch.empty(L, R, C, device=self.device, dtype=self.cache_dtype)
                 self._cache[player] = cache
             else:
                 refresh = k % self.every == 0
         opp, S, m = self._opp_sums(rv, player)
         ordered = self._ordered(rv) if refresh else None
-        scale = self.c.to(dt) * (2.0 / RIVERS_PER_PAIR)  # pot / 44
+        scale = self.c.to(dt) * (2.0 / self.cards_per_pair)  # pot / 44
         for k, runs in enumerate(self._runs):
             l0, l1 = runs[0][0], runs[-1][1]
             if refresh:
@@ -441,7 +480,7 @@ class RiverAverage:
         rv = self._prepare(reach)
         sums = [self._opp_sums(rv, p) for p in (0, 1)]
         ordered = self._ordered(rv)
-        scale = self.c.to(reach.dtype) * (2.0 / RIVERS_PER_PAIR)
+        scale = self.c.to(reach.dtype) * (2.0 / self.cards_per_pair)
         for k, runs in enumerate(self._runs):
             l0, l1 = runs[0][0], runs[-1][1]
             ev = self._net_ev_both(ordered, k)
@@ -474,6 +513,50 @@ class ValueLeafEvaluator(RiverAverage):
         cache_dtype: torch.dtype = torch.float16,
     ) -> None:
         lay = turn_end_leaves(tree)
+        self.ids = lay["ids"]
+        super().__init__(
+            predictor,
+            lay["boards4"],
+            lay["leaf_b4"],
+            lay["c"],
+            lay["stack"],
+            lay["oop_seat"],
+            tree.device,
+            every,
+            chunk,
+            cache_dtype,
+        )
+        self.oop = torch.tensor(lay["oop"], dtype=torch.long, device=self.device)
+
+
+class FlopEndLeafEvaluator(RiverAverage):
+    """Values of every ``VALUE`` node at the end of flop betting (3-card
+    boards ``b3``: a flop solve with ``depth_streets: 0``) from a **turn-start**
+    value net ``N_TS`` (``kind == "turn_start"``), by the exact chance average
+    over the 49 turn cards ``t``:
+
+        v_i(c) = sum_{t not in b3} (1 / 45) * [c avoids t] * m^t_-i(c) * pot * ev^t_i(c)
+
+    with ``ev^t = N_TS(b3 + t, reaches masked by t, c, stack)`` in pot units per
+    unit of disjoint opponent mass on the 4-card board and ``45 = 52 - 3 - 4``.
+    This is :class:`ValueLeafEvaluator` one street earlier
+    (:class:`RiverAverage` with ``board_len = 3``): 49 net rows per leaf, laid
+    out leaf-major, the same ``ids``, ``values(player, reach[2, L, 1326],
+    cached)``, ``every`` caching and predictor contract (0 on combos holding
+    the turn card).
+    """
+
+    board_len = FLOP_LEN
+
+    def __init__(
+        self,
+        tree: SubgameTree,
+        predictor: Any,
+        every: int = 1,
+        chunk: int = 16384,
+        cache_dtype: torch.dtype = torch.float16,
+    ) -> None:
+        lay = flop_end_leaves(tree)
         self.ids = lay["ids"]
         super().__init__(
             predictor,
@@ -648,13 +731,17 @@ def make_leaf_evaluator(
     tree: SubgameTree, predictor: Any, every: int = 1, **kwargs: Any
 ) -> RiverAverage | TurnEndLeafEvaluator:
     """The leaf-value provider for ``predictor``: :class:`TurnEndLeafEvaluator`
-    for a turn-end net (``kind == "turn_end"``), else :class:`ValueLeafEvaluator`."""
+    for a turn-end net (``kind == "turn_end"``), :class:`FlopEndLeafEvaluator`
+    for a turn-start net (``kind == "turn_start"``, flop-end leaves only), else
+    :class:`ValueLeafEvaluator`."""
     kind = predictor_kind(predictor)
     if kind == "turn_end":
         return TurnEndLeafEvaluator(tree, predictor, every=every, **kwargs)
+    if kind == "turn_start":
+        return FlopEndLeafEvaluator(tree, predictor, every=every, **kwargs)
     if kind == "river":
         return ValueLeafEvaluator(tree, predictor, every=every, **kwargs)
-    raise ValueError(f"unknown value-net kind {kind!r} (expected river or turn_end)")
+    raise ValueError(f"unknown value-net kind {kind!r} (expected river, turn_end or turn_start)")
 
 
 class FixedLeafValues:
@@ -730,6 +817,7 @@ class ShowdownOracle:
 
 __all__ = [
     "FixedLeafValues",
+    "FlopEndLeafEvaluator",
     "LeafValueProvider",
     "RiverAverage",
     "RiverPredictor",
@@ -738,6 +826,7 @@ __all__ = [
     "ValueLeafEvaluator",
     "make_leaf_evaluator",
     "predictor_kind",
+    "flop_end_leaves",
     "river_average",
     "turn_end_leaves",
 ]

@@ -50,10 +50,21 @@ has ``kind: turn_end`` and ``turn_features: {spread_buckets}``.
 :func:`load_leaf_predictor` loads either kind (river nets have no ``kind``) as
 the matching predictor; :class:`TurnEndPredictor` has the river predictor's
 interface with ``boards [n, 4]``.
+
+**Turn-start net** (``kind: turn_start``, ``docs/turn_start_net.md``). The same
+model and features on the same 4-card board, but its values are at the turn
+*root*, before any turn betting: the root best-response values of a turn
+subgame solved with turn-end-net leaves (:mod:`.turn_start_data`,
+:class:`~.batch_turn_solver.BatchTurnSolver`), in the same units (pot units
+per unit of opponent mass disjoint from the combo, ``pot = 2c`` at the turn
+root). :class:`TurnStartPredictor` is :class:`TurnEndPredictor` with that
+kind; it values flop-end leaves (``depth_streets: 0`` flop solves,
+:class:`~.value_leaf.FlopEndLeafEvaluator`).
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -79,6 +90,8 @@ RIVERS = NUM_CARDS - TURN_LEN  # 48
 SEEN_RIVERS = RIVERS - 2  # river cards a valid combo can see (46)
 TURN_VALID = 1128  # combos disjoint from a 4-card board: C(48, 2)
 KIND = "turn_end"
+START_KIND = "turn_start"  # turn-root values (flop-end leaves)
+TURN_KINDS = (KIND, START_KIND)
 # 2-D buckets by default: 32 x 8 beat 1-D 256 by 8% held-out MAE on check-down targets
 DEFAULT_SPREAD_BUCKETS = 8
 _KEY_BASE = torch.tensor([NUM_CARDS**i for i in range(TURN_LEN)], dtype=torch.long)
@@ -358,27 +371,53 @@ class TurnEndPredictor(ValueNetPredictor):
     def from_path(cls, path: str | Path, device: torch.device | str = "cpu") -> TurnEndPredictor:
         net = load_value_net(path, device)
         kind = net.meta.get("kind", "river")
-        if kind != KIND:
-            raise ValueError(f"{path} is a {kind} value net, not a turn-end net")
+        if kind != cls.kind:
+            raise ValueError(
+                f"{path} is a {kind} value net, not a {cls.kind.replace('_', '-')} net"
+            )
         return cls(net, device)
+
+
+class TurnStartPredictor(TurnEndPredictor):
+    """Batched turn-start net inference: ``predict(boards [n, 4], ranges [n, 2,
+    1326], c, stack) -> ev [n, 2, 1326]``, the values at the turn root (before
+    turn betting) in pot units per unit of disjoint opponent mass on the
+    4-card board, ``(OOP, IP)``, 0 on invalid combos. The same features and
+    code as :class:`TurnEndPredictor`; ``kind = "turn_start"``."""
+
+    kind = START_KIND
 
 
 # --------------------------------------------------------------------------- checkpoints
 
 
-def turn_meta(spread_buckets: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Checkpoint ``meta`` of a turn-end net."""
-    return {**(extra or {}), "kind": KIND, "turn_features": {"spread_buckets": int(spread_buckets)}}
+def _check_kind(kind: str) -> str:
+    if kind not in TURN_KINDS:
+        raise ValueError(f"unknown turn net kind {kind!r} (expected one of {TURN_KINDS})")
+    return kind
+
+
+def turn_meta(
+    spread_buckets: int, extra: dict[str, Any] | None = None, kind: str = KIND
+) -> dict[str, Any]:
+    """Checkpoint ``meta`` of a turn-end (or ``kind="turn_start"``) net."""
+    sb = {"spread_buckets": int(spread_buckets)}
+    return {**(extra or {}), "kind": _check_kind(kind), "turn_features": sb}
 
 
 def save_turn_net(
-    path: str | Path, net: RiverValueNet, spread_buckets: int, meta: dict[str, Any] | None = None
+    path: str | Path,
+    net: RiverValueNet,
+    spread_buckets: int,
+    meta: dict[str, Any] | None = None,
+    kind: str = KIND,
 ) -> None:
-    save_value_net(path, net, turn_meta(spread_buckets, meta))
+    save_value_net(path, net, turn_meta(spread_buckets, meta, kind))
 
 
 def checkpoint_kind(path: str | Path) -> str:
-    """``"turn_end"`` or ``"river"`` (the default when ``meta`` has no ``kind``)."""
+    """``"turn_end"``, ``"turn_start"`` or ``"river"`` (the default when
+    ``meta`` has no ``kind``)."""
     ck = torch.load(path, map_location="cpu", weights_only=True)
     return str((ck.get("meta") or {}).get("kind", "river"))
 
@@ -387,12 +426,14 @@ def load_leaf_predictor(
     path: str | Path, device: torch.device | str = "cpu"
 ) -> ValueNetPredictor | TurnEndPredictor:
     """The predictor of a value-net checkpoint, by its ``meta`` kind: a
-    :class:`TurnEndPredictor` for a turn-end net, else a river
-    :class:`~.value_net.ValueNetPredictor`."""
+    :class:`TurnEndPredictor` for a turn-end net, a :class:`TurnStartPredictor`
+    for a turn-start net, else a river :class:`~.value_net.ValueNetPredictor`."""
     net = load_value_net(path, device)
     kind = net.meta.get("kind", "river")
     if kind == KIND:
         return TurnEndPredictor(net, device)
+    if kind == START_KIND:
+        return TurnStartPredictor(net, device)
     if kind == "river":
         return ValueNetPredictor(net, device)
     raise ValueError(f"{path}: unknown value-net kind {kind!r}")
@@ -412,12 +453,18 @@ def train_turn_net(
     log: Any = print,
     raw: dict[str, torch.Tensor] | None = None,
     raw_heldout: dict[str, torch.Tensor] | None = None,
+    kind: str = KIND,
 ) -> tuple[RiverValueNet, dict[str, Any]]:
     """:func:`~.value_train.train_value_net` on turn-end shards (boards
     ``[n, 4]``) with :class:`TurnFeatureCache` features; the checkpoint's meta
-    records ``kind: turn_end`` and ``spread_buckets``."""
+    records ``kind`` (``turn_end``, or ``turn_start`` for the turn-start shards
+    of :mod:`.turn_start_data`) and ``spread_buckets``. Shard directories whose
+    ``meta.json`` names another kind are rejected."""
     from .value_train import train_value_net
 
+    _check_kind(kind)
+    for paths in (data, heldout):
+        check_shard_kind(paths, kind)
     net_cfg = net_cfg or ValueNetConfig()
     sb = int(spread_buckets)
     if net_cfg.buckets % sb:
@@ -437,15 +484,31 @@ def train_turn_net(
         raw,
         raw_heldout,
         cache_factory=factory,
-        meta=turn_meta(sb),
+        meta=turn_meta(sb, kind=kind),
     )
+
+
+def check_shard_kind(paths: str | Path | Sequence[str | Path] | None, kind: str) -> None:
+    """Raise if a shard directory's ``meta.json`` names a ``kind`` other than ``kind``."""
+    if paths is None:
+        return
+    for p in [paths] if isinstance(paths, str | Path) else paths:
+        meta = Path(p) / "meta.json"
+        if meta.is_file():
+            got = json.loads(meta.read_text()).get("kind")
+            if got is not None and got != kind:
+                raise ValueError(f"{p} holds {got} shards, not {kind} shards")
 
 
 __all__ = [
     "DEFAULT_SPREAD_BUCKETS",
     "KIND",
+    "START_KIND",
+    "TURN_KINDS",
     "TurnEndPredictor",
     "TurnFeatureCache",
+    "TurnStartPredictor",
+    "check_shard_kind",
     "checkpoint_kind",
     "load_leaf_predictor",
     "river_boards",
