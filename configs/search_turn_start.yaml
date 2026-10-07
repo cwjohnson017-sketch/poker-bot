@@ -1,0 +1,45 @@
+# Real-time search with a turn-start value net at the end of flop betting
+# (docs/turn_start_net.md). Same as search_value_net.yaml except where noted.
+# Flop solves stop at the end of flop betting (depth_streets: 0); their leaves are
+# valued by the turn-start net in leaf.net, averaged over the 49 turn cards
+# (FlopEndLeafEvaluator, 49 net rows per leaf). The checkpoint's kind must be
+# turn_start (scripts/train_turn_net.py --kind turn_start).
+#   python scripts/time_flop_search.py --blueprint runs/dcfr4_distilled_v2 \
+#       --config configs/search_turn_start.yaml
+
+search:
+  device: auto
+  seed: 0
+  time_budget:              # seconds per decision: tree + gadget + leaf setup + solve
+    flop: 2.0               # a flop-only tree (~150-200 nodes): fast iterations
+    turn: 2.0
+    river: 1.0
+  min_iterations: 10
+  remove_own_blockers: true
+  fallback_on_error: true
+
+  tree:
+    actions: blueprint      # the blueprint's own abstraction (dcfr4: 12 actions per street)
+    depth_streets: 0        # flop solves: flop betting only, turn-start net leaves
+    depth_streets_turn: 1   # turn solves to showdown, as today. 0: turn-end leaves valued
+                            # by leaf.turn_net (a turn-end net; set it below)
+    max_nodes: 6000
+    chance_cards: null
+    min_chance_cards: 4
+
+  solver:
+    algorithm: dcfr
+    iterations: 1000
+    max_runouts: 48
+    dtype: float32
+
+  leaf:
+    mode: value_net
+    net: runs/value_net/turn_start_v1.pt   # kind turn_start
+    # turn_net: runs/value_net/turn_v2w.pt # kind turn_end; needed with depth_streets_turn: 0
+    net_every: 1
+
+  gadget:
+    safe: true
+    prior_mix: 0.05
+    rollouts: 256

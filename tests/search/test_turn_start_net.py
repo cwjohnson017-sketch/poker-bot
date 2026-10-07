@@ -9,17 +9,22 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
+from pokerbot.agents import RandomAgent
 from pokerbot.engine_select import get_engine
 from pokerbot.env.actions import CHECK_CALL, DEFAULT_SPEC, FOLD, ActionSpec
+from pokerbot.eval.match import run_match
+from pokerbot.search import SearchAgent, UniformBlueprint
 from pokerbot.search import value_ranges as vrg
-from pokerbot.search.abstract import legal_options
+from pokerbot.search.abstract import legal_options, make_state
 from pokerbot.search.batch_turn_solver import BatchTurnSolver, turn_tree
 from pokerbot.search.blueprint import TabularBlueprintFromCallable
-from pokerbot.search.combos import NUM_COMBOS
-from pokerbot.search.tree import DECISION, VALUE
+from pokerbot.search.combos import NUM_COMBOS, blocked_sum, valid_mask
+from pokerbot.search.solver import RangeSolver, SolverConfig, allin_matrix
+from pokerbot.search.tree import DECISION, VALUE, TreeConfig, build_tree
 from pokerbot.search.turn_data import RiverAveragePredictor, turn_checkdown_samples, turn_targets
 from pokerbot.search.turn_net import (
     TurnEndPredictor,
@@ -37,7 +42,12 @@ from pokerbot.search.turn_start_data import (
     solve_turn_states,
 )
 from pokerbot.search.value_data import SHARD_DTYPES
-from pokerbot.search.value_leaf import ShowdownOracle
+from pokerbot.search.value_leaf import (
+    FlopEndLeafEvaluator,
+    ShowdownOracle,
+    TurnEndLeafEvaluator,
+    make_leaf_evaluator,
+)
 from pokerbot.search.value_net import RiverValueNet, ValueNetConfig, opponent_mass
 from pokerbot.search.value_train import ValueTrainConfig, load_shards
 
@@ -252,3 +262,249 @@ def test_batch_turn_solver_with_a_turn_end_net():
     assert L > 2 and s.net_rows == 10 * L * 3 and s.net_calls == 10 * math.ceil(L / 2)
     ex = s.exploitability()
     assert bool(torch.isfinite(ex["br"]).all()) and len(pred.cache) == 3
+
+
+# --------------------------------------------------------------------------- flop-end leaves
+
+
+class _TurnStartOracle(RiverAveragePredictor):
+    """Exact turn-start values when the turn and the river are checked down:
+    the check-down turn-end values of the same ranges (kind turn_start)."""
+
+    kind = "turn_start"
+
+
+PASS = (("fold",), ("check_call",))
+FLOP_BOARD = [4, 9, 14, 19, 24]  # the flop is the first three cards
+
+
+def _flop_state(stacks: int = 2000):
+    engine = get_engine()
+    cfg = _engine_config(stacks)
+    s = make_state(engine, cfg, 0, FLOP_BOARD, [])
+    s.apply(engine.Action.raise_to(250))
+    s.apply(engine.Action.check_call())
+    return cfg, s
+
+
+def _flop_tree(cfg, s, spec=SMALL, depth=0):
+    tc = TreeConfig(spec=spec, depth_streets=depth, max_nodes=10**7, leaf_mode="value_net")
+    return build_tree(cfg, s.button, s.board, s.history, tc)
+
+
+def test_flop_end_leaves_are_the_exact_checkdown_runout():
+    """FlopEndLeafEvaluator with the check-down turn-start oracle equals the
+    dense all-in enumeration over all 1176 turn and river run-outs, card
+    removal included; the per-card opponent-mass identity holds on 3-card
+    boards; make_leaf_evaluator picks it for a turn-start predictor."""
+    cfg, s = _flop_state()
+    tree = _flop_tree(cfg, s)
+    oracle = _TurnStartOracle(ShowdownOracle(max_boards=1 << 13))
+    ev = FlopEndLeafEvaluator(tree, oracle, chunk=49 * 2)  # several chunks
+    assert type(make_leaf_evaluator(tree, oracle)) is FlopEndLeafEvaluator
+    L = ev.num_leaves
+    assert L == tree.count(VALUE) > 1 and ev.num_rows == 49 * L and ev.cards_per_pair == 45
+    board = list(s.board)
+    valid = valid_mask(board)
+    g = torch.Generator().manual_seed(5)
+    reach = torch.rand(2, L, C, generator=g, dtype=torch.float64) ** 2  # also on the board
+    reach[1, 0] = 0.0  # an unreached leaf
+    E = allin_matrix(tuple(board), 1176, torch.device("cpu"), torch.float64, 0)  # every run-out
+    both = ev.values_both(reach)
+    for p in (0, 1):
+        v = ev.values(p, reach)
+        assert v.shape == (L, C) and bool((v[:, ~valid] == 0).all())
+        torch.testing.assert_close(both[p], v, rtol=1e-12, atol=1e-12)
+        for j in range(L):
+            c = int(tree.contrib[ev.ids[j], 0])
+            ref = c * ((reach[1 - p, j] * valid) @ E.t()) * valid
+            assert torch.allclose(v[j], ref, atol=1e-9 * max(1.0, float(ref.abs().max()))), (p, j)
+    opp = reach[0] * ev.valid
+    mx = ev.opponent_mass(opp, ev.cards)
+    for slot in (0, 30, 48):
+        x = ev.cards[:, slot]
+        avoid = torch.stack([valid_mask([int(t)]) for t in x])
+        assert torch.allclose(mx[:, slot] * avoid, blocked_sum(opp * avoid) * avoid, atol=1e-10)
+    # a turn-start net cannot value turn-end leaves, nor a turn-end net flop-end ones
+    with pytest.raises(ValueError, match="3-card"):
+        FlopEndLeafEvaluator(_flop_tree(cfg, s, depth=1), oracle)
+    with pytest.raises(ValueError, match="turn-start net"):
+        TurnEndLeafEvaluator(tree, RiverAveragePredictor(ShowdownOracle()))
+
+
+class _ToyTurn:
+    """A nonlinear turn 'net' that depends on both ranges, the 4-card board,
+    ``c`` and ``stack`` (0 on combos that hit the board), to check the plumbing."""
+
+    kind = "turn_end"
+
+    def predict(self, boards, ranges, c, stack):
+        valid = vrg.board_valid(boards.to(ranges.device))[:, None, :]
+        r = ranges / ranges.sum(-1, keepdim=True).clamp(min=1e-30)
+        z = 300.0 * r - 200.0 * r.flip(1) + (boards.sum(1).to(r.dtype) / 200.0)[:, None, None]
+        z = z + (c.to(r.dtype) / 1000.0 - stack.to(r.dtype) / 20000.0)[:, None, None]
+        z = z + torch.tensor([0.1, -0.2], dtype=r.dtype, device=r.device)[None, :, None]
+        return torch.tanh(z) * valid
+
+
+class _ToyTurnStart(_ToyTurn):
+    kind = "turn_start"
+
+
+def test_flop_solve_with_flop_end_leaves_matches_the_two_street_solve():
+    """A depth_streets 0 flop solve whose flop-end leaves use a turn-start
+    predictor ``P`` equals a flop + turn solve with a checked-down turn (all 49
+    turn cards dealt by chance nodes) whose turn-end leaves use the same ``P``
+    as a turn-end predictor: values, best responses, exploitability and every
+    flop strategy. ``P`` is nonlinear in both ranges (the check-down oracle is
+    checked against the dense enumeration above)."""
+    cfg, s = _flop_state()
+    tree_a = _flop_tree(cfg, s)
+    tree_b = _flop_tree(cfg, s, ActionSpec(streets=(BIG, BIG, PASS, PASS), max_raises=2), 1)
+    turn_dec = [n for n in range(tree_b.num_nodes) if int(tree_b.street[n]) == 2]
+    assert turn_dec and all(int(tree_b.num_children[n]) == 1 for n in turn_dec)
+    # the tree stores chance weights in float32 (1/45 to 6e-8): use the exact float64 one
+    dealt = tree_b.deal_card >= 0
+    assert int(dealt.sum()) == 49 * tree_a.count(VALUE)
+    tree_b.chance_weight = torch.where(dealt, 1.0 / 45, tree_b.chance_weight.double())
+    g = torch.Generator().manual_seed(1)
+    r = torch.rand(2, C, generator=g, dtype=torch.float64) * valid_mask(s.board)
+    sc = SolverConfig(dtype="float64")
+    sa = RangeSolver(tree_a, r, sc, value_leaves=FlopEndLeafEvaluator(tree_a, _ToyTurnStart()))
+    sb = RangeSolver(tree_b, r, sc, value_leaves=TurnEndLeafEvaluator(tree_b, _ToyTurn()))
+    sa.solve(10)
+    sb.solve(10)
+    pot = int(s.pot)
+    ea, eb = sa.exploitability(), sb.exploitability()
+    for k in ("br", "ev"):
+        for p in (0, 1):
+            assert abs(ea[k][p] - eb[k][p]) < 1e-10 * pot, (k, ea, eb)
+    for p in (0, 1):
+        for br in (False, True):
+            va, _ = sa.values(p, best_response=br)
+            vb, _ = sb.values(p, best_response=br)
+            assert float((va[0] - vb[0]).abs().max()) < 1e-10 * float(vb[0].abs().max()), (p, br)
+    flop_b = {
+        tree_b.histories[n]: n
+        for n in range(tree_b.num_nodes)
+        if int(tree_b.street[n]) == 1 and int(tree_b.kind[n]) == DECISION
+    }
+    dec_a = [n for n in range(tree_a.num_nodes) if int(tree_a.kind[n]) == DECISION]
+    assert len(dec_a) == len(flop_b)
+    for n in dec_a:
+        diff = sa.node_strategy(n) - sb.node_strategy(flop_b[tree_a.histories[n]])
+        assert float(diff.abs().max()) < 1e-9
+
+
+# --------------------------------------------------------------------------- agent
+
+SMALL_ACTIONS = [[list(a) for a in BIG]] * 4
+TINY_TS = {
+    "device": "cpu",
+    "time_budget": 0.02,
+    "min_iterations": 2,
+    "fallback_on_error": False,
+    "tree": {"actions": SMALL_ACTIONS, "max_raises": 1, "depth_streets": 0, "max_nodes": 1500},
+    "solver": {"iterations": 3, "max_runouts": 6},
+    "leaf": {"mode": "value_net", "net_every": 1},
+    "gadget": {"rollouts": 8},
+}
+
+
+def _play(agent, hands=6, seed=0):  # seed 0: decisions on every street
+    config = get_engine().GameConfig(
+        num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100, ante=0
+    )
+    res = run_match([agent, RandomAgent()], config, num_hands=hands, seed=seed)
+    assert res.hands == hands and int(res.seat_payoffs.sum()) == 0
+    assert not any(st.get("fallback") for st in agent.stats)
+    return {k: [st for st in agent.stats if st.get("street") == k] for k in (1, 2, 3)}
+
+
+def _with(base, **sections):
+    out = dict(base)
+    for k, v in sections.items():
+        out[k] = {**base.get(k, {}), **v}
+    return out
+
+
+def test_agent_with_flop_end_and_turn_end_leaves_plays_legal_hands(tmp_path):
+    oracle = _TurnStartOracle(ShowdownOracle(max_boards=4096))
+    turn_end = RiverAveragePredictor(ShowdownOracle(max_boards=4096))
+    # 1. flop depth 0 (turn-start oracle), the turn solved to showdown
+    cfg1 = _with(TINY_TS, tree={"depth_streets_turn": 1})
+    a = SearchAgent(UniformBlueprint(), cfg1, value_predictor=oracle)
+    by = _play(a)
+    assert by[1] and all(st["value_provider"] == "FlopEndLeafEvaluator" for st in by[1])
+    assert all(st["value_net_rows"] % 49 == 0 and st["value_leaves"] > 0 for st in by[1])
+    assert by[2] and all(st["value_leaves"] == 0 for st in by[2])
+    # 2. the turn depth-limited too: turn-end leaves from the turn predictor
+    cfg2 = _with(TINY_TS, tree={"depth_streets_turn": 0})
+    b = SearchAgent(UniformBlueprint(), cfg2, value_predictor=oracle, turn_value_predictor=turn_end)
+    by = _play(b)
+    assert by[1] and all(st["value_provider"] == "FlopEndLeafEvaluator" for st in by[1])
+    assert by[2] and all(st["value_provider"] == "TurnEndLeafEvaluator" for st in by[2])
+    assert all(st["value_leaves"] > 0 for st in by[2])
+    # 3. both nets from checkpoints (leaf.net turn-start, leaf.turn_net turn-end)
+    net = _noisy_net(ValueNetConfig(buckets=16, width=32, layers=2))
+    ts, te = tmp_path / "ts.pt", tmp_path / "te.pt"
+    save_turn_net(ts, net, spread_buckets=2, kind="turn_start")
+    save_turn_net(te, net, spread_buckets=2)
+    cfg3 = _with(cfg2, leaf={"net": str(ts), "turn_net": str(te)})
+    c = SearchAgent(UniformBlueprint(), cfg3)
+    assert type(c.get_value_predictor()) is TurnStartPredictor
+    assert type(c.get_turn_value_predictor()) is TurnEndPredictor
+    by = _play(c, hands=4, seed=4)
+    assert by[1] and all(st["value_provider"] == "FlopEndLeafEvaluator" for st in by[1])
+    assert all(st["value_provider"] == "TurnEndLeafEvaluator" for st in by[2])
+
+
+def test_depth_streets_turn_sets_the_depth_of_turn_trees():
+    engine = get_engine()
+    cfg = _engine_config(2000)
+    s = make_state(engine, cfg, 0, FLOP_BOARD[:4], [])
+    for _ in range(4):
+        s.apply(engine.Action.check_call())
+    assert int(s.street) == 2
+
+    def tree(**kw):
+        tc = TreeConfig(spec=SMALL, max_nodes=10**6, leaf_mode="value_net", **kw)
+        return build_tree(cfg, s.button, s.board, s.history, tc)
+
+    assert tree(depth_streets=1).count(VALUE) == 0  # today: the turn runs to showdown
+    limited = tree(depth_streets=1, depth_streets_turn=0)
+    assert limited.count(VALUE) > 0 and limited.last_street == 2
+    assert torch.equal(limited.kind, tree(depth_streets=0).kind)  # None: depth_streets
+    assert tree(depth_streets=0, depth_streets_turn=1).count(VALUE) == 0
+    flop_cfg, flop = _flop_state()
+    t = build_tree(
+        flop_cfg,
+        flop.button,
+        flop.board,
+        flop.history,
+        TreeConfig(spec=SMALL, depth_streets=0, depth_streets_turn=1, leaf_mode="value_net"),
+    )
+    assert t.last_street == 1 and all(len(t.boards[int(b)]) == 3 for b in t.board_id)
+
+
+def test_agent_rejects_inconsistent_turn_start_configs():
+    oracle = _TurnStartOracle(ShowdownOracle())
+    engine = get_engine()
+    config = engine.GameConfig(num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100)
+    s = make_state(engine, config, 0, FLOP_BOARD, [])
+    s.apply(engine.Action.raise_to(250))
+    s.apply(engine.Action.check_call())
+    rng = np.random.default_rng(0)
+
+    def act(cfg, **kw):
+        agent = SearchAgent(UniformBlueprint(), cfg, value_predictor=oracle, **kw)
+        agent.new_hand(int(s.current_player), config)
+        return agent.act(s, int(s.current_player), rng)
+
+    with pytest.raises(ValueError, match="depth_streets: 0"):
+        act(_with(TINY_TS, tree={"depth_streets": 1}))
+    with pytest.raises(ValueError, match="leaf.turn_net"):
+        act(TINY_TS)  # depth_streets_turn defaults to depth_streets (0) without a turn net
+    with pytest.raises(ValueError, match="turn-end or river"):
+        act(_with(TINY_TS, tree={"depth_streets_turn": 0}), turn_value_predictor=oracle)
+    assert act(_with(TINY_TS, tree={"depth_streets_turn": 1})) is not None
