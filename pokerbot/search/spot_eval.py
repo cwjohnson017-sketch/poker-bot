@@ -58,13 +58,13 @@ from typing import Any
 import numpy as np
 import torch
 
-from .abstract import RAISE, legal_options
-from .blueprint import policy_matrix
 from .combos import NUM_COMBOS, blocked_sum
 from .config import SearchConfig, search_config
 from .exact_eval import map_sigma, node_key, trunk_exploitability
+from .gadget import gadget_violation
 from .solver import RangeSolver
 from .tree import DECISION, LEAF, VALUE, SubgameTree
+from .tree_policy import blueprint_profile, blueprint_sigma
 from .value_leaf import FixedLeafValues
 
 C = NUM_COMBOS
@@ -143,6 +143,10 @@ class EvalSettings:
     variants: tuple[str, ...] = ()
     turn_net: str | None = None  # turn-end net checkpoint for the value_net_turn* variants
     search: dict = field(default_factory=dict)  # extra search_config overrides (every search)
+    # named value-net searches with their own overrides on top of ``search``, e.g.
+    # {"gadget_br": {"gadget": {"terminate": "blueprint_br"}}}; same tree, own profile
+    extra: dict = field(default_factory=dict)
+    rollout: bool = True  # also run (and score) the default rollout search
 
     def torch_device(self) -> torch.device:
         if self.device == "auto":
@@ -353,50 +357,6 @@ def check_same_trunk(a: SearchRun, b: SearchRun, rtol: float = 1e-5) -> dict:
 # -- blueprint profile --------------------------------------------------------------
 
 
-def blueprint_profile(solver: RangeSolver, bp: Any) -> tuple[torch.Tensor, torch.Tensor]:
-    """The blueprint's strategy on every decision node of ``solver``'s tree,
-    ``[D, A, C]``, and the blueprint mass on actions the tree lacks, ``[D, C]``.
-
-    Children are matched to the blueprint's legal options at the node's state by
-    concrete action; mass on blueprint actions missing from the tree (sizes the
-    node budget dropped) is renormalised over the tree's children (uniform where
-    none match), as ``exploit.py`` did. A ``LEAF`` node of a rollout tree plays
-    the plain blueprint continuation (index 0)."""
-    tree = solver.tree
-    dev, dt = solver.device, solver.dtype
-    sigma = solver.uniform.clone()
-    dropped = torch.zeros(solver.Dn, C, device=dev, dtype=dt)
-    for d, node in enumerate(solver.dec_nodes.tolist()):
-        kind = int(tree.kind[node])
-        if kind == LEAF:
-            sigma[d] = 0
-            sigma[d, 0] = 1
-            continue
-        if kind != DECISION:
-            continue
-        n = int(tree.num_children[node])
-        st = tree.states[node]
-        P = policy_matrix(bp, st, int(tree.actor[node])).to(dev, dt).expand(C, -1)  # [C, A]
-        col = {(o.kind, o.amount): o.index for o in legal_options(st, bp.spec)}
-        S = torch.zeros(C, n, device=dev, dtype=dt)
-        for j, (k, amt) in enumerate(tree.child_actions(node)):
-            i = col.get((int(k), int(amt) if int(k) == RAISE else 0))
-            if i is not None:
-                S[:, j] = P[:, i]
-        tot = S.sum(1, keepdim=True)
-        dropped[d] = (1 - tot[:, 0]).clamp(min=0)
-        S = torch.where(tot > 0, S / tot.clamp(min=1e-30), torch.full_like(S, 1.0 / n))
-        sigma[d] = 0
-        sigma[d, :n] = S.t()
-    return sigma, dropped
-
-
-def blueprint_sigma(solver: RangeSolver, bp: Any) -> torch.Tensor:
-    """The blueprint's ``[D, A, C]`` strategy on ``solver``'s tree (see
-    :func:`blueprint_profile`)."""
-    return blueprint_profile(solver, bp)[0]
-
-
 @torch.no_grad()
 def offtree_mass(solver: RangeSolver, sigma: torch.Tensor, dropped: torch.Tensor) -> float:
     """Expected number of decisions per hand, under ``sigma`` on the plain root
@@ -442,10 +402,12 @@ def score_profile(
     settings: EvalSettings,
     log: Callable[[str], None] | None = None,
     batch: int | None = None,
+    root_values: bool = False,
 ) -> dict:
     """:func:`~pokerbot.search.exact_eval.trunk_exploitability` of ``sigma`` with
     chips converted to mbb/hand (``1000 * chips / big blind``). ``batch``
-    overrides ``settings.river_batch``."""
+    overrides ``settings.river_batch``. ``root_values`` adds the per-combo root
+    best-response values ``[2, C]`` (a tensor, under ``"root_values"``)."""
     batch = settings.river_batch if batch is None else int(batch)
     res = trunk_exploitability(
         eval_solver,
@@ -457,9 +419,12 @@ def score_profile(
         min_mass=settings.min_mass,
         batch=batch,
         log=log,
+        root_values=root_values,
     )
     mbb = 1000.0 / float(game_config.big_blind)
+    extra = {"root_values": res["root_values"]} if root_values else {}
     return {
+        **extra,
         "chips": float(res["exploitability"]),
         "mbb": float(res["exploitability"]) * mbb,
         "br": [float(x) for x in res["br"]],
@@ -498,6 +463,49 @@ def _jsonable(x: Any) -> Any:
     if isinstance(x, float) and not math.isfinite(x):
         return str(x)
     return x
+
+
+@torch.no_grad()
+def safety_vs(
+    eval_solver: RangeSolver,
+    values: torch.Tensor,
+    reference: torch.Tensor,
+    seat: int,
+    mbb: float = 10.0,
+    tol: float = 0.01,
+) -> dict:
+    """How much more the searcher's opponent gets, combo by combo, against a
+    profile than against ``reference`` (the blueprint), in the exact game.
+
+    ``values`` / ``reference`` are :func:`score_profile`'s per-combo root
+    best-response values ``[2, C]``. Safe resolving promises ``values <=
+    reference`` for every opponent combo (Burch et al.); an opponent whose
+    range differs from the one the search assumed collects the excess. With
+    ``m(c')`` the searcher's root mass disjoint from ``c'`` and ``d = max(0,
+    values - reference)``:
+
+    * ``excess_mbb``: ``sum r_o d / Z``, weighted by the assumed opponent range;
+    * ``excess_uniform_mbb``: the same for an opponent holding a uniformly
+      random hand;
+    * ``worst_combo_mbb``: the largest per-hand excess ``d / m`` of any combo;
+    * ``frac_worse``: the share of combos with ``d / m`` above ``tol`` of the pot.
+    """
+    opp = 1 - seat
+    r = eval_solver.ranges
+    m = blocked_sum(r[seat])
+    ok = (m > 1e-12 * float(m.max().clamp(min=1e-30))) & (eval_solver.board_valid_root > 0)
+    d = (values[opp] - reference[opp]).to(m)
+    pos = d.clamp(min=0) * ok
+    Z = float(eval_solver.pair_mass())
+    u = ok.to(m) / ok.sum().clamp(min=1)
+    per_hand = torch.where(ok, d / m.clamp(min=1e-30), torch.zeros_like(d))
+    pot = float(eval_solver.tree.contrib[0].sum())
+    return {
+        "excess_mbb": float((r[opp] * pos).sum()) / Z * mbb,
+        "excess_uniform_mbb": float((u * pos).sum() / (u * m).sum()) * mbb,
+        "worst_combo_mbb": float(per_hand[ok].max()) * mbb,
+        "frac_worse": float((per_hand[ok] > tol * pot).float().mean()),
+    }
 
 
 # -- one spot -----------------------------------------------------------------------
@@ -568,7 +576,8 @@ def evaluate_spot(
     log(f"{spot.label}: board {list(state.board)}, seat {int(state.current_player)} to act")
     # the value-net search first: its blueprint queries then start cold, as in play
     runs: dict[str, SearchRun] = {"value_net": search("value_net", vn_over(), True)}
-    runs["rollout"] = search("rollout", ro_over, False)
+    if settings.rollout:
+        runs["rollout"] = search("rollout", ro_over, False)
     for name in settings.variants:
         v = parse_variant(name)
         if v["turn"] and not settings.turn_net:
@@ -576,10 +585,13 @@ def evaluate_spot(
         path = settings.turn_net if v["turn"] else net_path
         over = vn_over(v["net_every"], settings.budget if v["budget"] else None, path)
         runs[name] = search(name, over, True, own_net=v["turn"])
+    for name, extra in settings.extra.items():
+        runs[name] = search(name, _merge(vn_over(), extra), True)
     vrun = runs["value_net"]
     vsolver = vrun.solver
-    check = check_same_trunk(vrun, runs["rollout"])
-    for name in settings.variants:
+    others = [n for n in runs if n != "value_net"]
+    check = check_same_trunk(vrun, runs[others[0]] if others else vrun)
+    for name in others[1:]:
         check_same_trunk(vrun, runs[name])
     log(
         f"  trunk check ok: {check['decision_nodes']} decision nodes, {check['leaves']} leaves, "
@@ -588,8 +600,7 @@ def evaluate_spot(
 
     # strategies on the value-net tree
     sigmas: dict[str, torch.Tensor] = {"value_net": vsolver.average_strategy()}
-    sigmas["rollout"], _ = map_sigma(runs["rollout"].solver, vsolver, strict=True)
-    for name in settings.variants:
+    for name in others:
         sigmas[name], _ = map_sigma(runs[name].solver, vsolver, strict=True)
     t_bp = time.perf_counter()
     sigmas["blueprint"], dropped = blueprint_profile(vsolver, blueprint)
@@ -601,6 +612,10 @@ def evaluate_spot(
             **run.stats,
             "act_seconds": run.seconds,
             "self_exploitability": _self_exploitability(run, game_config),
+            # sum_c' prior(c') max(0, BR_enter(c') - T(c')) in chips, in the search's own game
+            "gadget_violation": (
+                gadget_violation(run.solver) if run.solver.gadget is not None else None
+            ),
         }
     nodes = {name: int(run.solver.tree.num_nodes) for name, run in runs.items()}
     tree = vsolver.tree
@@ -611,8 +626,10 @@ def evaluate_spot(
     _free()
     offtree = offtree_mass(eval_solver, sigmas["blueprint"], dropped)
     profiles: dict[str, dict] = {}
-    order = [*BASE_PROFILES, *settings.variants]
+    order = [n for n in BASE_PROFILES if n in sigmas]
+    order += [n for n in sigmas if n not in BASE_PROFILES]
     batch = [settings.river_batch]
+    root_values: dict[str, torch.Tensor] = {}
     for name in order:
         res = _score_with_retry(
             batch,
@@ -623,13 +640,17 @@ def evaluate_spot(
             game_config,
             settings,
             log=lambda m, n=name: log(f"    [{n}] {m.lstrip('# ').strip()}"),
+            root_values=True,
         )
+        root_values[name] = res.pop("root_values")
         profiles[name] = res
         log(
             f"  {name}: {res['mbb']:.0f} mbb/hand (BR {res['br'][0]:.1f} / {res['br'][1]:.1f} "
             f"chips, {res['instances']} river subgames, {res['skipped']} skipped, "
             f"bound {res['skip_bound_mbb']:.2g} mbb, scored in {res['seconds']:.0f}s)"
         )
+    seat = int(state.current_player)
+    mbb = 1000.0 / float(game_config.big_blind)
     out = {
         "label": spot.label,
         "board_index": spot.board_index,
@@ -648,6 +669,11 @@ def evaluate_spot(
         "searches": searches,
         "reference_sanity": searches["value_net"]["self_exploitability"],
         "profiles": profiles,
+        "safety": {
+            name: safety_vs(eval_solver, root_values[name], root_values["blueprint"], seat, mbb)
+            for name in order
+            if name != "blueprint"
+        },
         "blueprint_offtree": offtree,
         "blueprint_seconds": t_bp,
         "seconds": time.perf_counter() - t_spot,
@@ -774,7 +800,8 @@ def _f(x: Any, nd: int = 0) -> str:
 
 
 def _columns(spots: Sequence[dict]) -> list[str]:
-    cols = list(BASE_PROFILES)
+    have = {name for s in spots for name in s["profiles"]}
+    cols = [c for c in BASE_PROFILES if c in have or not spots]
     for s in spots:
         for name in s["profiles"]:
             if name not in cols:
@@ -805,6 +832,8 @@ def render_markdown(data: dict) -> str:
         f"plain root ranges; all-ins over {allin}. "
         f"Exploitability = (BR_0 + BR_1) / 2 in mbb/hand (1 bb = 100 chips)."
     )
+    for name, over in (st.get("extra") or {}).items():
+        lines.append(f"`{name}`: value-net search with `{json.dumps(over)}`.")
     if any(v == "value_net_budget" for v in st.get("variants", [])):
         lines.append(
             f"`value_net_budget`: value-net search under a {st['budget']:g}s budget "
@@ -885,6 +914,47 @@ def render_markdown(data: dict) -> str:
             f"exploitability in its own game (as judged by its leaf model).",
         ]
 
+    # safety: per-combo excess over the blueprint for the searcher's opponent
+    safe_cols = [
+        c for c in cols if c != "blueprint" and any(c in s.get("safety", {}) for s in spots)
+    ]
+    if safe_cols:
+        lines += [
+            "",
+            "## Per-combo excess over the blueprint (mbb/hand)",
+            "",
+            "For each hand the opponent of the searcher may hold, how much more its best "
+            "response gets against the profile than against the blueprint (exact game). Safe "
+            "resolving promises no excess for any hand; an opponent whose range differs from "
+            "the assumed one collects it. Cells: excess weighted by the assumed opponent "
+            "range / by a uniformly random hand / worst single hand (mbb per hand of that "
+            "combo) / share of hands worse by more than 1% of the pot.",
+            "",
+        ]
+        sh = ["spot"] + [PROFILE_NAMES.get(c, c) for c in safe_cols]
+        lines.append("| " + " | ".join(sh) + " |")
+        lines.append("|---|" + "---:|" * (len(sh) - 1))
+
+        def scell(xs: Sequence[dict]) -> str:
+            if not xs:
+                return ""
+            m = {k: _mean([x[k] for x in xs]) for k in xs[0]}
+            return (
+                f"{_f(m['excess_mbb'])} / {_f(m['excess_uniform_mbb'])} / "
+                f"{_f(m['worst_combo_mbb'])} / {_f(100 * m['frac_worse'], 1)}%"
+            )
+
+        def srow(label: str, g: Sequence[dict]) -> str:
+            cells = [label]
+            for c in safe_cols:
+                cells.append(scell([s["safety"][c] for s in g if c in s.get("safety", {})]))
+            return "| " + " | ".join(cells) + " |"
+
+        for s in spots:
+            lines.append(srow(s["label"], [s]))
+        for name, g in groups:
+            lines.append(srow(name, g))
+
     # timing
     lines += ["", "## Timing per decision (seconds)", ""]
     th = [
@@ -899,6 +969,8 @@ def render_markdown(data: dict) -> str:
         "ms/iter",
         "nodes",
         "value leaves",
+        "gadget",
+        "gadget violation (chips)",
     ]
     lines.append("| " + " | ".join(th) + " |")
     lines.append("|---|---|" + "---:|" * (len(th) - 2))
@@ -927,6 +999,8 @@ def render_markdown(data: dict) -> str:
             _f(ms, 1),
             _f(m("nodes"), 0),
             _f(m("value_leaves"), 0),
+            "/".join(sorted({str(x.get("gadget", "")) for x in xs})),
+            _f(m("gadget_violation"), 2),
         ]
         return "| " + " | ".join(cells) + " |"
 

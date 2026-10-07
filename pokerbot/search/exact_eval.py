@@ -118,13 +118,16 @@ def trunk_exploitability(
     river_cfg: SolverConfig | None = None,
     log: Any = None,
     keep_river: list | None = None,
+    root_values: bool = False,
 ) -> dict:
     """Exploitability of ``sigma`` (``[D, A, C]`` on ``solver``'s tree, whose
     depth-limit leaves are ``VALUE`` nodes at the end of the turn) with an
     exact river; see the module docstring. ``ranges`` defaults to the solver's
     plain root ranges. Values in chips per hand. ``keep_river`` (a list) receives
     ``(leaf history, 5-card board, river tree, [N, C] river strategy)`` per
-    solved river subgame, for tests."""
+    solved river subgame, for tests. ``root_values`` adds ``"root_values"``:
+    each player's per-combo best-response counterfactual values at the root,
+    ``[2, C]`` (weighted by the other player's root reach)."""
     from .batch_solver import BatchRiverSolver, river_tree
     from .value_leaf import FixedLeafValues
 
@@ -208,13 +211,17 @@ def trunk_exploitability(
     old = term.value_leaves
     term.value_leaves = fixed
     br = []
+    rv = []
     try:
         for p in (0, 1):
             vb, _ = solver.values(p, sigma, True, root)
             br.append(float((root[p] * vb[0]).sum() / Z))
+            rv.append(vb[0].clone())
     finally:
         term.value_leaves = old
+    extra = {"root_values": torch.stack(rv)} if root_values else {}
     return {
+        **extra,
         "br": br,
         "exploitability": (br[0] + br[1]) / 2,
         "skip_bound": skip_bound * float(root_mass[0] * root_mass[1]) / Z if L else 0.0,

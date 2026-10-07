@@ -5,6 +5,7 @@ profile, strict strategy mapping, the trunk check, and resuming a run."""
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -15,7 +16,7 @@ from pokerbot.search import UniformBlueprint
 from pokerbot.search import spot_eval as se
 from pokerbot.search.abstract import legal_options
 from pokerbot.search.blueprint import policy_matrix
-from pokerbot.search.combos import NUM_COMBOS
+from pokerbot.search.combos import NUM_COMBOS, blocked_sum
 from pokerbot.search.exact_eval import map_sigma, node_key
 from pokerbot.search.solver import RangeSolver
 from pokerbot.search.tree import DECISION, VALUE, TreeConfig, build_tree
@@ -123,6 +124,59 @@ def test_spot_end_to_end(spot_result):
     json.dumps(res)  # JSON-ready
     md = se.render_markdown({"settings": TINY.comparable(), "meta": {}, "spots": [res]})
     assert "| **mean** |" in md and "board0 BTN vs 1/2 lead" in md
+
+
+def test_extra_searches_and_safety():
+    """Named extra searches (gadget variants) share the trunk; without the
+    rollout search; per-combo excess over the blueprint for every profile."""
+    engine, cfg = _config()
+    (spot,) = se.exploit_spots(engine, cfg, 1, 5, ["bb_first"])
+    extra = {
+        "unsafe_first": {"gadget": {"terminate": "unsafe"}},
+        "gadget_br": {"gadget": {"terminate": "blueprint_br"}},
+    }
+    settings = replace(TINY, rollout=False, extra=extra)
+    res = se.evaluate_spot(
+        spot, UniformBlueprint(SPEC), cfg, settings, ShowdownOracle, log=lambda m: None
+    )
+    assert set(res["profiles"]) == {"value_net", "blueprint", *extra}
+    assert set(res["safety"]) == {"value_net", *extra}
+    gad = {name: res["searches"][name]["gadget"] for name in res["searches"]}
+    assert gad == {"value_net": "rollouts", "unsafe_first": "unsafe", "gadget_br": "blueprint_br"}
+    assert res["searches"]["unsafe_first"]["gadget_violation"] is None
+    assert res["searches"]["gadget_br"]["gadget_violation"] >= 0
+    for name, s in res["safety"].items():
+        assert s["excess_mbb"] >= 0 and s["excess_uniform_mbb"] >= 0, name
+        assert 0 <= s["frac_worse"] <= 1
+    json.dumps(res)
+    md = se.render_markdown({"settings": settings.comparable(), "meta": {}, "spots": [res]})
+    assert "Per-combo excess over the blueprint" in md and "gadget_br" in md
+    assert "rollout search" not in md
+
+
+def test_safety_vs_measures_the_excess():
+    engine, cfg = _config()
+    (spot,) = se.exploit_spots(engine, cfg, 1, 5, ["bb_first"])
+    s = spot.state
+    tc = TreeConfig(spec=SPEC, max_nodes=300, leaf_mode="value_net", chance_cards=2)
+    tree = build_tree(cfg, s.button, s.board, s.history, tc, searcher=int(s.current_player))
+    L = int((tree.kind == VALUE).sum())
+    g = torch.Generator().manual_seed(0)
+    ranges = torch.rand(2, NUM_COMBOS, generator=g)
+    solver = RangeSolver(tree, ranges, value_leaves=FixedLeafValues(torch.zeros(2, L, NUM_COMBOS)))
+    seat = int(s.current_player)
+    ref = torch.rand(2, NUM_COMBOS, generator=g)
+    same = se.safety_vs(solver, ref, ref, seat)
+    assert same["excess_mbb"] == 0 and same["worst_combo_mbb"] == 0 and same["frac_worse"] == 0
+    worse = ref.clone()
+    worse[1 - seat] += 1.0  # one chip more per unit of searcher mass, for every combo
+    out = se.safety_vs(solver, worse, ref, seat)
+    m = blocked_sum(solver.ranges[seat])
+    ok = solver.board_valid_root > 0
+    Z = float(solver.pair_mass())
+    want = float((solver.ranges[1 - seat] * ok).sum()) / Z * 10
+    assert out["excess_mbb"] == pytest.approx(want, rel=1e-5)
+    assert out["worst_combo_mbb"] == pytest.approx(float((10 / m[ok]).max()), rel=1e-5)
 
 
 def test_blueprint_sigma_rows_sum_to_one(spot_result):
