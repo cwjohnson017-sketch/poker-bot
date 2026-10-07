@@ -150,25 +150,36 @@ class _Terminal:
 class _Kernels:
     """Per-instance fold and showdown operators on the compact combo layout:
     opponent reach rows ``r [n, B, 1081]`` -> values ``[n, B, 1081]``. The
-    batched matmuls run over instances on transposed views."""
+    batched matmuls run over instances on transposed views. ``showdown=False``
+    skips the showdown matrices (a tree without showdowns)."""
 
-    def __init__(self, boards: torch.Tensor, cmap: torch.Tensor, dtype: torch.dtype) -> None:
+    def __init__(
+        self, boards: torch.Tensor, cmap: torch.Tensor, dtype: torch.dtype, showdown: bool = True
+    ) -> None:
         dev = cmap.device
-        B = cmap.shape[0]
-        inc = torch.zeros(B, CV, 52, device=dev, dtype=dtype)
+        B, cv = cmap.shape
+        inc = torch.zeros(B, cv, 52, device=dev, dtype=dtype)
         inc.scatter_(2, combo_table(dev)[cmap], 1.0)
         self.inc = inc
         # total - S[x1] - S[x2] = S @ (1/2 - inc^T), S = per-card mass
         self.fold_m = (0.5 - inc).transpose(1, 2).contiguous()
+        self.K = self._showdown_matrix(boards, cmap, dtype) if showdown else None
+
+    @staticmethod
+    def _showdown_matrix(boards: torch.Tensor, cmap: torch.Tensor, dtype: torch.dtype):
+        """``K_b[c', c] = sign(s(c) - s(c'))`` over disjoint pairs, ``[B, 1081, 1081]``."""
+        dev = cmap.device
+        B = cmap.shape[0]
         strength = combo_strengths(boards).gather(1, cmap)  # [B, CV]
         conflict = conflict_matrix(dev)
-        self.K = torch.empty(B, CV, CV, device=dev, dtype=dtype)
+        K = torch.empty(B, CV, CV, device=dev, dtype=dtype)
         step = 16
         for b in range(0, B, step):
             s = strength[b : b + step]
             cm = cmap[b : b + step]
             ok = ~conflict[cm[:, :, None], cm[:, None, :]]
-            self.K[b : b + step] = torch.sign(s[:, None, :] - s[:, :, None]) * ok
+            K[b : b + step] = torch.sign(s[:, None, :] - s[:, :, None]) * ok
+        return K
 
     def fold(self, r: torch.Tensor) -> torch.Tensor:
         """Opponent mass disjoint from each combo (in place: ``r`` becomes the
@@ -184,6 +195,11 @@ class _Kernels:
 
 
 class BatchRiverSolver:
+    # instances' board length and the combos disjoint from such a board (subclasses
+    # for other streets, e.g. batch_turn_solver.BatchTurnSolver, override both)
+    board_len = 5
+    num_valid = CV
+
     def __init__(
         self,
         tree: SubgameTree,
@@ -209,30 +225,32 @@ class BatchRiverSolver:
             boards.tolist() if isinstance(boards, torch.Tensor) else [list(b) for b in boards],
             dtype=torch.long,
         )
-        if bt.dim() != 2 or bt.shape[1] != 5:
-            raise ValueError(f"boards must be [B, 5], got {tuple(bt.shape)}")
+        nb = self.board_len
+        if bt.dim() != 2 or bt.shape[1] != nb:
+            raise ValueError(f"boards must be [B, {nb}], got {tuple(bt.shape)}")
         srt = bt.sort(1).values
         if bool((bt < 0).any() | (bt > 51).any() | (srt[:, 1:] == srt[:, :-1]).any()):
-            raise ValueError("every board needs 5 distinct cards in 0..51")
+            raise ValueError(f"every board needs {nb} distinct cards in 0..51")
         self.boards = [tuple(int(x) for x in b) for b in bt.tolist()]
         B = self.B = len(self.boards)
+        cv = self.num_valid
         self.valid = valid_masks(self.boards, dev)  # [B, C]
-        self.cmap = self.valid.nonzero()[:, 1].view(B, CV)
+        self.cmap = self.valid.nonzero()[:, 1].view(B, cv)
         self.chunk_rows = int(chunk_rows)
         self.pot = int(tree.contrib[0].sum())
         self.ranges = self._compact_ranges(ranges)
         self._layout(tree)
-        self.kern = _Kernels(bt.to(dev), self.cmap, self.dtype)
+        self.kern = self._kernels(bt.to(dev))
         N = self.N
         z = dict(device=dev, dtype=self.dtype)
-        self.regret = torch.zeros(N, B, CV, **z)
-        self.strat_sum = torch.zeros(N, B, CV, **z)
-        self.sigma = torch.empty(N, B, CV, **z)
+        self.regret = torch.zeros(N, B, cv, **z)
+        self.strat_sum = torch.zeros(N, B, cv, **z)
+        self.sigma = torch.empty(N, B, cv, **z)
         self.sigma[0] = 1
         for g in self.segs:
             self.sigma[g.s : g.e] = 1.0 / g.k
-        self.reach = torch.empty(N + 1, B, CV, **z)
-        self.v = torch.empty(N, B, CV, **z)
+        self.reach = torch.empty(N + 1, B, cv, **z)
+        self.v = torch.empty(N, B, cv, **z)
         self._reach_ok = [False, False]
         self._scal = torch.zeros(3, **z).unbind(0)  # discounts a, b; strategy weight w
         self._use_graph = bool(cuda_graph) and dev.type == "cuda"
@@ -254,6 +272,10 @@ class BatchRiverSolver:
             )
         if int(tree.kind[0]) != DECISION:
             raise ValueError("the root of the river tree must be a decision node")
+
+    def _kernels(self, boards: torch.Tensor) -> _Kernels:
+        """The fold and showdown operators of the instances (``boards`` on the device)."""
+        return _Kernels(boards, self.cmap, self.dtype)
 
     def _compact_ranges(self, ranges: torch.Tensor) -> torch.Tensor:
         r = torch.as_tensor(ranges).to(self.device, self.dtype)
@@ -288,6 +310,7 @@ class BatchRiverSolver:
         for n in range(1, N):
             for p in (0, 1):
                 src[p][n] = inv[n] if pa[n] == p else src[p][parent[n]]
+        self._inv, self._src = inv, src  # for subclasses' extra terminals
         self.segs: list[_Seg] = []
         i = 1
         while i < N:
@@ -341,7 +364,7 @@ class BatchRiverSolver:
     # -- passes -------------------------------------------------------------
 
     def _view(self, x: torch.Tensor, g: _Seg) -> torch.Tensor:
-        return x[g.s : g.e].view(g.m, g.k, self.B, CV)
+        return x[g.s : g.e].view(g.m, g.k, self.B, self.num_valid)
 
     # A strategy is a function of a segment returning its ``[m, k, B, 1081]`` rows.
 
@@ -373,7 +396,7 @@ class BatchRiverSolver:
                 r = F.embedding_bag(
                     term.src[1 - i][:, None], R, per_sample_weights=term.coef[i], mode="sum"
                 )
-                v.index_copy_(0, term.ids, op(r.view(-1, self.B, CV)))
+                v.index_copy_(0, term.ids, op(r.view(-1, self.B, self.num_valid)))
 
     def _backward(self, i: int, sigma: Strategy, mode: str) -> torch.Tensor:
         """Values of player ``i`` against the opponent's reach in the buffer.
@@ -503,7 +526,7 @@ class BatchRiverSolver:
         out = self.sigma.new_empty(self.N, self.B, C)
         out[0] = 1
         for g in self.segs:
-            rows = sigma(g).reshape(g.e - g.s, self.B, CV)
+            rows = sigma(g).reshape(g.e - g.s, self.B, self.num_valid)
             full = rows.new_full((g.e - g.s, self.B, C), 1.0 / g.k)
             full.scatter_(2, self.cmap.expand_as(rows), rows)
             out.index_copy_(0, g.orig, full)
