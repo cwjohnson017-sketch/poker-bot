@@ -5,6 +5,33 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
 
 ## Summary
 
+**Round 2 (2026-10-07; details in "Round 2" below):**
+
+* **Correction.** Every blueprint number in this report before Round 2 is too
+  high. The old evaluation queried the blueprint's turn play on the wrong turn
+  card. Corrected on the six spots: one-sided 1,190 (not 2,398) and two-sided
+  1,051 (not 1,981) mbb/hand. Value-net search is still about 5x (one-sided)
+  to 10x (two-sided) less exploitable. The margins quoted below are
+  overstated by about 2x.
+* **Production search changes:**
+  * no safe-resolving gadget at the first decision of a street. The rollout
+    terminate values were biased: the searcher's one-sided exploitability on 6
+    spots goes from 580 to 221 mbb/hand, and the per-hand excess over the
+    blueprint from 139 to 5.5;
+  * flop trees of 20,000 nodes, the blueprint's whole flop abstraction. They
+    are less exploitable than 6,000 or 10,000-node trees under the same 4 s,
+    despite 65 instead of 186 iterations: one-sided 147 against 209, two-sided
+    186 against 677;
+  * the round-2 turn-end net `turn_v3w`: 5% lower leaf error at production
+    states, 2% lower exploitability.
+* **Measured and not adopted:** a blocker-aware head on the turn-end net, and
+  terminate values computed in the search tree (better than rollouts, but
+  2.6 s of the budget).
+* **Head to head:** 10,000 hands against the blueprint (running; see Round 2,
+  section 5).
+
+**Round 1 (2026-10-05/06):**
+
 * **Search with value-net leaves is far less exploitable than the blueprint,
   and than rollout search, on every spot measured.** The reference game solves
   every river exactly, so no leaf model is involved in scoring.
@@ -844,24 +871,44 @@ Code and CPU tests only so far; design and measurements are in
 
 ## Next steps
 
-1. **Done (2026-10-06):** more river data, on-policy samples, a turn-end net
-   retrained on 1.5M samples, and a wider turn-end net (see "Follow-up").
-   Remaining lever for accuracy: **blocker-aware per-combo outputs**.
-   * On-policy states have a bucket-oracle floor of 0.019 pot, so bucket-level
-     outputs cannot fit them.
-   * The residual head exists (`--residual-head`). It is too slow for the
-     48-row river fan-out, but cheap for the turn-end net's one row per leaf.
-2. **More on-policy data from the current leaf model**, iterated (ReBeL style).
-   The first 73k samples were recorded with the v1 leaf model.
-3. **Better first-decision gadget values.** For example, evaluate the
-   blueprint's trunk strategy with value-net leaves instead of 256 rollouts, or
-   use unsafe resolving when the root ranges are the blueprint's own. The
-   measured stake is about 330 mbb/hand of the searcher's exploitability.
-4. **Bigger production trees.** With the turn-end net, a leaf costs one row, so
-   20–50k-node trees, with the blueprint's full flop sizes, fit in a few
-   seconds. Re-measure exploitability there.
-5. **A turn-start net and batched turn solving.** This enables
-   `depth_streets: 0` on the flop (smaller, faster flop trees) and value-net
-   leaves for turn decisions.
-6. **Head-to-head and ABR at scale.** A 2,000-hand match has a CI of about
-   ±350 mbb/hand.
+Status of the round-1 list after Round 2:
+
+1. *Blocker-aware outputs:* done for the turn-end net, with no gain (Round 2,
+   section 2). It needs blocker-aware targets first.
+2. *More on-policy data, iterated:* done once more (section 3); a small gain.
+3. *Better first-decision gadget values:* done (section 1). Production now
+   resolves unsafely there.
+4. *Bigger production trees:* done for the flop (section 4): 20,000 nodes.
+5. *Turn-start net and batched turn solving:* code done (section 6); GPU
+   data and training queued.
+6. *Head-to-head at scale:* 10,000 hands running (section 5).
+
+Next, in order of expected value:
+
+1. **Turn bet sizing in flop searches.**
+   * Every budget leaves all-in as the turn's only opening bet (`keep_open`,
+     section "Other changes").
+   * Test `keep_open` and a turn open plus re-raise on a trunk that has turn
+     opens: about 34k nodes and 4,655 leaves, about 45 min of scoring per
+     profile per spot.
+2. **The turn-end net's own fit.**
+   * At production leaf states it has about twice the error of the river-net
+     fan-out it imitates (0.035 against 0.020 pot).
+   * Its targets are not the limit: more steps, a larger or deeper net, or a
+     loss weighted towards on-policy states are cheap to try.
+3. **Blocker-aware targets**, to get below the bucket floor:
+   * bootstrap the turn-end data from a residual-head river net (its
+     inference cost only matters offline);
+   * or train on exact 48-river solves of on-policy states.
+4. **Turn-start net:**
+   * held-out accuracy and depth-0 flop timing once trained;
+   * then an exploitability comparison against depth-1 flop search, which
+     needs exact turn solves at the flop leaves (expensive) or the
+     depth-1 trunk with turn play taken from a depth-1 search.
+   * Also evaluate turn decisions with turn-end-net leaves
+     (`depth_streets_turn: 0`) against today's turn solves to showdown.
+5. **Re-run the 12-spot and richer-trunk blueprint comparisons** with the
+   corrected blueprint profile.
+6. **Cheaper in-tree terminate values** (bf16, per-node history and board
+   branches computed once), if safe resolving at first decisions is wanted
+   against opponents whose preflop play differs from the blueprint's.
