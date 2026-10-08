@@ -25,7 +25,10 @@ At every postflop decision:
 4. **Act.** Read the average strategy of our actual combo at the current node,
    sample a child, and play its concrete action (sizes computed exactly as
    :mod:`pokerbot.env.actions` does). Cache the played strategy (for locking)
-   and the values at the next street's roots (continual resolving).
+   and the values at the next street's roots (continual resolving): the chance
+   children under our action, or, for a turn tree ending at turn-end leaves
+   valued by a river net, the river roots below those leaves
+   (:meth:`~pokerbot.search.gadget.ContinualCache.store`).
 """
 
 from __future__ import annotations
@@ -384,6 +387,8 @@ class SearchAgent(BaseAgent):
         kind, amount = acts[slot]
         self._played[(key, tree.histories[node])] = (acts, strat)
         prefix = (*tree.histories[node], (street, seat, kind, amount))
+        net_rows = 0 if value_leaves is None else value_leaves.net_rows
+        t_cache = time.perf_counter()
         stored = self.cache.store(solver, tree, seat, prefix)
         t_end = time.perf_counter()
         self.last_stats = {
@@ -400,6 +405,11 @@ class SearchAgent(BaseAgent):
             "total_seconds": t_end - t0,
             "cached_root": info["cached"],
             "cache_entries": stored,
+            # the cache store's share of value_net_rows, and its time
+            "cache_net_rows": 0 if value_leaves is None else value_leaves.net_rows - net_rows,
+            "cache_seconds": t_end - t_cache,
+            # leaves under our action whose next-street roots were not stored (turn-end net)
+            "cache_skipped_leaves": self.cache.skipped_leaves,
             "gadget": mode,
             "terminate_seconds": t_term,
         }
