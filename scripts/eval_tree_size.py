@@ -2,10 +2,11 @@
 r"""Flop tree size under a fixed time budget, scored with an exact river.
 
 For every flop spot: production value-net searches (configs/search_value_net.yaml)
-at several tree.max_nodes under the same flop time budget, so bigger trees get
-fewer DCFR iterations. Each search's strategy is translated onto the largest
-search's tree and scored there with every (leaf, river card) river subgame
-solved exactly, next to the blueprint (see pokerbot/search/size_eval.py).
+at several tree.max_nodes (or named variants, each with search overrides of its
+own) under the same flop time budget, so bigger trees get fewer DCFR iterations.
+Each search's strategy is translated onto the trunk (the largest search's tree, or
+--trunk's) and scored there with every (leaf, river card) river subgame solved
+exactly, next to the blueprint (see pokerbot/search/size_eval.py).
 
 python scripts/eval_tree_size.py --blueprint runs/dcfr4_distilled_v2 \
     --value-net runs/value_net/turn_v2w.pt --spots 0:bb_first 0:btn_vs_check 1:bb_first \
@@ -16,12 +17,30 @@ python scripts/eval_tree_size.py --blueprint runs/dcfr4_distilled_v2 --oracle sh
     --spots 0:bb_first --sizes 1000 2000 --river-iters 20 --eval-runouts 0 --device cpu \
     --out-json runs/tree_size/smoke.json --out-md runs/tree_size/smoke.md     # smoke test
 
+python scripts/eval_tree_size.py --blueprint runs/dcfr4_distilled_v2 \
+    --value-net runs/value_net/turn_v3w.pt --spots 0:bb_first 0:btn_vs_check \
+    --variant prod=20000 --variant open20k=20000:'{"tree": {"keep_open": true}}' \
+    --variant open34k=34170:'{"tree": {"keep_open": true}}' --trunk open34k \
+    --resolve-iters 200 --resolve-mix 0.01 --no-score-translated \
+    --out-json runs/tree_size/variants.json --out-md runs/tree_size/variants.md
+
 Spots: --spots <board>:<type> ... picks spots by board index and type
 (bb_first, btn_vs_check, btn_vs_lead); without it, --boards x --spot-types.
---iters N adds a fixed-N-iteration search per size as a reference.
-Each smaller budget search is also scored re-searched, as the agent plays: the same
-agent searches again wherever the opponent takes a flop size its tree lacks
-(--no-research: translated only).
+Searches: --sizes N ... (named by their size; the largest tree is the scoring
+trunk) or named --variant NAME=MAX_NODES[:JSON] ... (in report order, each with
+search overrides of its own, e.g. '{"tree": {"keep_open": true}}', merged over
+--search; the last is the trunk unless --trunk NAME).
+--iters N adds a fixed-N-iteration search per size or variant as a reference.
+Each budget search but the trunk is also scored re-searched, as the agent plays: the
+same agent searches again wherever the opponent takes a flop size its tree lacks
+(--no-research: translated only; --no-score-translated: score a translated profile
+only where it has no re-searches).
+--resolve-iters N adds re-solved profiles: every flop decision of both players
+locked to the search's final profile, every turn decision solved again on the trunk
+with the trunk search's leaf model for N iterations, so they differ only on the
+flop (in play, turn searches replace the flop search's turn plan). --resolve-mix E
+mixes E uniform into the flop locks while solving, so turn lines the profile never
+enters (sizes its tree lacks) are solved too (recommended: 0.01).
 --search '{"gadget": {"safe": false}}' overrides the config for every search.
 
 --oracle showdown values every leaf as a checked-down river; --oracle untrained
@@ -53,10 +72,12 @@ from pokerbot.search.size_eval import (  # noqa: E402
     DEFAULT_CONFIG,
     DEFAULT_SIZES,
     SizeSettings,
+    Variant,
     config_path,
     render_markdown,
     run_size_evaluation,
     select_spots,
+    variant_from_arg,
 )
 from pokerbot.search.spot_eval import EXACT_FLOP_RUNOUTS, SPOT_TYPES, exploit_spots  # noqa: E402
 from pokerbot.search.value_leaf import ShowdownOracle  # noqa: E402
@@ -92,7 +113,14 @@ def _git_commit() -> str | None:
         return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def _variant(text: str) -> Variant:
+    try:
+        return variant_from_arg(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def build_parser() -> argparse.ArgumentParser:
     d = SizeSettings()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument(
@@ -108,9 +136,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", type=int, default=5, help="board generator seed")
     ap.add_argument("--spot-types", nargs="+", choices=SPOT_TYPES, default=["bb_first"])
     ap.add_argument("--spots", nargs="+", help="<board>:<type> picks, e.g. 0:bb_first 1:bb_first")
-    ap.add_argument("--sizes", type=int, nargs="+", default=list(DEFAULT_SIZES))
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument("--sizes", type=int, nargs="+", default=list(DEFAULT_SIZES))
+    which.add_argument(
+        "--variant",
+        type=_variant,
+        action="append",
+        metavar="NAME=MAX_NODES[:JSON]",
+        help="a named budget search (repeatable, in report order), e.g. "
+        'open34k=34170:\'{"tree": {"keep_open": true}}\'',
+    )
+    ap.add_argument("--trunk", help="the variant whose tree is the scoring trunk (default: last)")
     ap.add_argument("--budget", type=float, default=d.budget, help="flop seconds per decision")
-    ap.add_argument("--iters", type=int, help="also a fixed-iteration search per size")
+    ap.add_argument("--iters", type=int, help="also a fixed-iteration search per size / variant")
     ap.add_argument("--river-iters", type=int, default=d.river_iters)
     ap.add_argument("--mix", type=float, default=d.mix, help="uniform mixed into river ranges")
     ap.add_argument("--min-mass", type=float, default=d.min_mass)
@@ -134,6 +172,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="score translated strategies only (no re-search at off-tree opponent actions)",
     )
+    ap.add_argument(
+        "--no-score-translated",
+        action="store_true",
+        help="skip the translated profile of a search that has re-searches (score those)",
+    )
+    ap.add_argument(
+        "--resolve-iters",
+        type=int,
+        default=d.resolve_iters,
+        help="also re-solved profiles: flop locked, turn solved again on the trunk for N "
+        "iterations (0: none)",
+    )
+    ap.add_argument(
+        "--resolve-mix",
+        type=float,
+        default=d.resolve_mix,
+        help="uniform mixed into the flop locks while re-solving (e.g. 0.01)",
+    )
     ap.add_argument("--no-spot-warmup", action="store_true", help="no per-spot cache warm-up")
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
     ap.add_argument("--out-md", default="runs/tree_size/size.md")
@@ -143,14 +199,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--render-only", action="store_true", help="only rewrite --out-md from --out-json"
     )
-    args = ap.parse_args(argv)
+    return ap
 
-    if args.render_only:
-        data = json.loads(Path(args.out_json).read_text())
-        Path(args.out_md).write_text(render_markdown(data), encoding="utf-8")
-        log(f"wrote {args.out_md}")
-        return 0
-    settings = SizeSettings(
+
+def settings_from_args(args: argparse.Namespace) -> SizeSettings:
+    """The :class:`SizeSettings` of parsed arguments (``ValueError`` on bad ones)."""
+    return SizeSettings(
         sizes=tuple(args.sizes),
         budget=args.budget,
         iters=args.iters,
@@ -165,7 +219,27 @@ def main(argv: list[str] | None = None) -> int:
         spot_warmup=not args.no_spot_warmup,
         device=args.device,
         search=args.search,
+        variants=tuple(args.variant or ()),
+        trunk=args.trunk,
+        score_translated=not args.no_score_translated,
+        resolve_iters=args.resolve_iters,
+        resolve_mix=args.resolve_mix,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    if args.render_only:
+        data = json.loads(Path(args.out_json).read_text())
+        Path(args.out_md).write_text(render_markdown(data), encoding="utf-8")
+        log(f"wrote {args.out_md}")
+        return 0
+    try:
+        settings = settings_from_args(args)
+    except ValueError as exc:
+        ap.error(str(exc))
     config_path(settings.config)  # fail fast
     dev = settings.torch_device()
     engine = get_engine()
