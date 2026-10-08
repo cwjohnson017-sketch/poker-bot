@@ -8,7 +8,10 @@ bootstrapped from the next net: its targets are turn subgames solved with
 `VALUE` leaves at the end of turn betting, valued by the existing turn-end net
 `N_TE` (`runs/value_net/turn_v2w.pt`), which was itself bootstrapped from the river net.
 
-Status (2026-10-06): code and CPU tests only; nothing has run on the GPU.
+Status (2026-10-08): trained on GPU (`runs/value_net/turn_start_v1.pt`, 200k samples from
+`turn_v3w` leaves, held-out MAE 0.039 pot). Depth-0 flop search runs about 210 iterations in
+2 s, but its flop decisions are 131 mbb/hand more exploitable than depth-1 search on 3 spots,
+so it is not used in production. Results: `docs/value_net_eval.md`, Round 2, section 6.
 
 | Piece | Module | Tests |
 |---|---|---|
