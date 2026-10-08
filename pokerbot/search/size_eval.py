@@ -2,37 +2,47 @@
 
 The question: under the production flop budget (4 s), do bigger flop trees
 (more bet sizes, fewer DCFR iterations) give a less exploitable strategy than
-the production 6,000-node trees?
+the production 6,000-node trees? More generally, which of several named search
+**variants** plays the better flop: each a node budget and search-config
+overrides of its own (:class:`Variant`), e.g. the production 20,000-node tree
+next to ``tree.keep_open`` trees of 20,000 and 34,170 nodes.
 
 For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
 :func:`evaluate_sizes`
 
 1. runs the production value-net search (``configs/search_value_net.yaml``:
    value-net leaves at the end of the turn, each counting one node) once per
-   ``max_nodes`` in ``SizeSettings.sizes``, under the ``budget`` flop time
-   budget with the config's iteration cap and ``min_iterations``, so the
-   iteration count depends on the tree; with ``iters`` also once per size for
-   that fixed number of iterations (a reference without the time limit);
-2. takes the largest budget search's tree as the scoring trunk and puts every
-   search's average strategy on it with
+   budget variant (``SizeSettings.variants`` in their order; without them one
+   per ``max_nodes`` in ``SizeSettings.sizes``, named by it, smallest first),
+   under the ``budget`` flop time budget with the config's iteration cap and
+   ``min_iterations``, so the iteration count depends on the tree; with
+   ``iters`` also once per variant for that fixed number of iterations
+   (``<name>_it<iters>``, a reference without the time limit). A variant's
+   overrides go over ``SizeSettings.search``; its ``max_nodes`` (as
+   ``tree.max_nodes`` and ``tree.max_nodes_flop``), the time budget and the
+   leaf settings go over both (:func:`size_overrides`);
+2. takes one budget search's tree as the scoring trunk (``SizeSettings.trunk``,
+   default the last variant: without variants, the largest size) and puts
+   every search's average strategy on it with
    :func:`~pokerbot.search.tree_map.translate_sigma`. Where the histories
    agree this is exact. Opponent sizes that a smaller tree lacks map onto its
    sizes by the deterministic pseudo-harmonic rule, and unmatched nodes (none
    in the production trees) play the blueprint. The blueprint is mapped with
    :func:`~pokerbot.search.spot_eval.blueprint_profile`;
 3. **re-searches** as the agent does in play (``research``, budget searches
-   only): at every first off-tree opponent flop edge of the trunk (the
-   opponent picks a size the smaller tree lacks, after a history that tree has
-   exactly; :func:`~pokerbot.search.tree_map.offtree_edges`), the state is
-   replayed to that point and the SAME agent acts again. Its tree is rooted at
-   the flop with the observed path forced in, so the size is an extra branch;
-   the root info (ranges, gadget terminate values) comes from the agent's
-   cache, and the searcher's earlier flop decisions on the path are locked to
-   what it played (the first search's root strategy, and for any later
-   decisions on the path the first search's average strategy there, seeded
-   into ``SearchAgent._played``). The ``<size>_research`` profile takes each
-   re-search's strategy below its edge (translated by the same walk, exact
-   along the path) and the first search's translated strategy everywhere else;
+   but the trunk's): at every first off-tree opponent flop edge of the trunk
+   (the opponent picks a size the search's tree lacks, after a history that
+   tree has exactly; :func:`~pokerbot.search.tree_map.offtree_edges`), the
+   state is replayed to that point and the SAME agent acts again. Its tree is
+   rooted at the flop with the observed path forced in, so the size is an
+   extra branch; the root info (ranges, gadget terminate values) comes from
+   the agent's cache, and the searcher's earlier flop decisions on the path
+   are locked to what it played (the first search's root strategy, and for
+   any later decisions on the path the first search's average strategy there,
+   seeded into ``SearchAgent._played``). The ``<name>_research`` profile takes
+   each re-search's strategy below its edge (translated by the same walk,
+   exact along the path) and the first search's translated strategy
+   everywhere else;
 4. scores every profile with :func:`~pokerbot.search.spot_eval.score_profile`.
    Every (leaf, river card) river subgame is solved exactly, and best
    responses are backed up through the trunk on the plain root ranges. The
@@ -40,18 +50,21 @@ For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
    searcher is the player to act); its differences between profiles are exact
    differences in the searcher's exploitability in the trunk's game. The
    **two-sided** number is ``(BR_0 + BR_1) / 2``. A ``_research`` profile with
-   no re-search (the trunk's own size) is the translated one and is not scored
-   twice.
+   no re-search (the trunk's own, or one whose tree has all the trunk's
+   opponent flop sizes) is the translated one and is not scored twice. With
+   ``score_translated=False`` a translated profile that has a re-searched one
+   (with re-searches) is not scored either (``{"not_scored": true}``); the
+   trunk's always is.
 
-The trunk's game gives the opponent every size of the largest tree. The
+The trunk's game gives the opponent every size of the trunk's tree. The
 translated profiles charge a smaller tree for answering a size it lacks with
 its strategy for the nearest size it has; the re-searched profiles answer it
 as the agent would. Only off-tree edges are re-searched: the agent re-searches
 at its on-tree decisions too, for every size, which this leaves out.
 
-Before the measured searches of a spot, a short search on it warms the
-blueprint's caches (``spot_warmup``), so every size starts from the same cache
-state.
+Before the measured searches of a spot, a short search on it (the smallest
+tree's variant, :func:`warmup_config`) warms the blueprint's caches
+(``spot_warmup``), so every variant starts from the same cache state.
 
 :func:`run_size_evaluation` drives a list of spots, rewrites the JSON after
 every spot (resumable) and renders the markdown report
@@ -117,15 +130,42 @@ from .tree_map import (
 DEFAULT_CONFIG = "configs/search_value_net.yaml"
 DEFAULT_SIZES = (6000, 10000, 20000)
 
+RESEARCH = "_research"
+
 
 # -- settings ---------------------------------------------------------------------
 
 
 @dataclass
+class Variant:
+    """One budget search: its name (a column of the report), its node budget
+    (``tree.max_nodes`` and ``tree.max_nodes_flop``) and ``search_config``
+    overrides of its own, merged over ``SizeSettings.search`` (see
+    :func:`size_overrides`)."""
+
+    name: str
+    max_nodes: int
+    search: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.name = str(self.name)
+        self.max_nodes = int(self.max_nodes)
+        self.search = dict(self.search or {})
+        n = self.name
+        if not n or n == "blueprint" or "_it" in n or n.endswith(RESEARCH):
+            raise ValueError(
+                f"bad variant name {n!r}: it must be non-empty, not 'blueprint', without "
+                f"'_it' and not end with {RESEARCH!r}"
+            )
+        if self.max_nodes <= 0:
+            raise ValueError(f"variant {n!r}: max_nodes must be positive, got {self.max_nodes}")
+
+
+@dataclass
 class SizeSettings:
-    sizes: tuple[int, ...] = DEFAULT_SIZES  # tree.max_nodes per search
+    sizes: tuple[int, ...] = DEFAULT_SIZES  # tree.max_nodes per search (without variants)
     budget: float = 4.0  # flop time budget (seconds per decision)
-    iters: int | None = None  # also a fixed-iteration search per size
+    iters: int | None = None  # also a fixed-iteration search per variant
     config: str = DEFAULT_CONFIG  # base search config (YAML)
     seed: int = 0  # search seed (gadget rollouts)
     river_iters: int = 200  # BatchRiverSolver iterations per river subgame
@@ -138,12 +178,42 @@ class SizeSettings:
     spot_warmup: bool = True  # warm the blueprint caches on each spot first
     device: str = "auto"
     search: dict = field(default_factory=dict)  # extra search_config overrides (every search)
+    # named budget searches in report order (Variant or its dict); empty: one per size,
+    # named str(size), smallest first. Given, they replace sizes (set to their max_nodes)
+    variants: tuple[Variant, ...] = ()
+    trunk: str | None = None  # the variant whose tree is the scoring trunk (None: the last)
+    score_translated: bool = True  # False: skip translated profiles that have re-searches
 
     def __post_init__(self) -> None:
+        self.variants = tuple(
+            v if isinstance(v, Variant) else Variant(**v) for v in (self.variants or ())
+        )
+        if self.variants:
+            names = [v.name for v in self.variants]
+            dup = sorted({n for n in names if names.count(n) > 1})
+            if dup:
+                raise ValueError(f"duplicate variant names {dup}")
+            self.sizes = tuple(v.max_nodes for v in self.variants)
         sizes = sorted({int(s) for s in self.sizes})
         if not sizes:
             raise ValueError("SizeSettings.sizes is empty")
         self.sizes = tuple(sizes)
+        if self.trunk is not None:
+            self.trunk = str(self.trunk)
+            names = [v.name for v in self.budget_variants()]
+            if self.trunk not in names:
+                raise ValueError(f"trunk {self.trunk!r} is not a variant (one of {names})")
+
+    def budget_variants(self) -> tuple[Variant, ...]:
+        """The budget searches in report order: ``variants``, or one per size
+        (named ``str(size)``, no overrides), smallest first."""
+        if self.variants:
+            return self.variants
+        return tuple(Variant(search_name(s), s) for s in self.sizes)
+
+    def trunk_name(self) -> str:
+        """The name of the variant whose tree is the scoring trunk."""
+        return self.trunk if self.trunk is not None else self.budget_variants()[-1].name
 
     def torch_device(self) -> torch.device:
         if self.device == "auto":
@@ -151,11 +221,22 @@ class SizeSettings:
         return torch.device(self.device)
 
     def comparable(self) -> dict:
-        """The settings that change the numbers (for resuming)."""
+        """The settings that change the numbers (for resuming). The variant
+        options are left out at their defaults, so a run without them reads as
+        before they existed."""
         d = asdict(self)
         for k in ("river_batch", "device"):
             d.pop(k)
         d["sizes"] = list(d["sizes"])
+        d["variants"] = [dict(v) for v in d["variants"]]
+        defaults = {
+            "variants": [],
+            "trunk": None,
+            "score_translated": True,
+        }
+        for k, v in defaults.items():
+            if d[k] == v:
+                d.pop(k)
         return d
 
     def eval_settings(self) -> EvalSettings:
@@ -182,33 +263,49 @@ def config_path(path: str | Path) -> Path:
     raise FileNotFoundError(f"search config {path} not found (also tried {q})")
 
 
-def search_name(size: int, iters: int | None = None) -> str:
-    """``"6000"`` for a budget search, ``"6000_it300"`` for a fixed-iteration one."""
-    return f"{int(size)}" if iters is None else f"{int(size)}_it{int(iters)}"
+def search_name(size: int | str, iters: int | None = None) -> str:
+    """``"6000"`` for a budget search, ``"6000_it300"`` for a fixed-iteration one
+    (``size`` may be a variant's name: ``"open34k_it300"``)."""
+    base = size if isinstance(size, str) else f"{int(size)}"
+    return base if iters is None else f"{base}_it{int(iters)}"
+
+
+def search_runs(settings: SizeSettings) -> list[tuple[str, Variant, int | None]]:
+    """``(name, variant, fixed iterations or None)`` of every search: the budget
+    searches in variant order, then the fixed-iteration references."""
+    vs = settings.budget_variants()
+    out: list[tuple[str, Variant, int | None]] = [(v.name, v, None) for v in vs]
+    if settings.iters:
+        it = int(settings.iters)
+        out += [(search_name(v.name, it), v, it) for v in vs]
+    return out
 
 
 def search_plan(settings: SizeSettings) -> list[tuple[str, int, int | None]]:
     """``(name, max_nodes, fixed iterations or None)`` of every search, budget
-    searches first, smallest tree first."""
-    out: list[tuple[str, int, int | None]] = [(search_name(s), s, None) for s in settings.sizes]
-    if settings.iters:
-        out += [(search_name(s, settings.iters), s, int(settings.iters)) for s in settings.sizes]
-    return out
+    searches first, in variant order (without variants: smallest tree first)."""
+    return [(name, v.max_nodes, iters) for name, v, iters in search_runs(settings)]
 
 
 def size_overrides(
-    settings: SizeSettings, max_nodes: int, net_path: str | None = None, iters: int | None = None
+    settings: SizeSettings,
+    max_nodes: int,
+    net_path: str | None = None,
+    iters: int | None = None,
+    extra: dict | None = None,
 ) -> dict:
     """``search_config`` overrides of one search over ``settings.config``:
-    ``settings.search`` first, then this run's ``tree.max_nodes``, its flop time
-    budget (or ``iters`` fixed iterations under a huge budget), value-net leaves
-    and ``leaf.net = net_path`` when given."""
+    ``settings.search`` first, then ``extra`` (a variant's own overrides), then
+    this run's ``tree.max_nodes``, its flop time budget (or ``iters`` fixed
+    iterations under a huge budget), value-net leaves and ``leaf.net =
+    net_path`` when given."""
     o: dict[str, Any] = {
         "device": str(settings.torch_device()),
         "fallback_on_error": False,
         "seed": settings.seed,
     }
     o = _merge(o, settings.search)
+    o = _merge(o, extra)
     o = _merge(o, {"tree": {"max_nodes": int(max_nodes), "max_nodes_flop": int(max_nodes)}})
     if iters is None:
         o = _merge(o, {"time_budget": {"flop": float(settings.budget)}})
@@ -221,11 +318,48 @@ def size_overrides(
 
 
 def size_config(
-    settings: SizeSettings, max_nodes: int, net_path: str | None = None, iters: int | None = None
+    settings: SizeSettings,
+    max_nodes: int,
+    net_path: str | None = None,
+    iters: int | None = None,
+    extra: dict | None = None,
 ) -> SearchConfig:
     """A fresh :class:`SearchConfig` for one search (see :func:`size_overrides`)."""
-    over = size_overrides(settings, max_nodes, net_path, iters)
+    over = size_overrides(settings, max_nodes, net_path, iters, extra)
     return search_config(config_path(settings.config), **over)
+
+
+def variant_config(
+    settings: SizeSettings, variant: Variant, net_path: str | None = None, iters: int | None = None
+) -> SearchConfig:
+    """:func:`size_config` of ``variant``: its node budget and overrides."""
+    return size_config(settings, variant.max_nodes, net_path, iters, variant.search)
+
+
+def warmup_config(settings: SizeSettings, net_path: str | None = None) -> SearchConfig:
+    """A two-iteration search of the budget variant with the smallest tree (the
+    first such), for the warm-up searches."""
+    v = min(settings.budget_variants(), key=lambda v: v.max_nodes)
+    return variant_config(settings, v, net_path, iters=2)
+
+
+def variant_from_arg(text: str) -> Variant:
+    """A :class:`Variant` from ``NAME=MAX_NODES`` or ``NAME=MAX_NODES:JSON``
+    (``JSON`` a search-override dict, e.g. ``open=34170:{"tree": {"keep_open":
+    true}}``), as the CLI's ``--variant`` takes it."""
+    name, eq, rest = str(text).partition("=")
+    nodes, colon, js = rest.partition(":")
+    if not eq or not name.strip() or not nodes.strip().isdigit():
+        raise ValueError(f"bad variant {text!r}: expected NAME=MAX_NODES or NAME=MAX_NODES:JSON")
+    over = {}
+    if colon:
+        try:
+            over = json.loads(js)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"bad variant {text!r}: its overrides are not JSON ({exc})") from exc
+        if not isinstance(over, dict):
+            raise ValueError(f"bad variant {text!r}: its overrides must be a JSON object")
+    return Variant(name.strip(), int(nodes), over)
 
 
 def select_spots(
@@ -253,8 +387,6 @@ def select_spots(
 
 
 # -- re-searches at off-tree opponent actions --------------------------------------
-
-RESEARCH = "_research"
 
 
 def research_name(name: str) -> str:
@@ -511,14 +643,14 @@ def evaluate_sizes(
     state = spot.state
     seat = int(state.current_player)
     river_spec = blueprint.spec if river_spec is None else river_spec
-    plan = search_plan(settings)
-    trunk_name = search_name(settings.sizes[-1])
+    plan = search_runs(settings)
+    trunk_name = settings.trunk_name()
     log(f"{spot.label}: board {list(state.board)}, seat {seat} to act")
 
     warm_s = None
     if settings.spot_warmup:
         t0 = time.perf_counter()
-        cfg = size_config(settings, settings.sizes[0], net_path, iters=2)
+        cfg = warmup_config(settings, net_path)
         run_search("spot-warmup", blueprint, state, game_config, cfg, predictor_factory())
         _free()
         warm_s = time.perf_counter() - t0
@@ -526,15 +658,15 @@ def evaluate_sizes(
 
     searches: dict[str, dict] = {}
     snaps: dict[str, StrategySnapshot] = {}
-    agents: dict[str, Any] = {}  # first-decision agents of the sizes to re-search
+    agents: dict[str, Any] = {}  # first-decision agents of the variants to re-search
     eval_solver = None
-    for name, size, iters in plan:
-        cfg = size_config(settings, size, net_path, iters)
+    for name, variant, iters in plan:
+        cfg = variant_config(settings, variant, net_path, iters)
         run = run_search(name, blueprint, state, game_config, cfg, predictor_factory())
         s = run.stats
         info = {
             **s,
-            "max_nodes": size,
+            "max_nodes": variant.max_nodes,
             "fixed_iterations": iters,
             "act_seconds": run.seconds,
             **_tree_info(run.solver.tree),
@@ -597,10 +729,10 @@ def evaluate_sizes(
     # re-searches at the opponent's off-tree flop actions, as in play
     researched: dict[str, list[Research]] = {}
     if settings.research:
-        for name, _size, iters in plan:
+        for name, _variant, iters in plan:
             if iters is not None:
                 continue
-            if name not in agents:  # the trunk's own size: nothing is off its tree
+            if name not in agents:  # the trunk itself: nothing is off its tree
                 searches[name]["research"] = _research_summary([], [])
                 continue
             rs = research_offtree(
@@ -652,6 +784,9 @@ def evaluate_sizes(
         if name not in sigmas:  # a re-searched profile without re-searches: the same
             base = name[: -len(RESEARCH)]
             profiles[name] = {**profiles[base], "same_as": base}
+            continue
+        if not settings.score_translated and name != trunk_name and research_name(name) in sigmas:
+            profiles[name] = {"not_scored": True}  # its re-searched profile is scored
             continue
         res = _score_with_retry(
             batch,
@@ -740,7 +875,7 @@ def run_size_evaluation(
         log(f"resuming: {len(done)} spots done, {len(todo)} to go")
     if warmup is not None and todo:
         t0 = time.perf_counter()
-        cfg = size_config(settings, settings.sizes[0], net_path, iters=2)
+        cfg = warmup_config(settings, net_path)
         run_search("warmup", blueprint, warmup.state, game_config, cfg, predictor_factory())
         _free()
         log(f"warm-up search: {time.perf_counter() - t0:.1f}s")
@@ -775,12 +910,12 @@ def run_size_evaluation(
 
 
 def profile_order(settings: SizeSettings) -> list[str]:
-    """Profile names in report order: per budget size the translated and the
+    """Profile names in report order: per budget variant the translated and the
     re-searched profile, then the fixed-iteration references, then the blueprint."""
     out = []
-    for name, _size, iters in search_plan(settings):
+    for name, _variant, iters in search_runs(settings):
         out.append(name)
-        if settings.research and iters is None:
+        if iters is None and settings.research:
             out.append(research_name(name))
     return [*out, "blueprint"]
 
@@ -794,10 +929,11 @@ def display_name(name: str) -> str:
     return f"{size}, {it} it" if it else name
 
 
-def flop_sizes(street_actions: Sequence[Sequence]) -> str:
-    """The flop's sized raises, e.g. ``"open 0.75/1; rr 1"`` (all-in is always there)."""
+def flop_sizes(street_actions: Sequence[Sequence], street: int = 1) -> str:
+    """The sized raises of ``street`` (default the flop), e.g. ``"open 0.75/1;
+    rr 1"`` (all-in is always there)."""
     both, opens, rr = [], [], []
-    for a in street_actions[1]:
+    for a in street_actions[street]:
         if a[0] not in ("raise", "raise_x"):
             continue
         s = f"{float(a[1]):g}" + ("x" if a[0] == "raise_x" else "")
@@ -812,13 +948,33 @@ def flop_sizes(street_actions: Sequence[Sequence]) -> str:
 
 
 def _columns(spots: Sequence[dict]) -> list[str]:
-    """Every profile name but the blueprint's, in first-seen order."""
+    """Every profile name but the blueprint's, in first-seen order, without
+    those scored on no spot (``not_scored``)."""
     cols: list[str] = []
+    scored = set()
     for s in spots:
-        for name in s["profiles"]:
+        for name, p in s["profiles"].items():
             if name != "blueprint" and name not in cols:
                 cols.append(name)
-    return cols
+            if not p.get("not_scored"):
+                scored.add(name)
+    return [c for c in cols if c in scored]
+
+
+def _search_names(spots: Sequence[dict]) -> list[str]:
+    """Every search's name, in first-seen order."""
+    names: list[str] = []
+    for s in spots:
+        names += [n for n in s["searches"] if n not in names]
+    return names
+
+
+def _variant_rows(st: dict) -> list[tuple[str, int, dict]]:
+    """``(name, max_nodes, overrides)`` of the budget variants of a settings dict
+    (:meth:`SizeSettings.comparable`), also of one written before variants."""
+    if st.get("variants"):
+        return [(v["name"], v["max_nodes"], v.get("search") or {}) for v in st["variants"]]
+    return [(search_name(s), s, {}) for s in st["sizes"]]
 
 
 def _groups(spots: Sequence[dict]) -> list[tuple[str, list[dict]]]:
@@ -836,7 +992,12 @@ def _row(cells: Sequence[str]) -> str:
 
 def _metric(s: dict, c: str, key: str) -> float | None:
     p = s["profiles"].get(c)
-    return None if p is None else p[key]
+    return None if p is None or p.get("not_scored") else p[key]
+
+
+def _g(x: Any, nd: int = 0) -> str:
+    """:func:`~pokerbot.search.spot_eval._f`, with ``"-"`` for a missing value."""
+    return "-" if x is None else _f(x, nd)
 
 
 def _table(
@@ -855,9 +1016,9 @@ def _table(
 
     def row(label: str, g: Sequence[dict]) -> str:
         vals = {c: _mean([_metric(s, c, key) for s in g]) for c in [*cols, "blueprint"]}
-        cells = [label] + [_f(vals[c]) for c in [*cols, "blueprint"]]
+        cells = [label] + [_g(vals[c]) for c in [*cols, "blueprint"]]
         b = vals.get(base) if base else None
-        cells += [_f(None if vals[c] is None or b is None else vals[c] - b) for c in diff]
+        cells += [_g(None if vals[c] is None or b is None else vals[c] - b) for c in diff]
         return _row(cells)
 
     out += [row(s["label"], [s]) for s in spots]
@@ -866,7 +1027,7 @@ def _table(
 
 
 def render_markdown(data: dict) -> str:
-    """The report: one-sided and two-sided exploitability per spot and size
+    """The report: one-sided and two-sided exploitability per spot and variant
     (mbb/hand) with means, re-searched and translated, the re-searches, the
     searches (iterations, seconds, trees), the translation onto the trunk and
     the scoring details."""
@@ -875,28 +1036,42 @@ def render_markdown(data: dict) -> str:
     spots = data["spots"]
     cols = _columns(spots)
     res_cols = [c for c in cols if c.endswith(RESEARCH)]
-    tr_cols = [c for c in cols if not c.endswith(RESEARCH)]
-    budget_cols = [c for c in tr_cols if "_it" not in c]
+    tr_cols = [c for c in cols if c not in res_cols]
+    names = _search_names(spots)
+    budget_cols = [c for c in names if "_it" not in c]
+    rows = _variant_rows(st)
+    named = bool(st.get("variants") or st.get("trunk"))
+    per = "variant" if st.get("variants") else "size"
     lines = ["# Flop tree size under a fixed time budget", ""]
     lines.append(
         f"Blueprint `{meta.get('blueprint')}`, leaf model `{meta.get('leaf_model')}`, "
         f"device {meta.get('device')}{', GPU ' + meta['gpu'] if meta.get('gpu') else ''}."
     )
-    ref = f"; reference: {st['iters']} fixed iterations per size" if st.get("iters") else ""
+    ref = f"; reference: {st['iters']} fixed iterations per {per}" if st.get("iters") else ""
     runouts = st.get("eval_max_runouts")
     allin = "the search's run-outs" if runouts is None else f"up to {runouts} run-outs per board"
     extra = f" Extra search overrides: `{json.dumps(st['search'])}`." if st.get("search") else ""
+    if st.get("variants"):
+        where = "as the variants " + "; ".join(
+            f"`{n}` at max_nodes {m}" + (f" with `{json.dumps(o)}`" if o else "")
+            for n, m, o in rows
+        )
+    else:
+        where = f"at max_nodes {' / '.join(str(s) for s in st['sizes'])}"
+    trunk = st.get("trunk") or rows[-1][0]
+    trunk_txt = (
+        f"the `{trunk}` search's tree" if named else f"the {st['sizes'][-1]}-node search's tree"
+    )
     lines.append(
-        f"Searches: `{st['config']}` (value-net leaves at the end of the turn) at max_nodes "
-        f"{' / '.join(str(s) for s in st['sizes'])}, flop budget {st['budget']:g} s with the "
-        f"config's iteration settings{ref}.{extra} "
+        f"Searches: `{st['config']}` (value-net leaves at the end of the turn) {where}, flop "
+        f"budget {st['budget']:g} s with the config's iteration settings{ref}.{extra} "
         + (
-            "A short search on each spot first warms the blueprint caches, so every size "
+            f"A short search on each spot first warms the blueprint caches, so every {per} "
             "starts from the same cache state. "
             if st.get("spot_warmup")
             else ""
         )
-        + f"Scoring trunk: the {st['sizes'][-1]}-node search's tree. Each search's average "
+        + f"Scoring trunk: {trunk_txt}. Each search's average "
         "strategy is translated onto it (`tree_map.translate_sigma`: exact where the histories "
         "agree, sizes a smaller tree lacks mapped onto its sizes by the deterministic "
         "pseudo-harmonic rule, unmatched nodes play the blueprint); the blueprint is mapped "
@@ -914,7 +1089,12 @@ def render_markdown(data: dict) -> str:
             "action the profile is the re-search's strategy; elsewhere the first search's. "
             "**Translated** profiles answer those sizes with the first search's strategy for "
             "the nearest size it has. Only off-tree actions are re-searched (the agent also "
-            "re-searches at on-tree decisions, for every size).",
+            "re-searches at on-tree decisions, for every size)."
+            + (
+                " Translated profiles of searches with re-searches are not scored."
+                if st.get("score_translated") is False
+                else ""
+            ),
         ]
     one_txt = (
         "Best response of the opponent of the player to act against that player's trunk "
@@ -945,7 +1125,6 @@ def render_markdown(data: dict) -> str:
             lines += _table(spots, cs, metric, sizes_of(cs), base)
 
     # re-searches
-    names = list(tr_cols)
     if res_cols:
         lines += ["", "## Re-searches at off-tree opponent actions", ""]
         rh = [
@@ -996,6 +1175,7 @@ def render_markdown(data: dict) -> str:
         "decision nodes",
         "leaves",
         "flop sizes",
+        "turn sizes",
         "iterations",
         "total s",
         "setup s",
@@ -1003,15 +1183,18 @@ def render_markdown(data: dict) -> str:
         "ms/iter",
         "own game (mbb)",
     ]
-    lines += [_row(th), "|---|---|" + "---:|" * 3 + "---|" + "---:|" * (len(th) - 6)]
+    lines += [_row(th), "|---|---|" + "---:|" * 3 + "---|---|" + "---:|" * (len(th) - 7)]
 
     def srow(label: str, name: str, xs: Sequence[dict]) -> str:
         def m(key: str) -> float | None:
             return _mean([x.get(key) for x in xs])
 
+        def sizes(street: int) -> str:
+            got = {flop_sizes(x["street_actions"], street) for x in xs if x.get("street_actions")}
+            return got.pop() if len(got) == 1 else "varies"
+
         it, solve = m("iterations"), m("solve_seconds")
         ms = None if not it or solve is None else 1000 * solve / it
-        sizes = {flop_sizes(x["street_actions"]) for x in xs if x.get("street_actions")}
         return _row(
             [
                 label,
@@ -1019,7 +1202,8 @@ def render_markdown(data: dict) -> str:
                 _f(m("nodes")),
                 _f(m("decision_nodes")),
                 _f(m("leaves")),
-                sizes.pop() if len(sizes) == 1 else "varies",
+                sizes(1),
+                sizes(2),
                 _f(it),
                 _f(m("total_seconds"), 2),
                 _f(m("setup_seconds"), 2),
@@ -1111,7 +1295,7 @@ def render_markdown(data: dict) -> str:
     for s in spots:
         for c in [*cols, "blueprint"]:
             p = s["profiles"].get(c)
-            if p is None or p.get("same_as"):
+            if p is None or p.get("same_as") or p.get("not_scored"):
                 continue
             lines.append(
                 _row(
@@ -1133,8 +1317,8 @@ def render_markdown(data: dict) -> str:
     if res_cols:
         lines += [
             "",
-            "A re-searched profile without re-searches (the trunk's own size) is the translated "
-            "one and is scored once.",
+            "A re-searched profile without re-searches (the trunk's own, or one whose tree has "
+            "every opponent flop size of the trunk's) is the translated one and is scored once.",
         ]
     total = sum(s["seconds"] for s in spots)
     lines += ["", f"{len(spots)} spots, {total / 60:.1f} min of evaluation."]
@@ -1150,6 +1334,7 @@ __all__ = [
     "RESEARCH",
     "Research",
     "SizeSettings",
+    "Variant",
     "act_again",
     "compose_research",
     "config_path",
@@ -1165,9 +1350,13 @@ __all__ = [
     "run_size_evaluation",
     "search_name",
     "search_plan",
+    "search_runs",
     "seed_played",
     "select_spots",
     "size_config",
     "size_overrides",
     "street_root_state",
+    "variant_config",
+    "variant_from_arg",
+    "warmup_config",
 ]
