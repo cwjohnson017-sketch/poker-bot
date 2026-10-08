@@ -21,7 +21,7 @@ python scripts/eval_tree_size.py --blueprint runs/dcfr4_distilled_v2 \
     --value-net runs/value_net/turn_v3w.pt --spots 0:bb_first 0:btn_vs_check \
     --variant prod=20000 --variant open20k=20000:'{"tree": {"keep_open": true}}' \
     --variant open34k=34170:'{"tree": {"keep_open": true}}' --trunk open34k \
-    --no-score-translated \
+    --resolve-iters 200 --resolve-mix 0.01 --no-score-translated \
     --out-json runs/tree_size/variants.json --out-md runs/tree_size/variants.md
 
 Spots: --spots <board>:<type> ... picks spots by board index and type
@@ -35,6 +35,12 @@ Each budget search but the trunk is also scored re-searched, as the agent plays:
 same agent searches again wherever the opponent takes a flop size its tree lacks
 (--no-research: translated only; --no-score-translated: score a translated profile
 only where it has no re-searches).
+--resolve-iters N adds re-solved profiles: every flop decision of both players
+locked to the search's final profile, every turn decision solved again on the trunk
+with the trunk search's leaf model for N iterations, so they differ only on the
+flop (in play, turn searches replace the flop search's turn plan). --resolve-mix E
+mixes E uniform into the flop locks while solving, so turn lines the profile never
+enters (sizes its tree lacks) are solved too (recommended: 0.01).
 --search '{"gadget": {"safe": false}}' overrides the config for every search.
 
 --oracle showdown values every leaf as a checked-down river; --oracle untrained
@@ -171,6 +177,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the translated profile of a search that has re-searches (score those)",
     )
+    ap.add_argument(
+        "--resolve-iters",
+        type=int,
+        default=d.resolve_iters,
+        help="also re-solved profiles: flop locked, turn solved again on the trunk for N "
+        "iterations (0: none)",
+    )
+    ap.add_argument(
+        "--resolve-mix",
+        type=float,
+        default=d.resolve_mix,
+        help="uniform mixed into the flop locks while re-solving (e.g. 0.01)",
+    )
     ap.add_argument("--no-spot-warmup", action="store_true", help="no per-spot cache warm-up")
     ap.add_argument("--device", default="auto", help="auto | cuda | cpu")
     ap.add_argument("--out-md", default="runs/tree_size/size.md")
@@ -203,6 +222,8 @@ def settings_from_args(args: argparse.Namespace) -> SizeSettings:
         variants=tuple(args.variant or ()),
         trunk=args.trunk,
         score_translated=not args.no_score_translated,
+        resolve_iters=args.resolve_iters,
+        resolve_mix=args.resolve_mix,
     )
 
 

@@ -43,7 +43,22 @@ For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
    each re-search's strategy below its edge (translated by the same walk,
    exact along the path) and the first search's translated strategy
    everywhere else;
-4. scores every profile with :func:`~pokerbot.search.spot_eval.score_profile`.
+4. with ``resolve_iters``, **re-solves** every budget variant's final profile
+   (``<name>_research`` where it has re-searches, else the translated one; the
+   trunk search's own strategy for the trunk) below the flop
+   (:func:`resolve_below_root`): on the trunk, every flop decision of both
+   players is locked to the profile and every later decision is solved again
+   for ``resolve_iters`` DCFR iterations with the trunk search's own leaf
+   model (``SearchAgent.value_leaf_provider``) and solver settings, on its
+   plain root ranges (unsafe: no gadget). In play, separate turn searches
+   replace a flop search's turn strategy, which is only a plan; the
+   ``<name>_resolved`` profiles differ only in their flop strategies. Where a
+   profile never takes a flop action (a size its tree lacks), nothing reaches
+   the turn below it, and the other player's turn decisions there would keep
+   the uniform strategy: ``resolve_mix`` > 0 locks the flop to ``(1 - mix) *
+   profile + mix * uniform`` while solving (the result still plays the
+   profile on the flop), so those lines are solved as well;
+5. scores every profile with :func:`~pokerbot.search.spot_eval.score_profile`.
    Every (leaf, river card) river subgame is solved exactly, and best
    responses are backed up through the trunk on the plain root ranges. The
    **one-sided** number is the best response of the searcher's opponent (the
@@ -91,6 +106,7 @@ from ..engine_select import get_engine
 from .abstract import make_state, to_action
 from .config import SearchConfig, search_config
 from .gadget import history_key
+from .solver import RangeSolver, SolverConfig
 from .spot_eval import (
     EXACT_FLOP_RUNOUTS,
     HUGE_BUDGET,
@@ -131,6 +147,7 @@ DEFAULT_CONFIG = "configs/search_value_net.yaml"
 DEFAULT_SIZES = (6000, 10000, 20000)
 
 RESEARCH = "_research"
+RESOLVED = "_resolved"
 
 
 # -- settings ---------------------------------------------------------------------
@@ -152,10 +169,10 @@ class Variant:
         self.max_nodes = int(self.max_nodes)
         self.search = dict(self.search or {})
         n = self.name
-        if not n or n == "blueprint" or "_it" in n or n.endswith(RESEARCH):
+        if not n or n == "blueprint" or "_it" in n or n.endswith((RESEARCH, RESOLVED)):
             raise ValueError(
                 f"bad variant name {n!r}: it must be non-empty, not 'blueprint', without "
-                f"'_it' and not end with {RESEARCH!r}"
+                f"'_it' and not end with {RESEARCH!r} or {RESOLVED!r}"
             )
         if self.max_nodes <= 0:
             raise ValueError(f"variant {n!r}: max_nodes must be positive, got {self.max_nodes}")
@@ -183,6 +200,8 @@ class SizeSettings:
     variants: tuple[Variant, ...] = ()
     trunk: str | None = None  # the variant whose tree is the scoring trunk (None: the last)
     score_translated: bool = True  # False: skip translated profiles that have re-searches
+    resolve_iters: int = 0  # > 0: also <name>_resolved profiles (re-solved below the flop)
+    resolve_mix: float = 0.0  # uniform mixed into the flop locks while re-solving
 
     def __post_init__(self) -> None:
         self.variants = tuple(
@@ -203,6 +222,12 @@ class SizeSettings:
             names = [v.name for v in self.budget_variants()]
             if self.trunk not in names:
                 raise ValueError(f"trunk {self.trunk!r} is not a variant (one of {names})")
+        self.resolve_iters = int(self.resolve_iters or 0)
+        if self.resolve_iters < 0:
+            raise ValueError(f"resolve_iters must be >= 0, got {self.resolve_iters}")
+        self.resolve_mix = float(self.resolve_mix or 0.0)
+        if not 0.0 <= self.resolve_mix < 1.0:
+            raise ValueError(f"resolve_mix must be in [0, 1), got {self.resolve_mix}")
 
     def budget_variants(self) -> tuple[Variant, ...]:
         """The budget searches in report order: ``variants``, or one per size
@@ -233,6 +258,8 @@ class SizeSettings:
             "variants": [],
             "trunk": None,
             "score_translated": True,
+            "resolve_iters": 0,
+            "resolve_mix": 0.0,
         }
         for k, v in defaults.items():
             if d[k] == v:
@@ -392,6 +419,11 @@ def select_spots(
 def research_name(name: str) -> str:
     """``"6000"`` -> ``"6000_research"``: the profile with the re-searches."""
     return f"{name}{RESEARCH}"
+
+
+def resolved_name(name: str) -> str:
+    """``"6000"`` -> ``"6000_resolved"``: the profile re-solved below the flop."""
+    return f"{name}{RESOLVED}"
 
 
 def street_root_state(engine: Any, game_config: Any, state: Any) -> Any:
@@ -601,6 +633,98 @@ def _research_summary(researches: Sequence[Research], reports: Sequence[dict]) -
     }
 
 
+# -- re-solving below the root street -------------------------------------------------
+
+
+def root_street_locks(
+    tree: SubgameTree, dec_nodes: torch.Tensor, sigma: torch.Tensor
+) -> dict[int, torch.Tensor]:
+    """``{node: [C, n] strategy}`` of ``sigma`` (``[D, A, C]`` over
+    ``dec_nodes``) at every decision node of both players on ``tree``'s root
+    street: the ``locked`` argument of
+    :class:`~pokerbot.search.solver.RangeSolver` (views of ``sigma``)."""
+    kind = tree.kind.tolist()
+    street = tree.street.tolist()
+    nch = tree.num_children.tolist()
+    out: dict[int, torch.Tensor] = {}
+    for d, n in enumerate(dec_nodes.tolist()):
+        if kind[n] == DECISION and street[n] == tree.root_street:
+            out[n] = sigma[d, : nch[n]].t()
+    return out
+
+
+@torch.no_grad()
+def resolve_below_root(
+    trunk_solver: Any,
+    sigma: torch.Tensor,
+    value_leaves: Any,
+    iterations: int,
+    game_config: Any,
+    cfg: SolverConfig | None = None,
+    mix: float = 0.0,
+) -> tuple[torch.Tensor, dict]:
+    """``sigma`` (a profile on ``trunk_solver``'s tree, in its decision-node
+    order) with every decision below the root street solved again: a fresh
+    :class:`~pokerbot.search.solver.RangeSolver` on the trunk and its plain
+    root ranges (no gadget: unsafe), with every root-street decision of both
+    players locked to ``sigma`` (:func:`root_street_locks`; the solver
+    renormalises each combo's row), leaves valued by ``value_leaves``, solver
+    settings ``cfg`` (default ``trunk_solver.cfg``) without a time limit, run for
+    ``iterations`` DCFR iterations.
+
+    ``mix`` > 0 locks the root-street decisions to ``(1 - mix) * sigma + mix *
+    uniform`` while solving, so every later-street subgame is reached by both
+    players: where ``sigma`` never takes an action (e.g. a size the search's
+    tree lacks), the other player's decisions below it otherwise get no
+    counterfactual value at all and keep the uniform strategy. CFR is
+    scale-free per subgame, so a small ``mix`` solves those subgames as fully as
+    the rest. The result plays ``sigma`` exactly on the root street either way.
+
+    Returns the average strategy (on the CPU, ``sigma``'s layout, ``sigma``
+    itself at the locked nodes) and a report: ``iterations``, ``locked_nodes``,
+    ``mix``, ``locked_max_diff`` (the largest change of a locked probability
+    during the solve, ~0 unless a row of ``sigma`` was not normalised),
+    ``seconds`` / ``setup_seconds`` / ``solve_seconds`` and
+    ``self_exploitability`` (the result's exploitability in the trunk's game
+    with that leaf model, as the searches report theirs)."""
+    t0 = time.perf_counter()
+    tree = trunk_solver.tree
+    cfg = replace(trunk_solver.cfg if cfg is None else cfg, time_budget=None)
+    sig = sigma.to(trunk_solver.device, getattr(torch, cfg.dtype))
+    locked = root_street_locks(tree, trunk_solver.dec_nodes, sig)
+    if mix > 0:
+        locked = {n: (1 - mix) * s + mix / s.shape[1] for n, s in locked.items()}
+    solver = RangeSolver(tree, trunk_solver.ranges, cfg, locked=locked, value_leaves=value_leaves)
+    del locked
+    if not torch.equal(solver.dec_nodes, trunk_solver.dec_nodes):
+        raise RuntimeError("the re-solve's decision nodes are not the trunk's")
+    t_setup = time.perf_counter() - t0
+    solver.solve(iterations=int(iterations))
+    # the locks held (the solver never updates a locked node); then sigma exactly there
+    ids = solver.locked.nonzero().flatten()
+    diff = 0.0
+    for a in range(0, len(ids), 1024):  # chunks: [K, A, C] copies of the locked rows
+        j = ids[a : a + 1024]
+        want = (1 - mix) * sig[j] + mix * solver.uniform[j] if mix > 0 else sig[j]
+        diff = max(diff, float((solver.sigma[j] - want).abs().max()))
+        solver.sigma[j] = sig[j]
+    del sig
+    out = solver.average_strategy().cpu()
+    info = {
+        "iterations": solver.iterations_done,
+        "locked_nodes": len(ids),
+        "mix": float(mix),
+        "locked_max_diff": diff,
+        "seconds": time.perf_counter() - t0,
+        "setup_seconds": t_setup,
+        "solve_seconds": solver.solve_time,
+    }
+    run = SearchRun("resolve", solver, None, {}, 0.0)
+    info["self_exploitability"] = _self_exploitability(run, game_config)
+    del run, solver
+    return out, info
+
+
 # -- one spot -------------------------------------------------------------------------
 
 
@@ -660,6 +784,8 @@ def evaluate_sizes(
     snaps: dict[str, StrategySnapshot] = {}
     agents: dict[str, Any] = {}  # first-decision agents of the variants to re-search
     eval_solver = None
+    trunk_agent = None  # the trunk search's agent and solver settings, for the re-solves
+    trunk_cfg = None
     for name, variant, iters in plan:
         cfg = variant_config(settings, variant, net_path, iters)
         run = run_search(name, blueprint, state, game_config, cfg, predictor_factory())
@@ -682,6 +808,8 @@ def evaluate_sizes(
         snaps[name] = StrategySnapshot.of(run.solver, "cpu")
         if name == trunk_name:
             eval_solver = scoring_solver(run.solver, settings.eval_max_runouts)
+            if settings.resolve_iters:
+                trunk_agent, trunk_cfg = run.agent, run.solver.cfg
         elif settings.research and iters is None:
             agents[name] = run.agent
         del run
@@ -773,6 +901,34 @@ def evaluate_sizes(
             matches=matches,
         )
     del snaps, trunk, bp_sigma, dropped, researched, agents
+    _free()
+
+    # every budget variant's final profile re-solved below the flop on the trunk
+    if settings.resolve_iters:
+        for name, _variant, iters in plan:
+            if iters is not None:
+                continue
+            src = research_name(name) if research_name(name) in sigmas else name
+            sig, rinfo = resolve_below_root(
+                eval_solver,
+                sigmas[src],
+                trunk_agent.value_leaf_provider(eval_solver.tree),
+                settings.resolve_iters,
+                game_config,
+                trunk_cfg,
+                settings.resolve_mix,
+            )
+            searches[name]["resolve"] = {"source": src, **rinfo}
+            sigmas[resolved_name(name)] = sig
+            del sig
+            log(
+                f"  {name}: re-solved below the flop from {src} in {rinfo['seconds']:.1f}s "
+                f"({rinfo['iterations']} iterations, {rinfo['locked_nodes']} flop decisions "
+                f"locked; own-game exploitability {rinfo['self_exploitability']['mbb']:.0f} "
+                "mbb/hand)"
+            )
+            _free()
+    del trunk_agent
     _free()
 
     # scoring
@@ -910,21 +1066,27 @@ def run_size_evaluation(
 
 
 def profile_order(settings: SizeSettings) -> list[str]:
-    """Profile names in report order: per budget variant the translated and the
-    re-searched profile, then the fixed-iteration references, then the blueprint."""
+    """Profile names in report order: per budget variant the translated, the
+    re-searched and the re-solved profile, then the fixed-iteration references,
+    then the blueprint."""
     out = []
     for name, _variant, iters in search_runs(settings):
         out.append(name)
         if iters is None and settings.research:
             out.append(research_name(name))
+        if iters is None and settings.resolve_iters:
+            out.append(resolved_name(name))
     return [*out, "blueprint"]
 
 
 def display_name(name: str) -> str:
     """``"6000"`` -> ``"6000"``, ``"6000_it300"`` -> ``"6000, 300 it"``,
-    ``"6000_research"`` -> ``"6000, re-searched"``."""
+    ``"6000_research"`` -> ``"6000, re-searched"``, ``"6000_resolved"`` ->
+    ``"6000, re-solved"``."""
     if name.endswith(RESEARCH):
         return f"{name[: -len(RESEARCH)]}, re-searched"
+    if name.endswith(RESOLVED):
+        return f"{name[: -len(RESOLVED)]}, re-solved"
     size, _, it = name.partition("_it")
     return f"{size}, {it} it" if it else name
 
@@ -1028,15 +1190,16 @@ def _table(
 
 def render_markdown(data: dict) -> str:
     """The report: one-sided and two-sided exploitability per spot and variant
-    (mbb/hand) with means, re-searched and translated, the re-searches, the
-    searches (iterations, seconds, trees), the translation onto the trunk and
-    the scoring details."""
+    (mbb/hand) with means, re-searched, re-solved and translated, the
+    re-searches, the re-solves, the searches (iterations, seconds, trees), the
+    translation onto the trunk and the scoring details."""
     st = data["settings"]
     meta = data.get("meta", {})
     spots = data["spots"]
     cols = _columns(spots)
     res_cols = [c for c in cols if c.endswith(RESEARCH)]
-    tr_cols = [c for c in cols if c not in res_cols]
+    rsv_cols = [c for c in cols if c.endswith(RESOLVED)]
+    tr_cols = [c for c in cols if c not in res_cols and c not in rsv_cols]
     names = _search_names(spots)
     budget_cols = [c for c in names if "_it" not in c]
     rows = _variant_rows(st)
@@ -1096,6 +1259,27 @@ def render_markdown(data: dict) -> str:
                 else ""
             ),
         ]
+    if rsv_cols:
+        mix = st.get("resolve_mix") or 0.0
+        lines += [
+            "",
+            "**Re-solved** profiles compare flop decisions alone: on the trunk, every flop "
+            "decision of both players is locked to the search's profile (re-searched where it "
+            "has re-searches, else translated; the trunk search's own strategy for the trunk), "
+            "and every later-street decision is re-solved with the trunk search's leaf model "
+            f"for {st.get('resolve_iters')} DCFR iterations on the plain root ranges (unsafe: "
+            "no gadget), as separate turn searches replace a flop search's turn plan in play. "
+            "So the columns differ only in the flop strategy. "
+            + (
+                f"While solving, the flop locks have {mix:g} uniform mixed in, so the turn "
+                "below flop actions a profile never takes is solved too (the profile still "
+                "plays its own flop)."
+                if mix
+                else "Below a flop action a profile never takes (a size its tree lacks), the "
+                "other player's turn decisions get no counterfactual value and stay uniform "
+                "(see `resolve_mix`)."
+            ),
+        ]
     one_txt = (
         "Best response of the opponent of the player to act against that player's trunk "
         "strategy, in the trunk's game. The game value is the same for every column, so "
@@ -1108,12 +1292,23 @@ def render_markdown(data: dict) -> str:
     )
 
     def sizes_of(cs: Sequence[str]) -> list[str]:
-        return [c[: -len(RESEARCH)] if c.endswith(RESEARCH) else display_name(c) for c in cs]
+        out = []
+        for c in cs:
+            for suffix in (RESEARCH, RESOLVED):
+                if c.endswith(suffix):
+                    c = c[: -len(suffix)]
+                    break
+            else:
+                c = display_name(c)
+            out.append(c)
+        return out
 
     tables = []
     if res_cols:
         tables.append(("re-searched (as played)", res_cols))
-    tables.append(("translated only" if res_cols else "", tr_cols))
+    if rsv_cols:
+        tables.append(("re-solved", rsv_cols))
+    tables.append(("translated only" if res_cols or rsv_cols else "", tr_cols))
     for metric, title, txt in (
         ("one_sided_mbb", "Best response against the searcher", one_txt),
         ("mbb", "Two-sided exploitability", two_txt),
@@ -1164,6 +1359,43 @@ def render_markdown(data: dict) -> str:
             "",
             "Each re-search is a full decision of the same agent (tree, setup and solve within "
             "the flop budget); the opponent actions are raise-to amounts in chips.",
+        ]
+
+    # re-solves
+    if any("resolve" in x for s in spots for x in s["searches"].values()):
+        lines += ["", "## Re-solves below the flop on the trunk", ""]
+        rh = [
+            "spot",
+            "search",
+            "flop from",
+            "locked decisions",
+            "iterations",
+            "s",
+            "own game (mbb)",
+        ]
+        lines += [_row(rh), "|---|---|---|" + "---:|" * 4]
+        for s in spots:
+            for name in budget_cols:
+                r = s["searches"].get(name, {}).get("resolve")
+                if r is None:
+                    continue
+                lines.append(
+                    _row(
+                        [
+                            s["label"],
+                            name,
+                            display_name(r["source"]),
+                            str(r["locked_nodes"]),
+                            str(r["iterations"]),
+                            _f(r["seconds"], 1),
+                            _f(r["self_exploitability"]["mbb"]),
+                        ]
+                    )
+                )
+        lines += [
+            "",
+            "own game = the re-solved profile's exploitability in the trunk's game with the "
+            "trunk search's leaf model (both players best-respond on every street).",
         ]
 
     # searches
@@ -1332,6 +1564,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "DEFAULT_SIZES",
     "RESEARCH",
+    "RESOLVED",
     "Research",
     "SizeSettings",
     "Variant",
@@ -1347,6 +1580,9 @@ __all__ = [
     "replay",
     "research_name",
     "research_offtree",
+    "resolve_below_root",
+    "resolved_name",
+    "root_street_locks",
     "run_size_evaluation",
     "search_name",
     "search_plan",
