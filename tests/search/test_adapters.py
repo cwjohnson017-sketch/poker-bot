@@ -212,3 +212,94 @@ def test_flop_decision_timing_tabular_blueprint(small_strategy, monkeypatch):
         f"  blueprint policy_combos: {calls['n']} calls, {calls['t']:.2f}s total, "
         f"{1e3 * calls['t'] / max(1, calls['n']):.2f} ms/call"
     )
+
+
+def test_incremental_reach_rollouts_match_history_replay(tiny_neural_run, one_thread):
+    """Rollouts that carry the neural blueprint's own reach forward give the
+    same weights, actions and payoffs as replaying the history at every step."""
+    from pokerbot.search.leaf import LeafConfig, _rollout
+
+    bp = make_blueprint(f"neural:{tiny_neural_run}")
+    assert hasattr(bp, "policy_combos_nets")
+
+    class Replay:  # the same blueprint without the incremental hooks
+        spec = bp.spec
+
+        def policy_combos(self, state, player):
+            return bp.policy_combos(state, player)
+
+    engine = get_engine()
+    g = bp.game
+    config = engine.GameConfig(
+        num_players=2, stacks=g["stacks"], small_blind=g["small_blind"], big_blind=g["big_blind"]
+    )
+    flops = [s for s in random_states(bp.spec, config, 30, seed=13) if s.street == 1][:6]
+    assert flops
+    cfg = LeafConfig()
+    checked = 0
+    for i, s in enumerate(flops):
+        rng = np.random.default_rng(i)
+        full = list(s.board) + [c for c in range(52) if c not in s.board][:2]
+        for chooser in (0, 1):
+            a = _rollout(
+                s,
+                full,
+                bp,
+                chooser,
+                cfg.strategies,
+                cfg,
+                config,
+                engine,
+                np.random.default_rng(100 + i),
+            )
+            b = _rollout(
+                s,
+                full,
+                Replay(),
+                chooser,
+                cfg.strategies,
+                cfg,
+                config,
+                engine,
+                np.random.default_rng(100 + i),
+            )
+            assert a[2:] == b[2:]  # kind, folder, amount: the same sampled line
+            torch.testing.assert_close(a[0], b[0], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(a[1], b[1], rtol=1e-5, atol=1e-6)
+            checked += 1
+        del rng
+    assert checked >= 6
+
+
+def test_lockstep_rollout_policies_match_policy_matrix(tiny_distilled_run, one_thread):
+    """The lockstep rollouts' per-step range policy (VecNLHE slots replayed to
+    the state) equals the scalar path's policy_matrix at the same states."""
+    from pokerbot.search import vec_rollouts as vr
+
+    bp = make_blueprint(f"neural:{tiny_distilled_run}")
+    assert vr.supports(bp)
+    engine = get_engine()
+    g = bp.game
+    config = engine.GameConfig(
+        num_players=2, stacks=g["stacks"], small_blind=g["small_blind"], big_blind=g["big_blind"]
+    )
+    states = [s for s in random_states(bp.spec, config, 40, seed=21) if s.street >= 1][:24]
+    rng = np.random.default_rng(3)
+    ros = []
+    for s in states:
+        avail = [c for c in range(52) if c not in s.board]
+        full = list(s.board) + rng.choice(avail, 5 - len(s.board), replace=False).tolist()
+        ros.append(vr.Rollout(s, [int(c) for c in full], 0))
+    env = vr.make_env(ros, bp.spec, config, "cpu")
+    from pokerbot.blueprint.deepcfr.features import features_from_obs
+    from pokerbot.blueprint.deepcfr.strength import load_strength
+
+    feats = features_from_obs(env.obs(**bp.agent.features.obs_kwargs()))
+    st = bp.agent.features.strength_tables
+    cache = vr.StrengthCache(load_strength(st), "cpu") if st else None
+    boards = torch.tensor([ro.board for ro in ros])
+    P = vr.slot_policies(bp.agent, env, torch.arange(len(ros)), feats, boards, cache)
+    for i, (s, ro) in enumerate(zip(states, ros, strict=True)):
+        want = policy_matrix(bp, CardView(s, ro.board), s.current_player)
+        ok = valid_mask(ro.board)
+        torch.testing.assert_close(P[i][ok], want[ok], rtol=1e-4, atol=1e-5)

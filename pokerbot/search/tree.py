@@ -21,7 +21,10 @@ run-out), ``LEAF`` (depth limit: the start of a street beyond the solved
 horizon) and ``CONTINUATION``. A ``LEAF`` is a decision of the leaf chooser
 (the searcher's opponent by default) among ``k`` continuation strategies
 (Pluribus): each ``CONTINUATION`` child is valued by blueprint rollouts
-(see :mod:`pokerbot.search.leaf`).
+(see :mod:`pokerbot.search.leaf`). With ``leaf_mode="value_net"`` a depth
+limit is instead a ``VALUE`` terminal (no children), valued by a leaf value
+network on both players' current reaches (see
+:mod:`pokerbot.search.value_leaf`).
 
 Node budget: when the expanded tree is larger than ``max_nodes``, bet sizes
 are removed deepest street first (the size farthest from pot-sized first),
@@ -54,8 +57,9 @@ from .abstract import (
     to_action,
 )
 
-DECISION, CHANCE, FOLD_NODE, SHOWDOWN, LEAF, CONTINUATION = range(6)
-KIND_NAMES = ("decision", "chance", "fold", "showdown", "leaf", "continuation")
+DECISION, CHANCE, FOLD_NODE, SHOWDOWN, LEAF, CONTINUATION, VALUE = range(7)
+KIND_NAMES = ("decision", "chance", "fold", "showdown", "leaf", "continuation", "value")
+LEAF_MODES = ("rollouts", "value_net")
 
 
 @dataclass
@@ -63,10 +67,23 @@ class TreeConfig:
     spec: ActionSpec = DEFAULT_SPEC
     depth_streets: int = 1  # streets beyond the current one; the river is always solved fully
     max_nodes: int = 40000
+    max_nodes_flop: int | None = None  # node budget of trees rooted on the flop (None: max_nodes)
     chance_cards: int | None = None  # None: every card; int: subsample per chance node
     min_chance_cards: int = 4  # floor when the budget forces subsampling
     num_continuations: int = 4  # k continuation strategies at depth-limit leaves
     seed: int = 0
+    # "rollouts": LEAF + k CONTINUATION children; "value_net": one VALUE terminal
+    leaf_mode: str = "rollouts"
+    # nodes a depth-limit leaf counts for in the budget (None: 1 + k for rollouts,
+    # 1 for value_net; 1 + k gives a value-net tree the rollout tree's abstraction)
+    leaf_budget_cost: int | None = None
+    # depth_streets of trees rooted on the turn (None: depth_streets). 0 gives turn
+    # solves VALUE (or LEAF) nodes at the end of turn betting; >= 1 solves to showdown
+    depth_streets_turn: int | None = None
+    # node budget: among sizes equally far from pot-sized, drop re-raise entries before
+    # opening ones (False: the spec's order decides, which drops the turn's 1.0 open
+    # before its 1.0 re-raise and leaves all-in as the turn's only opening bet)
+    keep_open: bool = False
 
 
 @dataclass
@@ -97,7 +114,7 @@ class SubgameTree:
     slot: torch.Tensor  # position among the parent's children
     depth: torch.Tensor
     kind: torch.Tensor
-    actor: torch.Tensor  # acting player (DECISION, LEAF), else -1
+    actor: torch.Tensor  # acting player (DECISION, LEAF), else -1 (VALUE too)
     street: torch.Tensor
     contrib: torch.Tensor  # [N, 2] chips committed this hand
     bets: torch.Tensor  # [N, 2] chips committed on the node's street
@@ -114,7 +131,7 @@ class SubgameTree:
     children: torch.Tensor  # [N, max_children] child ids, -1 padded
     boards: list[tuple[int, ...]]
     level_start: list[int]  # node ids of depth d are level_start[d] .. level_start[d+1]-1
-    states: list[Any]  # engine state per node (DECISION / LEAF), else None
+    states: list[Any]  # engine state per node (DECISION / LEAF / VALUE), else None
     histories: list[tuple]  # concrete actions from the subgame root per node
     current_node: int  # the observed decision node (end of the path)
     path_nodes: list[tuple[int, int]]  # (node, child slot taken) along the observed path
@@ -138,7 +155,7 @@ class SubgameTree:
         return int((self.kind == kind).sum())
 
     def summary(self) -> str:
-        parts = [f"{KIND_NAMES[k]}={self.count(k)}" for k in range(6)]
+        parts = [f"{name}={self.count(k)}" for k, name in enumerate(KIND_NAMES)]
         return f"{self.num_nodes} nodes ({', '.join(parts)}), depth {len(self.level_start) - 1}"
 
     def child_actions(self, node: int) -> list[tuple[int, int]]:
@@ -147,10 +164,14 @@ class SubgameTree:
         return [(int(self.action_kind[c]), int(self.action_amount[c])) for c in range(s, s + n)]
 
 
-def _size_rank(a: tuple) -> float:
-    """Drop order for sized raises: farthest from pot-sized first, larger on ties."""
+def _size_rank(a: tuple, keep_open: bool = False) -> float:
+    """Drop order for sized raises: farthest from pot-sized first, larger on ties;
+    with ``keep_open``, a re-raise entry before an opening one of the same size."""
     f = float(a[1])
-    return abs(math.log(f)) + 1e-6 * f
+    r = abs(math.log(f)) + 1e-6 * f
+    if keep_open and len(a) > 2 and a[2] == "reraise":
+        r += 1e-9
+    return r
 
 
 class TreeBuilder:
@@ -175,6 +196,13 @@ class TreeBuilder:
         self.history_before = list(history_before)
         self.path = [(int(s), int(p), *action_key(a)) for s, p, a in path]
         self.tc = tree_config or TreeConfig()
+        if self.tc.leaf_mode not in LEAF_MODES:
+            raise ValueError(f"unknown leaf_mode {self.tc.leaf_mode!r} (expected {LEAF_MODES})")
+        self.value_leaves = self.tc.leaf_mode == "value_net"
+        cost = self.tc.leaf_budget_cost
+        if cost is None:
+            cost = 1 if self.value_leaves else 1 + int(self.tc.num_continuations)
+        self.leaf_cost = int(cost)
         self.device = torch.device(device)
         self.root_state = make_state(self.engine, config, button, self.board, self.history_before)
         if self.root_state.is_terminal:
@@ -184,8 +212,11 @@ class TreeBuilder:
             raise ValueError("search subgames start on the flop; preflop uses the blueprint")
         if len(self.board) != BOARD_LEN[self.root_street]:
             raise ValueError("board does not match the street of the root")
-        self.last_street = min(3, self.root_street + max(0, int(self.tc.depth_streets)))
-        if self.root_street == 2 and self.tc.depth_streets >= 1:
+        depth = int(self.tc.depth_streets)
+        if self.root_street == 2 and self.tc.depth_streets_turn is not None:
+            depth = int(self.tc.depth_streets_turn)
+        self.last_street = min(3, self.root_street + max(0, depth))
+        if self.root_street == 2 and depth >= 1:
             self.last_street = 3
         if searcher is None:
             searcher = int(self.root_state.current_player)
@@ -264,9 +295,11 @@ class TreeBuilder:
         if path_pos is not None and path_pos < len(self.path):
             raise ValueError("observed path continues past the end of the street")
         if new_st > self.last_street:
-            n = _Skel(LEAF, new_st, BOARD_LEN[st], (c[0], c[1]), (0, 0), state=state, history=hist)
-            n.actor = self.leaf_chooser
-            n.count = 1 + self.tc.num_continuations
+            kind = VALUE if self.value_leaves else LEAF
+            n = _Skel(kind, new_st, BOARD_LEN[st], (c[0], c[1]), (0, 0), state=state, history=hist)
+            if kind == LEAF:
+                n.actor = self.leaf_chooser
+            n.count = self.leaf_cost
             return n
         n = _Skel(CHANCE, st, BOARD_LEN[st], (c[0], c[1]), (0, 0), history=hist)
         n.template = self._node(state, hist, None)
@@ -282,6 +315,8 @@ class TreeBuilder:
     def build_skeleton(self) -> _Skel:
         """Skeleton within the node budget (see module docstring)."""
         budget = int(self.tc.max_nodes)
+        if self.root_street == 1 and self.tc.max_nodes_flop is not None:
+            budget = int(self.tc.max_nodes_flop)
         sk = self._skeleton()
         streets = list(range(self.last_street, self.root_street - 1, -1))
 
@@ -290,7 +325,7 @@ class TreeBuilder:
 
         for s in streets:  # 1: drop bet sizes deepest-first, keep one
             while sk.count > budget and len(sized(s)) > 1:
-                drop = max(sized(s), key=_size_rank)
+                drop = max(sized(s), key=lambda a: _size_rank(a, self.tc.keep_open))
                 self.street_actions[s].remove(drop)
                 sk = self._skeleton()
         for s in streets:  # 2: lower raise caps deepest-first
@@ -373,7 +408,7 @@ class TreeBuilder:
             r["aabs"].append(ab)
             r["cont"].append(cont)
             r["folder"].append(s.folder if cont < 0 else -1)
-            states.append(s.state if s.kind in (DECISION, LEAF) and cont < 0 else None)
+            states.append(s.state if s.kind in (DECISION, LEAF, VALUE) and cont < 0 else None)
             hists.append(s.history)
             kids: list[tuple] = []
             if cont >= 0:
@@ -496,10 +531,12 @@ __all__ = [
     "FOLD_NODE",
     "KIND_NAMES",
     "LEAF",
+    "LEAF_MODES",
     "RAISE",
     "SHOWDOWN",
     "SubgameTree",
     "TreeBuilder",
     "TreeConfig",
+    "VALUE",
     "build_tree",
 ]

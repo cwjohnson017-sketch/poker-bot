@@ -13,7 +13,15 @@ At every postflop decision:
    strategy we actually played (cached from that solve).
 3. **Solve** with DCFR within the street's time budget (tree building and
    rollouts count against it; at least ``min_iterations`` are run), with the
-   safe-resolving gadget when ``gadget.safe``.
+   safe-resolving gadget when ``gadget.safe``. Depth-limit leaves are valued
+   by blueprint rollouts (``leaf.mode: rollouts``) or by a value net on both
+   players' current reaches (``leaf.mode: value_net``, see
+   :mod:`pokerbot.search.value_leaf`): a river net averaged over the river
+   cards, or a turn-end net (one row per leaf), picked by the checkpoint's kind.
+   A turn-start net in ``leaf.net`` values the flop-end leaves of flop solves
+   with ``tree.depth_streets: 0`` (averaged over the turn cards); trees rooted
+   on the turn then use ``leaf.turn_net`` (a turn-end net) when it is set, for
+   turn solves with ``tree.depth_streets_turn: 0``.
 4. **Act.** Read the average strategy of our actual combo at the current node,
    sample a child, and play its concrete action (sizes computed exactly as
    :mod:`pokerbot.env.actions` does). Cache the played strategy (for locking)
@@ -23,6 +31,7 @@ At every postflop decision:
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -41,10 +50,13 @@ from .gadget import (
     history_key,
     mixed_prior,
     normalise_entry,
+    tree_terminate_values,
 )
 from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
-from .tree import LEAF, TreeBuilder
+from .tree import LEAF, VALUE, TreeBuilder
+from .tree_policy import blueprint_profile
+from .value_leaf import make_leaf_evaluator, predictor_kind
 
 
 def _engine_config(engine: Any, config: Any) -> Any:
@@ -59,6 +71,34 @@ def _engine_config(engine: Any, config: Any) -> Any:
     )
 
 
+def played_lock(
+    acts: list[tuple[int, int]], slot: int, old_acts: list[tuple[int, int]], old: torch.Tensor
+) -> torch.Tensor:
+    """``[C, len(acts)]`` lock of one of our earlier decisions on this street: the
+    strategy ``old`` we played there (over ``old_acts``) on the new tree's
+    children ``acts``, of which ``slot`` is the action we took.
+
+    The taken action keeps its exact probability, so our range below it is the
+    one we really have. When the new tree lacks some sizes we could have played
+    (a forced off-tree branch can push the budget into dropping them), their
+    mass goes to the other children in proportion to what they already have
+    (uniformly where they have none), never to the taken action."""
+    C = old.shape[0]
+    strat = torch.zeros(C, len(acts), dtype=old.dtype)
+    for j, a in enumerate(acts):
+        if a in old_acts:
+            strat[:, j] = old[:, old_acts.index(a)]
+    missing = (old.sum(1) - strat.sum(1)).clamp(min=0)  # [C]
+    others = [j for j in range(len(acts)) if j != slot]
+    if not others or float(missing.max()) <= 0:
+        return strat
+    rest = strat[:, others]
+    tot = rest.sum(1, keepdim=True)
+    share = torch.where(tot > 0, rest / tot.clamp(min=1e-30), 1.0 / len(others))
+    strat[:, others] = rest + missing[:, None] * share
+    return strat
+
+
 class SearchAgent(BaseAgent):
     name = "search"
 
@@ -67,6 +107,8 @@ class SearchAgent(BaseAgent):
         blueprint: Any,
         config: SearchConfig | dict | str | Path | None = None,
         name: str | None = None,
+        value_predictor: Any = None,
+        turn_value_predictor: Any = None,
         **overrides: Any,
     ) -> None:
         super().__init__(name)
@@ -75,7 +117,21 @@ class SearchAgent(BaseAgent):
             self.cfg = config
         else:
             self.cfg = search_config(config, **overrides)
+        if self.cfg.tree.spec is None:  # tree.actions: blueprint
+            self.cfg.tree = replace(self.cfg.tree, spec=blueprint.spec)
+        if self.cfg.tree.leaf_mode != self.cfg.leaf.mode:  # leaf.mode decides
+            self.cfg.tree = replace(self.cfg.tree, leaf_mode=self.cfg.leaf.mode)
         self.device = self.cfg.torch_device()
+        # leaf.mode value_net: a river or turn-end value net (loaded lazily from leaf.net)
+        self.value_predictor = value_predictor
+        if self.value_net and value_predictor is None and not self.cfg.leaf.net:
+            raise ValueError(
+                "leaf.mode is value_net but no value_predictor was given and leaf.net "
+                "(the value-net checkpoint path) is not set"
+            )
+        # trees rooted on the turn: a turn-end (or river) net from leaf.turn_net, if any
+        self.turn_value_predictor = turn_value_predictor
+        self._leaf_nets_checked = False
         self.cache = ContinualCache()
         self._roots: dict = {}
         self._played: dict = {}
@@ -95,15 +151,90 @@ class SearchAgent(BaseAgent):
         self._roots.clear()
         self._played.clear()
 
+    @property
+    def value_net(self) -> bool:
+        return self.cfg.leaf.mode == "value_net"
+
+    def get_value_predictor(self) -> Any:
+        """The value net (``leaf.mode: value_net``), loaded once from ``leaf.net``
+        unless one was passed to the constructor: a river
+        :class:`~.value_net.ValueNetPredictor` or a turn-end
+        :class:`~.turn_net.TurnEndPredictor`, by the checkpoint's ``meta`` kind."""
+        if self.value_predictor is None:
+            path = self.cfg.leaf.net
+            if not path:
+                raise ValueError("leaf.mode is value_net but leaf.net is not set")
+            from .turn_net import load_leaf_predictor
+
+            self.value_predictor = load_leaf_predictor(path, self.device)
+        return self.value_predictor
+
+    def get_turn_value_predictor(self) -> Any:
+        """The value net of trees rooted on the turn: the constructor's
+        ``turn_value_predictor``, else loaded once from ``leaf.turn_net``;
+        ``None`` when neither is set (``leaf.net`` then serves every tree)."""
+        if self.turn_value_predictor is None and self.cfg.leaf.turn_net:
+            from .turn_net import load_leaf_predictor
+
+            self.turn_value_predictor = load_leaf_predictor(self.cfg.leaf.turn_net, self.device)
+        return self.turn_value_predictor
+
+    def _check_leaf_nets(self) -> None:
+        """Config errors of the turn-start options, raised before any search
+        (so they are not hidden by ``fallback_on_error``): a turn-start
+        ``leaf.net`` needs ``depth_streets: 0`` and, when turn solves have
+        leaves, a turn-end ``leaf.turn_net``. Other setups are not checked."""
+        if self._leaf_nets_checked:
+            return
+        tc = self.cfg.tree
+        main = predictor_kind(self.get_value_predictor())
+        turn = self.get_turn_value_predictor()
+        if turn is not None and predictor_kind(turn) not in ("turn_end", "river"):
+            raise ValueError(
+                f"leaf.turn_net must be a turn-end or river net, got {predictor_kind(turn)}"
+            )
+        if main == "turn_start":
+            if int(tc.depth_streets) != 0:
+                raise ValueError(
+                    "leaf.net is a turn-start net, which values flop-end leaves: set "
+                    "tree.depth_streets: 0"
+                )
+            turn_depth = (
+                tc.depth_streets if tc.depth_streets_turn is None else tc.depth_streets_turn
+            )
+            if int(turn_depth) == 0 and turn is None:
+                raise ValueError(
+                    "turn solves end at turn-end leaves (tree.depth_streets_turn 0) but "
+                    "leaf.turn_net (a turn-end net) is not set; set it, or "
+                    "tree.depth_streets_turn: 1 to solve the turn to showdown"
+                )
+        self._leaf_nets_checked = True
+
+    def value_leaf_provider(self, tree: Any) -> Any:
+        """The leaf-value provider of ``tree``'s ``VALUE`` nodes for the value net:
+        :class:`~.value_leaf.TurnEndLeafEvaluator` (one net row per leaf) for a
+        turn-end net, :class:`~.value_leaf.FlopEndLeafEvaluator` (49 rows per
+        leaf) for a turn-start net, else :class:`~.value_leaf.ValueLeafEvaluator`
+        (the river net averaged over the 48 river cards). Trees rooted on the
+        turn use the turn net (``leaf.turn_net``) when one is set."""
+        pred = self.get_turn_value_predictor() if tree.root_street == 2 else None
+        if pred is None:
+            pred = self.get_value_predictor()
+        return make_leaf_evaluator(tree, pred, every=self.cfg.leaf.net_every)
+
     def act(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
         if state.street == 0:
             return self._blueprint_action(state, seat, rng)
+        if self.value_net:
+            self.get_value_predictor()  # load errors are config errors: no fallback
+            self._check_leaf_nets()
         try:
             return self._search_action(state, seat, rng)
         except Exception:
             if not self.cfg.fallback_on_error:
                 raise
             self.last_stats = {"fallback": True, "street": int(state.street)}
+            self.stats.append(self.last_stats)
             return self._blueprint_action(state, seat, rng)
 
     # -- helpers ------------------------------------------------------------
@@ -151,10 +282,7 @@ class SearchAgent(BaseAgent):
             played = self._played.get((key, tree.histories[node]))
             strat = torch.zeros(NUM_COMBOS, len(acts))
             if played is not None:
-                old_acts, old = played
-                for j, a in enumerate(acts):
-                    if a in old_acts:
-                        strat[:, j] = old[:, old_acts.index(a)]
+                strat = played_lock(acts, _slot, *played)
             if played is None or float(strat.sum()) <= 0:
                 st = tree.states[node]
                 P = policy_matrix(self.blueprint, st, seat).expand(NUM_COMBOS, -1)
@@ -181,9 +309,19 @@ class SearchAgent(BaseAgent):
             config, state.button, board, pre, cur, cfg.tree, seat, engine, self.device
         ).build()
         t_tree = time.perf_counter()
-        gadget = None
+        # safe resolving: terminate values from the previous street's solve (continual
+        # resolving), or computed once per street root as gadget.terminate says
+        mode = "off"  # stats: where this decision's terminate values come from
+        compute = None
+        t_term = 0.0
         if cfg.gadget.safe:
-            if info["terminate"] is None:
+            if info["terminate"] is None and info.get("terminate_source") is None:
+                compute = cfg.gadget.terminate
+            mode = compute or info.get("terminate_source") or "cache"
+            if compute == "unsafe":
+                info["terminate_source"] = compute
+            if compute == "rollouts":
+                t_term = time.perf_counter()
                 info["terminate"] = blueprint_terminate_values(
                     tree.states[0],
                     board,
@@ -196,19 +334,39 @@ class SearchAgent(BaseAgent):
                     self.device,
                     cfg.seed,
                 )
+                info["terminate_source"] = compute
+                t_term = time.perf_counter() - t_term
+        t_leaf = time.perf_counter()
+        rollouts = None
+        value_leaves = None
+        if bool((tree.kind == LEAF).any()):
+            rollouts = build_leaf_rollouts(
+                tree, self.blueprint, config, cfg.leaf, engine, self.device
+            )
+        if bool((tree.kind == VALUE).any()):
+            value_leaves = self.value_leaf_provider(tree)
+        t_leaf = time.perf_counter() - t_leaf
+        locks = self._locks(tree, key, seat)
+        solver = RangeSolver(
+            tree, info["ranges"], cfg.solver, rollouts, None, locks, value_leaves=value_leaves
+        )
+        if compute in ("blueprint", "blueprint_br"):
+            # terminate values in this tree's own game: the opponent against the blueprint
+            t0_term = time.perf_counter()
+            sigma_bp = blueprint_profile(solver, self.blueprint, config)[0]
+            info["terminate"] = tree_terminate_values(
+                solver, sigma_bp, 1 - seat, best_response=compute == "blueprint_br"
+            )
+            info["terminate_source"] = compute
+            del sigma_bp
+            t_term = time.perf_counter() - t0_term
+        if info["terminate"] is not None and cfg.gadget.safe:  # "unsafe": no gadget here
             prior = mixed_prior(
                 info["ranges"][1 - seat], valid_mask(board, self.device), cfg.gadget.prior_mix
             )
             if cfg.remove_own_blockers:
                 prior = prior * valid_mask(state.hole_cards(seat), self.device)
-            gadget = Gadget(1 - seat, prior, info["terminate"])
-        rollouts = None
-        if bool((tree.kind == LEAF).any()):
-            rollouts = build_leaf_rollouts(
-                tree, self.blueprint, config, cfg.leaf, engine, self.device
-            )
-        locks = self._locks(tree, key, seat)
-        solver = RangeSolver(tree, info["ranges"], cfg.solver, rollouts, gadget, locks)
+            solver.set_gadget(Gadget(1 - seat, prior, info["terminate"]))
         t_setup = time.perf_counter()
         solver.solve(iterations=min(cfg.min_iterations, cfg.solver.iterations))
         left = cfg.budget(street) - (time.perf_counter() - t0)
@@ -234,10 +392,16 @@ class SearchAgent(BaseAgent):
             "iterations": solver.iterations_done,
             "tree_seconds": t_tree - t0,
             "setup_seconds": t_setup - t_tree,
+            "leaf_seconds": t_leaf,
+            "value_leaves": 0 if value_leaves is None else value_leaves.num_leaves,
+            "value_provider": None if value_leaves is None else type(value_leaves).__name__,
+            "value_net_rows": 0 if value_leaves is None else value_leaves.net_rows,
             "solve_seconds": solver.solve_time,
             "total_seconds": t_end - t0,
             "cached_root": info["cached"],
             "cache_entries": stored,
+            "gadget": mode,
+            "terminate_seconds": t_term,
         }
         self.stats.append(self.last_stats)
         return to_action(engine, kind, amount)

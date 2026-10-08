@@ -1,0 +1,50 @@
+# Real-time search with value-net leaves (pokerbot/search, docs/value_net.md).
+# Same as search_default.yaml except where noted. leaf.net must point at a trained
+# checkpoint: a turn-end net (one row per leaf, fast) or a river net (48 rows per
+# leaf, slower); the agent picks the evaluator from the checkpoint's kind.
+#   python scripts/play_match.py --config configs/match_search_vn.yaml
+
+search:
+  device: auto
+  seed: 0
+  time_budget:              # seconds per decision: tree + gadget + leaf setup + solve
+    flop: 4.0               # value-net flop solves fit a < 5 s decision
+    turn: 2.0               # turn solves run to showdown (no leaves): about 110 iterations
+    river: 1.0
+  min_iterations: 10
+  remove_own_blockers: true
+  fallback_on_error: true
+
+  tree:
+    actions: blueprint      # the blueprint's own abstraction (dcfr4: 12 actions per street)
+    depth_streets: 1        # flop solves: flop + turn, value-net leaves at the end of the turn
+    max_nodes: 6000         # turn and river trees (to showdown); value-net leaves count 1 node
+    # flop trees: 20000 keeps the blueprint's whole flop abstraction (18.3k nodes, 2,009
+    # leaves, about 65 DCFR iterations in 4 s). On 3 spots scored on that trunk it beat
+    # 6000 (186 iterations) and 10000 (158) even with re-searches of off-tree sizes
+    # (docs/value_net_eval.md, 2026-10-07)
+    max_nodes_flop: 20000
+    chance_cards: null
+    min_chance_cards: 4
+
+  solver:
+    algorithm: dcfr
+    iterations: 1000
+    max_runouts: 48
+    dtype: float32
+
+  leaf:
+    mode: value_net
+    net: runs/value_net/turn_v3w.pt    # turn-end net, round 2 (docs/value_net_eval.md, 2026-10-07)
+    net_every: 1
+
+  gadget:
+    safe: true              # safe resolving from the previous street's cached solve
+    prior_mix: 0.05
+    rollouts: 256
+    # first decision of a street without a cached solve (the root ranges are the
+    # blueprint's): no gadget. On 6 flop spots (docs/value_net_eval.md, 2026-10-07)
+    # this beat terminate values from 256 or 4096 rollouts and from the search tree
+    # in strength and in per-hand excess over the blueprint, and leaves the whole
+    # 4 s to DCFR (about 185 iterations).
+    terminate: unsafe

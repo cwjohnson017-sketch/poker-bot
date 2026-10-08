@@ -39,7 +39,11 @@ Terminal kernels:
   distinct board, averaged over enumerated (or sampled) run-outs and built
   once per solve, applied as one matmul for all nodes on that board;
 * continuation (depth-limit leaf): blueprint rollouts, see
-  :mod:`pokerbot.search.leaf`.
+  :mod:`pokerbot.search.leaf`;
+* value (depth-limit leaf with ``leaf_mode="value_net"``): a leaf-value
+  provider (:mod:`pokerbot.search.value_leaf`) called with **both** players'
+  current reaches at the ``VALUE`` nodes, since a value net is nonlinear in
+  both ranges. ``VALUE`` nodes are terminals (no regrets).
 
 Safe resolving: when a ``gadget`` is given, its ``player`` starts at a
 terminate/enter choice per combo (see :mod:`pokerbot.search.gadget`); their
@@ -60,7 +64,7 @@ import torch
 from .combos import NUM_COMBOS, avoids_card, blocked_sum, conflict_matrix, valid_masks
 from .leaf import RolloutSet
 from .showdown import ShowdownTables, combo_strengths, fold_values
-from .tree import CHANCE, CONTINUATION, DECISION, FOLD_NODE, LEAF, SHOWDOWN, SubgameTree
+from .tree import CHANCE, CONTINUATION, DECISION, FOLD_NODE, LEAF, SHOWDOWN, VALUE, SubgameTree
 
 C = NUM_COMBOS
 
@@ -124,9 +128,16 @@ def allin_matrix(
 
 
 class TerminalEvaluator:
-    """Values of every terminal-like node for one player given the opponent's reach."""
+    """Values of every terminal-like node for one player given the opponent's reach
+    (and both reaches for ``VALUE`` nodes)."""
 
-    def __init__(self, tree: SubgameTree, cfg: SolverConfig, rollouts: RolloutSet | None):
+    def __init__(
+        self,
+        tree: SubgameTree,
+        cfg: SolverConfig,
+        rollouts: RolloutSet | None,
+        value_leaves: Any = None,
+    ):
         dev = tree.device
         self.dtype = getattr(torch, cfg.dtype)
         self.chunk = cfg.chunk_rows
@@ -191,10 +202,32 @@ class TerminalEvaluator:
         if len(conts) and rollouts is None:
             raise ValueError("tree has depth-limit leaves but no rollouts were given")
         self.cont_ids = conts
+        # value-net leaves: values(player, reach[2, L, C], cached) -> [L, C], rows in the
+        # provider's ``ids`` order if it has one, else in ascending node order
+        self.value_ids = (kind == VALUE).nonzero().flatten()
+        if len(self.value_ids) and value_leaves is None:
+            raise ValueError("tree has value-net leaves but no leaf-value provider was given")
+        ids = getattr(value_leaves, "ids", None)
+        if ids is not None:
+            ids = torch.as_tensor(ids, dtype=torch.long, device=dev)
+            if not torch.equal(ids.sort().values, self.value_ids):
+                raise ValueError("the leaf-value provider does not cover the tree's VALUE nodes")
+            self.value_ids = ids
+        self.value_leaves = value_leaves
 
-    def evaluate(self, player: int, opp: torch.Tensor, v: torch.Tensor) -> None:
+    def evaluate(
+        self,
+        player: int,
+        opp: torch.Tensor,
+        v: torch.Tensor,
+        reach: torch.Tensor | None = None,
+        cached: bool = False,
+    ) -> None:
         """Write values of ``player`` into ``v[node]`` for all terminal-like
-        nodes; ``opp`` is the opponent's reach ``[N, C]``."""
+        nodes; ``opp`` is the opponent's reach ``[N, C]``, ``reach`` both
+        players' reach ``[2, N, C]`` (needed when the tree has ``VALUE`` nodes).
+        ``cached`` lets the leaf-value provider reuse earlier net outputs
+        (``leaf.net_every``); the solver sets it for regret updates only."""
         if len(self.fold_ids):
             r = opp[self.fold_ids]
             coef = torch.where(self.fold_folder == player, -self.fold_stake, self.fold_stake)
@@ -215,6 +248,11 @@ class TerminalEvaluator:
             v[self.cont_ids] = self.rollouts.values(player, opp[self.cont_ids], self.chunk).to(
                 v.dtype
             )
+        if len(self.value_ids):
+            if reach is None:
+                raise ValueError("value-net leaves need both players' reach")
+            r = reach[:, self.value_ids]
+            v[self.value_ids] = self.value_leaves.values(player, r, cached).to(v.dtype)
 
 
 class RangeSolver:
@@ -227,6 +265,7 @@ class RangeSolver:
         gadget: Any = None,
         locked: dict[int, torch.Tensor] | None = None,
         terminals: TerminalEvaluator | None = None,
+        value_leaves: Any = None,
     ) -> None:
         self.tree = tree
         self.cfg = cfg or SolverConfig()
@@ -266,16 +305,22 @@ class RangeSolver:
             self.locked[d] = True
         self.avoid = avoids_card(dev).to(self.dtype)
         self._levels()
-        self.terminals = terminals or TerminalEvaluator(tree, self.cfg, rollouts)
-        self.gadget = gadget
-        if gadget is not None:
-            self.g_prior = gadget.prior.to(dev, self.dtype) * root_valid
-            self.g_term = gadget.terminate.to(dev, self.dtype)
-            self.g_regret = torch.zeros(2, C, device=dev, dtype=self.dtype)
-            self.g_enter = torch.full((C,), 0.5, device=dev, dtype=self.dtype)
+        self.terminals = terminals or TerminalEvaluator(tree, self.cfg, rollouts, value_leaves)
+        self.set_gadget(gadget)
         self.t = 0
         self.iterations_done = 0
         self.solve_time = 0.0
+
+    def set_gadget(self, gadget: Any) -> None:
+        """Attach the safe-resolving gadget (or ``None``) before solving, e.g. once
+        its terminate values have been computed on this solver's own tree."""
+        self.gadget = gadget
+        if gadget is not None:
+            dev = self.device
+            self.g_prior = gadget.prior.to(dev, self.dtype) * self.board_valid_root
+            self.g_term = gadget.terminate.to(dev, self.dtype)
+            self.g_regret = torch.zeros(2, C, device=dev, dtype=self.dtype)
+            self.g_enter = torch.full((C,), 0.5, device=dev, dtype=self.dtype)
 
     # -- setup --------------------------------------------------------------
 
@@ -342,9 +387,13 @@ class RangeSolver:
         opp: torch.Tensor,
         best_response: bool = False,
         regrets: bool = False,
+        reach: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Values ``[N, C]`` of player ``i``; ``opp`` is the opponent's reach,
+        ``reach`` both players' (``[2, N, C]``, for value-net leaves). Only
+        regret updates may reuse cached value-net outputs."""
         v = torch.zeros(self.N, C, device=self.device, dtype=self.dtype)
-        self.terminals.evaluate(i, opp, v)
+        self.terminals.evaluate(i, opp, v, reach, cached=regrets)
         for L in reversed(self.levels):
             ids = L["d_ids"]
             if len(ids):
@@ -403,7 +452,7 @@ class RangeSolver:
         self._discount(i)
         root = self.root_reach()
         reach = self.forward(self.sigma, root)
-        v = self.backward(i, self.sigma, reach[1 - i], regrets=True)
+        v = self.backward(i, self.sigma, reach[1 - i], regrets=True, reach=reach)
         sl = self._slice(i)
         nodes = self.dec_nodes[sl]
         w = float(self.t) if self.cfg.algorithm == "cfr+" else 1.0
@@ -485,7 +534,8 @@ class RangeSolver:
         sigma = self.average_strategy() if sigma is None else sigma
         root = self.root_reach() if root is None else root
         reach = self.forward(sigma, root)
-        return self.backward(player, sigma, reach[1 - player], best_response=best_response), reach
+        v = self.backward(player, sigma, reach[1 - player], best_response, reach=reach)
+        return v, reach
 
     def pair_mass(self, root: torch.Tensor | None = None) -> torch.Tensor:
         r = self.ranges if root is None else root

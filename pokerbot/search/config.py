@@ -12,9 +12,12 @@ from ..config import REPO_ROOT, load_yaml
 from ..env.actions import DEFAULT_SPEC, ActionSpec, spec_from_lists
 from .leaf import LeafConfig
 from .solver import SolverConfig
-from .tree import TreeConfig
+from .tree import LEAF_MODES, TreeConfig
 
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "search_default.yaml"
+
+
+GADGET_TERMINATE = ("rollouts", "blueprint", "blueprint_br", "unsafe")
 
 
 @dataclass
@@ -22,6 +25,12 @@ class GadgetConfig:
     safe: bool = True
     prior_mix: float = 0.05  # uniform mixed into the opponent prior at the gadget
     rollouts: int = 256  # blueprint rollouts for terminate values when nothing is cached
+    # terminate values when no earlier solve is cached (the first decision of a street):
+    # "rollouts": blueprint-vs-blueprint rollouts (``rollouts`` of them); "blueprint": the
+    # opponent's values with both players on the blueprint, in the search tree with its own
+    # leaves; "blueprint_br": the opponent's best response to the blueprint there;
+    # "unsafe": no gadget at such decisions (the root ranges are the blueprint's own)
+    terminate: str = "rollouts"
 
 
 @dataclass
@@ -60,7 +69,9 @@ def _sub(cls: type, data: dict | None, base: Any = None) -> Any:
     return replace(base, **data)
 
 
-def _spec(data: Any, max_raises: int | None) -> ActionSpec:
+def _spec(data: Any, max_raises: int | None) -> ActionSpec | None:
+    if data == "blueprint":
+        return None  # the blueprint's own abstraction, filled in by SearchAgent
     if data in (None, "default"):
         spec = DEFAULT_SPEC
     else:
@@ -87,10 +98,18 @@ def search_config(data: dict | str | Path | None = None, **overrides: Any) -> Se
     tree = dict(data.pop("tree", None) or {})
     spec = _spec(tree.pop("actions", None), tree.pop("max_raises", None))
     leaf = _sub(LeafConfig, data.pop("leaf", None))
+    if leaf.mode not in LEAF_MODES:
+        raise ValueError(f"unknown leaf.mode {leaf.mode!r} (expected one of {LEAF_MODES})")
+    if tree.setdefault("leaf_mode", leaf.mode) != leaf.mode:
+        raise ValueError("tree.leaf_mode must match leaf.mode (set leaf.mode only)")
     tree.setdefault("num_continuations", len(leaf.strategies))
     tcfg = _sub(TreeConfig, tree, TreeConfig(spec=spec))
     scfg = _sub(SolverConfig, data.pop("solver", None))
     gcfg = _sub(GadgetConfig, data.pop("gadget", None))
+    if gcfg.terminate not in GADGET_TERMINATE:
+        raise ValueError(
+            f"unknown gadget.terminate {gcfg.terminate!r} (expected one of {GADGET_TERMINATE})"
+        )
     tb = data.pop("time_budget", None)
     cfg = _sub(SearchConfig, data)
     if tb is not None:

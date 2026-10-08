@@ -184,6 +184,135 @@ def num_params(net: nn.Module) -> int:
     return sum(p.numel() for p in net.parameters())
 
 
+class StackedAdvantageNets:
+    """``T`` advantage nets of one ``hist_type="mlp"`` architecture evaluated
+    together: ``nets(feats) -> [T, n, A]``, equal to stacking each net's
+    output (up to float rounding).
+
+    Evaluating many nets one by one is bound by kernel launches (hundreds per
+    net). Here every layer runs once for all nets as a batched matmul over
+    stacked weights. Two shortcuts use the structure of range queries, where
+    all rows share one public state and differ only in the hole cards: the
+    history branch is evaluated once when every row has the same history,
+    and the board slots of the card branch are summed once when every row has
+    the same board (only the hole-card group is per row).
+    """
+
+    def __init__(self, nets: list[AdvantageNet]) -> None:
+        cfg = nets[0].cfg
+        if cfg.hist_type != "mlp":
+            raise ValueError("StackedAdvantageNets supports hist_type='mlp' only")
+        if any(n.cfg != cfg for n in nets):
+            raise ValueError("all nets must share one configuration")
+        self.cfg = cfg
+        self.T = len(nets)
+        self.card_embedding = cfg.card_embedding
+
+        def st(f):  # stack one parameter (detached) over the nets
+            return torch.stack([f(n).detach() for n in nets])
+
+        self.rank = st(lambda n: n.cards.rank.weight)  # [T, 14, d]
+        self.suit = st(lambda n: n.cards.suit.weight)  # [T, 5, d]
+        self.slot = st(lambda n: n.cards.slot.weight)  # [T, 7, d]
+        self.card = st(lambda n: n.cards.card.weight) if cfg.card_embedding else None
+        self.cw1 = st(lambda n: n.cards.mlp[0].weight.T)  # [T, 4d, H]
+        self.cb1 = st(lambda n: n.cards.mlp[0].bias)[:, None]
+        self.cw2 = st(lambda n: n.cards.mlp[2].weight.T)
+        self.cb2 = st(lambda n: n.cards.mlp[2].bias)[:, None]
+        self.tok = st(lambda n: n.history.tok.weight)  # [T, V, d]
+        self.pos = st(lambda n: n.history.pos.weight[1 : cfg.history_len + 1])  # [T, L, d]
+        self.amt_w = st(lambda n: n.history.amt.weight[:, 0])  # [T, d]
+        self.amt_b = st(lambda n: n.history.amt.bias)
+        self.hw1 = st(lambda n: n.history.mlp[0].weight.T)  # [T, L*d, hh]
+        self.hb1 = st(lambda n: n.history.mlp[0].bias)[:, None]
+        self.hw2 = st(lambda n: n.history.mlp[2].weight.T)
+        self.hb2 = st(lambda n: n.history.mlp[2].bias)[:, None]
+        self.sw = st(lambda n: n.scalars[0].weight.T)
+        self.sb = st(lambda n: n.scalars[0].bias)[:, None]
+        self.iw = st(lambda n: n.inp.weight.T)
+        self.ib = st(lambda n: n.inp.bias)[:, None]
+        self.hidden = [
+            (
+                st(lambda n, j=j: n.hidden[j].weight.T),
+                st(lambda n, j=j: n.hidden[j].bias)[:, None],
+                st(lambda n, j=j: n.norms[j].weight)[:, None],
+                st(lambda n, j=j: n.norms[j].bias)[:, None],
+            )
+            for j in range(cfg.trunk_layers - 1)
+        ]
+        self.eps = nets[0].norms[0].eps if len(nets[0].norms) else 1e-5
+        self.ow = st(lambda n: n.head.weight.T)
+        self.ob = st(lambda n: n.head.bias)[:, None]
+
+    def _slot_embeddings(
+        self, cards: torch.Tensor, dealt: torch.Tensor, slots: slice
+    ) -> torch.Tensor:
+        """``[T, n, k, d]`` embeddings of the card slots ``slots`` (zero when undealt)."""
+        c = torch.where(dealt, cards, 0).long()
+        rank = torch.where(dealt, torch.div(c, 4, rounding_mode="floor"), 13)
+        suit = torch.where(dealt, c % 4, 4)
+        e = self.rank[:, rank] + self.suit[:, suit] + self.slot[:, slots][:, None]
+        if self.card is not None:
+            e = e + self.card[:, torch.where(dealt, c, NO_CARD)]
+        return e * dealt[None, ..., None].to(e.dtype)
+
+    def _cards(self, cards: torch.Tensor, card_mask: torch.Tensor) -> torch.Tensor:
+        n = cards.shape[0]
+        d = self.rank.shape[-1]
+        dealt = card_mask & (cards < NO_CARD)
+        shared_board = n > 1 and bool(
+            (cards[:, 2:] == cards[:1, 2:]).all() and (dealt[:, 2:] == dealt[:1, 2:]).all()
+        )
+        if shared_board:
+            hole = self._slot_embeddings(cards[:, :2], dealt[:, :2], slice(0, 2)).sum(
+                2
+            )  # [T, n, d]
+            b = self._slot_embeddings(cards[:1, 2:], dealt[:1, 2:], slice(2, 7))  # [T, 1, 5, d]
+            board = torch.cat([b[:, :, :3].sum(2), b[:, :, 3], b[:, :, 4]], 2)  # flop, turn, river
+            x = torch.baddbmm(self.cb1, hole, self.cw1[:, :d])  # [T, n, H]
+            x = x + torch.bmm(board, self.cw1[:, d:])  # the board's part, once
+        else:
+            e = self._slot_embeddings(cards, dealt, slice(0, 7))  # [T, n, 7, d]
+            g = torch.cat([e[:, :, :2].sum(2), e[:, :, 2:5].sum(2), e[:, :, 5], e[:, :, 6]], 2)
+            x = torch.baddbmm(self.cb1, g, self.cw1)
+        return torch.relu(torch.baddbmm(self.cb2, torch.relu(x), self.cw2))
+
+    def _history(self, hist: torch.Tensor, amt: torch.Tensor) -> torch.Tensor:
+        n, L = hist.shape
+        shared = n > 1 and bool((hist == hist[:1]).all() and (amt == amt[:1]).all())
+        if shared:
+            hist, amt = hist[:1], amt[:1]
+        mask = (hist != 0).to(self.tok.dtype)
+        x = (
+            self.tok[:, hist.long()]
+            + self.pos[:, None]
+            + amt.float()[None, ..., None] * self.amt_w[:, None, None]
+        )
+        x = (x + self.amt_b[:, None, None]) * mask[None, ..., None]  # [T, m, L, d]
+        x = x.reshape(self.T, x.shape[1], -1)
+        h = torch.relu(
+            torch.baddbmm(self.hb2, torch.relu(torch.baddbmm(self.hb1, x, self.hw1)), self.hw2)
+        )
+        return h.expand(self.T, n, h.shape[-1]) if shared else h
+
+    @torch.no_grad()
+    def __call__(self, feats: dict[str, torch.Tensor]) -> torch.Tensor:
+        n = feats["cards"].shape[0]
+        c = self._cards(feats["cards"], feats["card_mask"])
+        h = self._history(feats["hist"], feats["hist_amt"])
+        s = feats["scalars"].float()[None].expand(self.T, n, -1)
+        s = torch.relu(torch.baddbmm(self.sb, s, self.sw))
+        z = torch.relu(
+            torch.baddbmm(self.ib, torch.cat([c, h.to(c.dtype), s.to(c.dtype)], 2), self.iw)
+        )
+        for w, b, g, beta in self.hidden:
+            y = z + torch.relu(torch.baddbmm(b, z, w))
+            mu = y.mean(-1, keepdim=True)
+            var = y.var(-1, unbiased=False, keepdim=True)
+            z = (y - mu) * torch.rsqrt(var + self.eps) * g + beta
+        return torch.baddbmm(self.ob, z, self.ow)
+
+
 def regret_matching(
     adv: torch.Tensor, legal: torch.Tensor, fallback: str = "uniform"
 ) -> torch.Tensor:

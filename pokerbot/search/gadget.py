@@ -73,6 +73,26 @@ def blueprint_terminate_values(
     return rs.values(opp, agent_range.to(device)[None].float())[0]
 
 
+@torch.no_grad()
+def tree_terminate_values(
+    solver: Any, sigma: torch.Tensor, player: int, best_response: bool = True
+) -> torch.Tensor:
+    """Terminate values ``[C]`` for the gadget ``player`` (the opponent) computed
+    in ``solver``'s own tree: their counterfactual values at the root when the
+    searcher plays ``sigma`` (``[D, A, C]``, e.g. the blueprint's strategy from
+    :func:`~pokerbot.search.tree_policy.blueprint_profile`), on the plain root
+    ranges.
+
+    With ``best_response`` the opponent best-responds to ``sigma`` (the CFR-D
+    value they could already secure against the strategy being refined);
+    otherwise they also play ``sigma``. The tree's own leaf values are used
+    (with value-net leaves, the net on both players' reaches under ``sigma``),
+    so ``T`` and the gadget's entry values come from the same game and are
+    weighted by the same searcher range, without rollout noise."""
+    v, _ = solver.values(player, sigma, best_response=best_response, root=solver.ranges)
+    return v[0]
+
+
 def gadget_entry_values(solver: Any, sigma: torch.Tensor | None = None) -> torch.Tensor:
     """The opponent's best-response values for entering the subgame (``[C]``)
     against the searcher's average strategy, on the searcher's root range."""
@@ -168,4 +188,5 @@ __all__ = [
     "history_key",
     "mixed_prior",
     "normalise_entry",
+    "tree_terminate_values",
 ]
