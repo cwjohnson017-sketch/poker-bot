@@ -527,6 +527,10 @@ def train_value_net(
     else:
         val_ds = ds
         tr, va = split_holdout(ds, cfg.holdout, cfg.holdout_by, cfg.seed)
+    if dev.type == "cuda":
+        # building the board features of ~1M boards leaves GBs of cached temporaries;
+        # without releasing them the residual head's activations spill out of VRAM
+        torch.cuda.empty_cache()
     log(
         f"# value net: {len(tr):,} train / {len(va):,} held-out samples on {ddev} "
         f"({len(ds.cache):,} boards, {ds.dropped} dropped by max_exploit), "
