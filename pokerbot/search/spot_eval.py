@@ -124,6 +124,67 @@ def exploit_spots(
     return out
 
 
+# flop lines into the turn spots: (name, BB's flop bet as a pot fraction or None for a
+# check, the button's bet after a check or None); every bet is called
+TURN_LINES = {
+    "xx": (None, None),  # check, check (pot 500)
+    "xbc": (None, 0.5),  # BB checks, BTN bets 1/2 pot, BB calls (pot 1000)
+    "bc": (0.75, None),  # BB bets 3/4 pot, BTN calls (pot 1250)
+}
+
+
+def turn_spots(
+    engine: Any,
+    game_config: Any,
+    boards: int = 2,
+    seed: int = 5,
+    lines: Sequence[str] = tuple(TURN_LINES),
+    types: Sequence[str] = SPOT_TYPES,
+) -> list[Spot]:
+    """Turn decisions on the boards of :func:`exploit_spots` (same permutations,
+    so the same flops; the turn is the deck's next card): after the 2.5x open and
+    call, each flop line of ``lines`` (:data:`TURN_LINES`), then on the turn "BB
+    first", "BTN vs check" and "BTN vs 1/2 lead" (a half-pot lead by the BB).
+    Labels read ``"board0 xbc BTN vs check"``."""
+    bad = [t for t in types if t not in SPOT_TYPES] + [x for x in lines if x not in TURN_LINES]
+    if bad:
+        raise ValueError(f"unknown spot types or lines {bad} ({SPOT_TYPES}, {tuple(TURN_LINES)})")
+    rng = np.random.default_rng(seed)
+    out = []
+
+    def bet(state: Any, frac: float) -> None:
+        pot = sum(int(x) for x in game_config.stacks) - sum(int(x) for x in state.stacks)
+        state.apply(engine.Action.raise_to(int(round(frac * pot))))
+
+    for b in range(boards):
+        deck = rng.permutation(52).tolist()
+        base = engine.GameState.new_hand(game_config, 0, deck)  # seat 0 on the button
+        base.apply(engine.Action.raise_to(250))
+        base.apply(engine.Action.check_call())
+        for line in lines:
+            s = base.clone()
+            lead, stab = TURN_LINES[line]
+            if lead is None:
+                s.apply(engine.Action.check_call())
+                if stab is None:
+                    s.apply(engine.Action.check_call())
+                else:
+                    bet(s, stab)
+                    s.apply(engine.Action.check_call())
+            else:
+                bet(s, lead)
+                s.apply(engine.Action.check_call())
+            if int(s.street) != 2:
+                raise AssertionError(f"line {line} did not reach the turn")
+            states = {"bb_first": s.clone(), "btn_vs_check": s.clone(), "btn_vs_lead": s.clone()}
+            states["btn_vs_check"].apply(engine.Action.check_call())
+            bet(states["btn_vs_lead"], 0.5)
+            for t in SPOT_TYPES:
+                if t in types:
+                    out.append(Spot(f"board{b} {line} {SPOT_NAMES[t]}", b, t, states[t]))
+    return out
+
+
 # -- settings ---------------------------------------------------------------------
 
 
@@ -1066,6 +1127,7 @@ __all__ = [
     "EvalSettings",
     "SPOT_TYPES",
     "SearchRun",
+    "TURN_LINES",
     "Spot",
     "blueprint_profile",
     "blueprint_sigma",
@@ -1082,4 +1144,5 @@ __all__ = [
     "scoring_solver",
     "search_overrides",
     "trunk_differences",
+    "turn_spots",
 ]
