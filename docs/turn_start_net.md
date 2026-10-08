@@ -278,12 +278,32 @@ python scripts/time_flop_search.py --blueprint %BP% --config configs/search_turn
   the pot (random ranges, 400 iterations). This is far below the net's own error,
   but the per-sample `exploit` should be used to filter.
 * **Continual resolving.** A `depth_streets: 0` flop tree, or a
-  `depth_streets_turn: 0` turn tree, has no chance nodes. `ContinualCache` then
-  stores nothing for the next street. That street starts from the blueprint
-  ranges, with the gadget's terminate values from `gadget.terminate` (256
-  blueprint rollouts by default): the noisy first-decision path. Fixing this
-  means storing per-card values at the `VALUE` leaves, which needs `gadget.py`
-  (not edited here).
+  `depth_streets_turn: 0` turn tree, has no chance nodes, so `ContinualCache`
+  has no chance children to store for the next street.
+  * **Turn-end leaves with a river net: stored** (2026-10-08). When the turn
+    tree's leaves are valued by a river net averaged over the 48 river cards
+    (`ValueLeafEvaluator`: `leaf.turn_net` a river net, or `leaf.net` one with
+    `leaf.turn_net` unset), the cache stores the river roots below the leaves
+    under our action. Each (leaf, river card `x`) gets the key a chance child
+    would have, both leaf reaches times `[avoids x]`, and the opponent's value
+    `[c avoids x] * m^x_us(c) * pot * ev^x_opp(c)` in chips: the terms of the
+    leaf's river average (`RiverAverage.card_values`). The river search starts
+    from them as after a turn solved to showdown (`gadget: cache`). With a
+    checked-down river and `ShowdownOracle` the entries equal those of the
+    showdown tree (`tests/search/test_river_cache.py`). See "Safe resolving
+    gadget" in `pokerbot/search/README.md` for the definition and the cost.
+  * **Turn-end nets: not stored.** `TurnEndLeafEvaluator` (e.g. `leaf.turn_net:
+    turn_v2w.pt`) predicts only the average over the river cards, so there is
+    no per-card value. The river starts from the blueprint ranges, with the
+    gadget's terminate values from `gadget.terminate` (256 blueprint rollouts
+    by default, none with `unsafe`): the noisy first-decision path.
+    `last_stats["cache_skipped_leaves"]` counts the leaves this affects.
+  * **Flop-end leaves: not stored.** The turn after a `depth_streets: 0` flop
+    solve starts the same way. `FlopEndLeafEvaluator` is a `RiverAverage` too,
+    so `card_values` already gives its per-turn-card values (49 cards, weight
+    `1 / 45`; checked once by hand, not in the tests). Storing them would mean
+    allowing flop-rooted trees in `gadget.card_value_provider`, with the
+    turn-start net's value at the turn root as `T`. Not done.
 * **Flop all-ins** stay as before: a sampled 48 of the 1,176 run-outs
   (`solver.max_runouts`), unbiased but noisy. Raise `max_runouts` if all-in
   nodes matter; flop trees are now small.
