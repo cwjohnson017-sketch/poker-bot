@@ -211,6 +211,12 @@ def solve_turn_states(
             out = {k: torch.empty((n, *v.shape[1:]), dtype=v.dtype) for k, v in rows.items()}
         for k, v in rows.items():
             out[k][idx] = v
+        del rows
+        if torch.device(device).type == "cuda":
+            # every batch has its own c, so its own tree and buffer shapes: without this the
+            # caching allocator fragments until it spills out of VRAM (a 200k-sample run on a
+            # 12 GB GPU slowed 2.7x after about 75k samples)
+            torch.cuda.empty_cache()
     return out
 
 
