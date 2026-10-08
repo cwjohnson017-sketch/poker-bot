@@ -9,7 +9,7 @@ search:
   seed: 0
   time_budget:              # seconds per decision: tree + gadget + leaf setup + solve
     flop: 4.0               # value-net flop solves fit a < 5 s decision
-    turn: 2.0               # turn solves run to showdown (no leaves): about 110 iterations
+    turn: 2.0               # depth-0 turn solves (below): about 230 iterations
     river: 1.0
   min_iterations: 10
   remove_own_blockers: true
@@ -18,7 +18,14 @@ search:
   tree:
     actions: blueprint      # the blueprint's own abstraction (dcfr4: 12 actions per street)
     depth_streets: 1        # flop solves: flop + turn, value-net leaves at the end of the turn
-    max_nodes: 6000         # turn and river trees (to showdown); value-net leaves count 1 node
+    # turn solves: turn betting only, value-net leaves at the end of the turn (leaf.turn_net,
+    # the river net averaged over the river cards): the blueprint's whole turn abstraction in
+    # about 170 nodes. On 18 turn spots it beat 6000-node turn trees solved to showdown (whose
+    # river had no bet below all-in) in every spot, by 256 mbb/hand one-sided
+    # (docs/value_net_eval.md, Round 3); the river roots below its leaves are cached for
+    # continual resolving
+    depth_streets_turn: 0
+    max_nodes: 6000         # turn and river trees; value-net leaves count 1 node
     # flop trees: 20000 keeps the blueprint's whole flop abstraction (18.3k nodes, 2,009
     # leaves, about 65 DCFR iterations in 4 s). On 3 spots scored on that trunk it beat
     # 6000 (186 iterations) and 10000 (158) even with re-searches of off-tree sizes
@@ -36,6 +43,7 @@ search:
   leaf:
     mode: value_net
     net: runs/value_net/turn_v3w.pt    # turn-end net, round 2 (docs/value_net_eval.md, 2026-10-07)
+    turn_net: runs/value_net/river_v3.pt  # trees rooted on the turn: river net x 48 river cards
     net_every: 1
 
   gadget:

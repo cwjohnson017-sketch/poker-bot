@@ -636,12 +636,18 @@ def test_resolve_mix_solves_lines_the_profile_never_enters(variant_result):
 
 SPEC_TURN = ActionSpec(streets=(PRE, FLOP, FLOP, LATE), max_raises=1)  # turn bets 0.5 / 1 pot
 DEPTH0 = {"tree": {"depth_streets_turn": 0}}
+# turn trees solved to showdown, whatever the production config sets
+SHOWDOWN = {"tree": {"depth_streets_turn": 1}}
 # "board0 xx BTN vs check" (the flop checked through, the big blind checks the turn):
 # "full" solves the turn to showdown with the whole turn abstraction (111 nodes, two river
 # cards), "lean" (100 nodes) lacks the turn's 0.5-pot bet (69 nodes), and "depth0" ends at
 # value-net leaves at the end of the turn (21 nodes, 5 leaves): the trunk
 TURNS = sz.SizeSettings(
-    variants=(sz.Variant("full", 200), sz.Variant("lean", 100), sz.Variant("depth0", 200, DEPTH0)),
+    variants=(
+        sz.Variant("full", 200, SHOWDOWN),
+        sz.Variant("lean", 100, SHOWDOWN),
+        sz.Variant("depth0", 200, DEPTH0),
+    ),
     trunk="depth0",
     budget=0.01,
     river_iters=10,
@@ -850,7 +856,8 @@ def test_cli_turn_options(capsys):
     ap = cli.build_parser()
     base = ["--blueprint", "uniform", "--oracle", "showdown", "--street", "turn"]
     argv = [*base, "--lines", "xbc", "bc", "--spots", "0:xx:bb_first", "--budget", "2"]
-    argv += ["--variant", "prod=6000", "--variant", "depth0=6000:" + json.dumps(DEPTH0)]
+    argv += ["--variant", "prod=6000:" + json.dumps(SHOWDOWN)]
+    argv += ["--variant", "depth0=6000:" + json.dumps(DEPTH0)]
     args = ap.parse_args([*argv, "--trunk", "depth0"])
     s = cli.settings_from_args(args)
     assert s.street == 2 and s.budget == 2 and s.trunk_name() == "depth0"
