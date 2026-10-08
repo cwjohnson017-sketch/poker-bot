@@ -42,7 +42,10 @@ search:
 
   leaf:
     mode: value_net
-    net: runs/value_net/turn_v3w.pt    # turn-end net, round 2 (docs/value_net_eval.md, 2026-10-07)
+    # turn-end net, round 3: 2048 x 8 layers, 120k steps. 11% lower leaf error than round 2's
+    # turn_v3w at production leaf states, 2-3% less exploitable on 12 flop spots, 58 instead
+    # of 62 flop iterations in 4 s (docs/value_net_eval.md, Round 3)
+    net: runs/value_net/turn_v4e.pt
     turn_net: runs/value_net/river_v3.pt  # trees rooted on the turn: river net x 48 river cards
     net_every: 1
 
