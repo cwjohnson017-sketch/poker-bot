@@ -24,9 +24,13 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
     186 against 677;
   * the round-2 turn-end net `turn_v3w`: 5% lower leaf error at production
     states, 2% lower exploitability.
-* **Measured and not adopted:** a blocker-aware head on the turn-end net, and
-  terminate values computed in the search tree (better than rollouts, but
-  2.6 s of the budget).
+* **Measured and not adopted:**
+  * a blocker-aware head on the turn-end net;
+  * terminate values computed in the search tree (better than rollouts, but
+    2.6 s of the budget);
+  * depth-0 flop search with the new turn-start net (stretch). It is built and
+    works (210 iterations in 2 s), but its flop decisions are 131 mbb/hand
+    more exploitable than depth-1 search's on 3 spots.
 * **Head to head, 10,000 hands** against the blueprint with the new
   production config: **+199 mbb/hand luck-adjusted, 95% CI [+44, +364]**
   (raw +162, CI [-13, +340]). There were no blueprint fallbacks in 12,825
@@ -813,8 +817,7 @@ against the searcher):
 
 ### 6. Turn-start net and batched turn solves (stretch)
 
-Code and CPU tests only so far; design and measurements are in
-`docs/turn_start_net.md`.
+Design and CPU measurements are in `docs/turn_start_net.md`.
 
 * `BatchTurnSolver` (`search/batch_turn_solver.py`) solves B turn subgames
   with turn-end-net leaves and exact river-averaged all-ins. Per instance it
@@ -825,8 +828,71 @@ Code and CPU tests only so far; design and measurements are in
 * `tree.depth_streets_turn` and `leaf.turn_net` give depth-limited turn
   solves with turn-end-net leaves. `configs/search_turn_start.yaml` is the
   flop `depth_streets: 0` setup.
-* GPU data generation and training are queued after the second on-policy
-  round, so they can bootstrap from the better turn-end net.
+
+**Data and net** (`runs/value_net/r2_turnstart*.cmd`):
+
+* **Training data.** 200,000 turn-root subgames with the usual mix (self-play,
+  perturbed, random), each solved by `BatchTurnSolver` for 300 iterations with
+  `turn_v3w` leaves at the end of turn betting (B = 512). Rate: 16 samples/s,
+  3.5 h in all.
+* **Solve quality.** Mean exploitability 0.51% of the pot (p90 1.0%), about 3x
+  the river data's. The net leaves make the subgame non-linear in the ranges, so
+  DCFR settles at about 0.5–1%.
+* **Held-out data.** 16,384 samples, seed 999.
+* **VRAM fix.** The first run slowed 2.7x after about 75k samples. Each batch
+  solves at its own `c`, and the CUDA caching allocator fragmented until it
+  spilled out of the 12 GB of VRAM. `solve_turn_states` now releases cached
+  blocks after every batch, and the speed held for the rest of the run.
+* **`turn_start_v1.pt`.** 2048 wide, 40k steps, 6 min. Held-out MAE in pot units:
+  * 0.039 overall (zero 0.41, bucket oracle 0.004);
+  * blueprint ranges 0.023, perturbed 0.029, random 0.082;
+  * game value 0.0095.
+  * The training loss is 0.0004, so the net is limited by data, as the river
+    net was at 200k samples.
+
+**Depth-0 flop search** (`configs/search_turn_start.yaml`: flop betting only,
+flop-end leaves valued by `turn_start_v1` over the 49 turn cards, turn
+decisions solved to showdown as today):
+
+| | depth-1 production | depth-0 |
+|---|---:|---:|
+| flop tree | 18,294 nodes, 2,009 leaves | 213 nodes, 41 leaves (49 net rows each) |
+| flop budget | 4 s | 2 s |
+| DCFR iterations | about 67–81 | about 210 |
+| own-game exploitability, board0 BB first | 93 mbb/hand | 41 mbb/hand |
+
+**Exploitability of the depth-0 flop decisions** (`scripts/eval_depth0.py`,
+`runs/tree_size/depth0.json`; mbb/hand):
+
+* **Method.** The scoring trunk is the production search's own 18,294-node
+  tree. The *hybrid* profile plays the depth-0 search's strategy at all 72
+  flop decision nodes (an exact match, since both trees have the blueprint's
+  whole flop abstraction) and the production search's at every turn decision.
+  So the two columns differ only in the flop decisions.
+* **Spots.** The three of the tree-size test.
+
+| spot | depth-1 (production) one-sided | depth-0 flop one-sided | depth-1 two-sided | depth-0 flop two-sided |
+|---|---:|---:|---:|---:|
+| board0 BB first | -106 | 98 | 182 | 328 |
+| board0 BTN vs check | 593 | 682 | 165 | 312 |
+| board1 BB first | -36 | 64 | 225 | 278 |
+| **mean** | **150** | 281 | **191** | 306 |
+
+* **Not adopted.** Depth-0 flop decisions are worse in every spot: +131
+  one-sided and +115 two-sided on average, at half the time. They remain far
+  better than the blueprint (2,878 one-sided on this trunk).
+* **Two sources of error.** The turn-start net (MAE 0.039, limited by data at
+  200k samples) adds its own error to that of the turn-end net it was
+  bootstrapped from. Its targets also come from solves that are only accurate
+  to about 0.5% of the pot.
+* **What would help.**
+  * Several times more data, as the river net needed.
+  * On-policy turn-root states from depth-0 searches.
+  * Tighter target solves.
+  * A per-street budget making depth-0 the turn-time option rather than the
+    flop default.
+* **Reproducibility.** The depth-1 numbers repeat the tree-size test closely
+  (mean 150 against 147 one-sided), at a new run of the same searches.
 
 ### Other changes
 
@@ -917,8 +983,9 @@ Status of the round-1 list after Round 2:
 3. *Better first-decision gadget values:* done (section 1). Production now
    resolves unsafely there.
 4. *Bigger production trees:* done for the flop (section 4): 20,000 nodes.
-5. *Turn-start net and batched turn solving:* code done (section 6); GPU
-   data and training queued.
+5. *Turn-start net and batched turn solving:* done (section 6). The net is
+   trained on 200k samples, and depth-0 flop search is not yet as good as
+   depth-1.
 6. *Head-to-head at scale:* done (section 5). +199 mbb/hand luck-adjusted,
    significant at 10,000 hands.
 
@@ -939,11 +1006,10 @@ Next, in order of expected value:
    * bootstrap the turn-end data from a residual-head river net (its
      inference cost only matters offline);
    * or train on exact 48-river solves of on-policy states.
-4. **Turn-start net:**
-   * held-out accuracy and depth-0 flop timing once trained;
-   * then an exploitability comparison against depth-1 flop search, which
-     needs exact turn solves at the flop leaves (expensive) or the
-     depth-1 trunk with turn play taken from a depth-1 search.
+4. **Turn-start net.**
+   * More (and on-policy) data and tighter target solves before depth-0 flop
+     search can compete. It is limited by data at 200k samples, and its
+     flop decisions are 131 mbb/hand worse.
    * Also evaluate turn decisions with turn-end-net leaves
      (`depth_streets_turn: 0`) against today's turn solves to showdown.
 5. **Re-run the 12-spot and richer-trunk blueprint comparisons** with the
