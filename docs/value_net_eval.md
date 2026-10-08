@@ -27,8 +27,10 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
 * **Measured and not adopted:** a blocker-aware head on the turn-end net, and
   terminate values computed in the search tree (better than rollouts, but
   2.6 s of the budget).
-* **Head to head:** 10,000 hands against the blueprint (running; see Round 2,
-  section 5).
+* **Head to head, 10,000 hands** against the blueprint with the new
+  production config: **+199 mbb/hand luck-adjusted, 95% CI [+44, +364]**
+  (raw +162, CI [-13, +340]). There were no blueprint fallbacks in 12,825
+  search decisions, and flop decisions took 4.06 s on average.
 
 **Round 1 (2026-10-05/06):**
 
@@ -771,7 +773,43 @@ against the searcher):
 
 ### 5. Head-to-head
 
-(Queued: 10,000 hands against the blueprint with the final production config.)
+`runs/vn_match/match_r2.json` (`scripts/match_search.py`, `configs/match_search_vn.yaml`):
+
+* **Players.** A is the production search (`configs/search_value_net.yaml` as
+  copied to `runs/vn_match/r2_search_config_used.yaml`):
+  * leaf net `turn_v3w`;
+  * flop trees of 20,000 nodes, turn and river 6,000;
+  * no gadget at the first decision of a street, the safe gadget from the
+    cached solve afterwards;
+  * 4 / 2 / 1 s per flop / turn / river decision.
+
+  B is the blueprint `dcfr4_distilled_v2`; both play preflop with it.
+* **Hands.** 5,000 duplicate deals (10,000 hands) in 100 chunks of 50, seeds
+  1000-1099, independent of round 1's seeds 0-19. The run was paused once at
+  chunk 84 and resumed; only the unfinished chunk was replayed.
+
+| | mbb/hand | 95% CI |
+|---|---:|---|
+| raw | +162 | [-13, +340] |
+| **luck-adjusted** (all-in EV + street control variates) | **+199** | **[+44, +364]** |
+
+| street | search decisions | fallbacks | mean time | p90 | max | mean DCFR iterations |
+|---|---:|---:|---:|---:|---:|---:|
+| flop | 6,383 | 0 | 4.06 s | 4.09 s | 4.21 s | 81 |
+| turn | 3,857 | 0 | 2.02 s | 2.04 s | 2.08 s | 129 |
+| river | 2,585 | 0 | 1.00 s | 1.01 s | 1.02 s | 162 |
+
+* **Significant.** The production search beats its own blueprint by about
+  0.2 bb/hand: the luck-adjusted CI excludes zero, the raw one barely
+  includes it.
+* **Consistent with round 1.** Round 1's 2,000-hand match (old config)
+  measured +131, CI [-227, +492].
+* **Not a comparison of configs.** At this sample size the old and new
+  configs' win rates cannot be told apart.
+* **Stability.** All 12,825 search decisions searched (no fallback). The
+  slowest flop decision took 4.21 s.
+* **Speed.** The match took about 10 h on the RTX 4070 Ti, about 3.6 s per
+  hand.
 
 ### 6. Turn-start net and batched turn solves (stretch)
 
@@ -881,7 +919,8 @@ Status of the round-1 list after Round 2:
 4. *Bigger production trees:* done for the flop (section 4): 20,000 nodes.
 5. *Turn-start net and batched turn solving:* code done (section 6); GPU
    data and training queued.
-6. *Head-to-head at scale:* 10,000 hands running (section 5).
+6. *Head-to-head at scale:* done (section 5). +199 mbb/hand luck-adjusted,
+   significant at 10,000 hands.
 
 Next, in order of expected value:
 
