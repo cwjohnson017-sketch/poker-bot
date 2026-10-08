@@ -29,6 +29,13 @@ never materialised: ``sum_x ev^x * m^x`` is one batched matmul per chunk (see
 :meth:`RiverAverage._combine`), so beyond the net the cost of a call is
 about one write of the net input and one read of the net output.
 
+The terms of the average, ``v^x_i(c) = [c avoids x] * m^x_-i(c) * pot *
+ev^x_i(c)``, are the values at the river roots below a leaf: the solver's
+value of a chance child dealing ``x`` (``sum_x v^x / 44`` is the leaf value).
+:meth:`RiverAverage.card_values` returns them for some leaves; the
+continual-resolving cache stores them for the river search
+(:meth:`~pokerbot.search.gadget.ContinualCache.store`).
+
 The same chance average without a tree is :func:`river_average` (states given
 as tensors, both players at once); it is the target of the **turn-end net**
 (:mod:`.turn_net`, DeepStack's auxiliary net), which predicts it directly:
@@ -37,7 +44,8 @@ as tensors, both players at once); it is the target of the **turn-end net**
 
 (``sum_x [c avoids x] m^x_-p(c) = 44 m_-p(c)``, so ``ev_TE`` is a convex
 combination of the ``ev^x``). :class:`TurnEndLeafEvaluator` uses such a net,
-one row per leaf instead of 48.
+one row per leaf instead of 48; it has no per-card values, so nothing is
+cached for the river below its leaves.
 
 Providers here (anything with ``values(player, reach[2, L, 1326], cached) ->
 [L, 1326]`` works with :class:`~pokerbot.search.solver.TerminalEvaluator`;
@@ -242,7 +250,7 @@ class RiverAverage:
             dtype=torch.long,
             device=dev,
         ).view(-1, self.board_len + 1)
-        lb = torch.tensor(leaf_b4, dtype=torch.long, device=dev)
+        lb = self.leaf_board = torch.tensor(leaf_b4, dtype=torch.long, device=dev)
         slots = torch.arange(R, device=dev)
         rivers_t = torch.tensor(rivers, dtype=torch.long, device=dev).view(-1, R)
         self.cards = rivers_t[lb]
@@ -333,25 +341,7 @@ class RiverAverage:
         ranges = ordered.new_empty(Lc, R, 2, C)
         for a, b, u in runs:  # leaves on one turn board share the 48 river masks
             torch.mul(ordered[a:b, None], avoid[u][None, :, None, :], out=ranges[a - l0 : b - l0])
-        rows = slice(l0 * R, l1 * R)
-        with torch.no_grad():
-            ids = self._predictor_board_ids()
-            if ids is None:
-                ev = self.predictor.predict(
-                    self.boards5[self.row_board[rows]],
-                    ranges.view(n, 2, C),
-                    self.row_c[rows],
-                    self.row_stack[rows],
-                )
-            else:
-                ev = self.predictor.predict_ids(
-                    ids[self.row_board[rows]],
-                    ranges.view(n, 2, C),
-                    self.row_c[rows],
-                    self.row_stack[rows],
-                )
-        self.net_calls += 1
-        self.net_rows += n
+        ev = self._predict(slice(l0 * R, l1 * R), ranges.view(n, 2, C))
         ev = ev.to(dt).reshape(Lc, R, 2, C)
         hit = None
         if self._zero_output is None:  # first call: does the predictor keep the contract?
@@ -368,6 +358,26 @@ class RiverAverage:
             if hit is None:
                 hit = self.card_combos[self.cards[l0:l1]]
             ev.scatter_(3, hit[:, :, None, :].expand(-1, -1, 2, -1), 0.0)
+        return ev
+
+    def _predict(self, rows: slice | torch.Tensor, ranges: torch.Tensor) -> torch.Tensor:
+        """The predictor's output ``[n, 2, C]`` for the net rows ``rows`` (a slice
+        or an index tensor into the leaf-major rows) given their ranges ``[n, 2, C]``."""
+        with torch.no_grad():
+            ids = self._predictor_board_ids()
+            if ids is None:
+                ev = self.predictor.predict(
+                    self.boards5[self.row_board[rows]],
+                    ranges,
+                    self.row_c[rows],
+                    self.row_stack[rows],
+                )
+            else:
+                ev = self.predictor.predict_ids(
+                    ids[self.row_board[rows]], ranges, self.row_c[rows], self.row_stack[rows]
+                )
+        self.net_calls += 1
+        self.net_rows += int(ranges.shape[0])
         return ev
 
     def net_ev(self, player: int, ordered: torch.Tensor, chunk: int) -> torch.Tensor:
@@ -491,6 +501,60 @@ class RiverAverage:
                 w = torch.nan_to_num_(w, nan=0.0, posinf=0.0, neginf=0.0)
                 out[p, l0:l1] = w * scale[l0:l1, None] * self.valid[l0:l1]
         return out
+
+    @torch.no_grad()
+    def card_values(
+        self,
+        player: int,
+        reach: torch.Tensor,
+        leaves: Sequence[int] | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``player``'s values at the roots of the next street below some leaves,
+        one per dealt card: the terms of the chance average in :meth:`values`.
+
+        ``reach`` is ``[2, L, C]`` as for :meth:`values` (every leaf, in this
+        provider's leaf order), ``leaves`` the positions of the leaves wanted (all
+        by default). Returns ``cards [n, R]`` (the dealt cards ``x`` per leaf, as
+        :attr:`cards`) and ``v [n, R, C]`` in chips:
+
+            v[l, j](c) = [c avoids x] * m^x_-p(c) * pot * ev^x_p(c),   x = cards[l, j]
+
+        with ``m^x_-p = blocked_sum(pi_-p * [avoids x])`` and ``ev^x`` the
+        predictor's output on board ``b + x`` for both reaches masked by ``x``
+        (``(OOP, IP)`` order), ``pot = 2 c``. This is the solver's value of a
+        chance child dealing ``x`` (not multiplied by the chance weight), so
+        ``v.sum(1) / cards_per_pair == values(player, reach)[leaves]``. Runs the
+        net on the ``n * R`` rows of these leaves only (no caching)."""
+        dev = self.device
+        L, R = self.num_leaves, self.cards_per_leaf
+        idx = (
+            torch.arange(L, device=dev)
+            if leaves is None
+            else torch.as_tensor(leaves, dtype=torch.long, device=dev).reshape(-1)
+        )
+        n = int(idx.numel())
+        out = reach.new_zeros(n, R, C)
+        if n == 0:
+            return self.cards[idx], out
+        rv = self._prepare(reach)
+        dt = reach.dtype
+        ordered = self._ordered(rv)  # [L, 2, C], (OOP, IP)
+        opp = rv[1 - player]
+        col = 0 if player == self.oop_seat else 1
+        pot = 2.0 * self.c.to(dt)
+        slots = torch.arange(R, device=dev)
+        for s in range(0, n, self.leaves_per_chunk):
+            li = idx[s : s + self.leaves_per_chunk]
+            k = int(li.numel())
+            avoid = self._river_avoid[self.leaf_board[li]]  # [k, R, C] bool
+            ranges = ordered[li][:, None] * avoid[:, :, None, :].to(dt)  # [k, R, 2, C]
+            rows = (li[:, None] * R + slots[None, :]).flatten()
+            ev = self._predict(rows, ranges.view(k * R, 2, C)).to(dt).view(k, R, 2, C)
+            m = self.opponent_mass(opp[li], self.cards[li])  # [k, R, C]
+            v = torch.where(avoid, ev[:, :, col] * m, 0.0)
+            v = torch.nan_to_num_(v, nan=0.0, posinf=0.0, neginf=0.0)
+            out[s : s + k] = v * pot[li, None, None] * self.valid[li][:, None, :]
+        return self.cards[idx], out
 
 
 class ValueLeafEvaluator(RiverAverage):
