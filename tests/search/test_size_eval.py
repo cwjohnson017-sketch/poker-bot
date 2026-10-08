@@ -4,7 +4,10 @@ leaves, two tree sizes plus fixed-iteration references, a re-search at the
 opponent's off-tree bet), re-searches with locks on earlier decisions, and
 resuming. Named variants (own overrides, a trunk other than the last), skipped
 translated profiles and profiles re-solved below the flop end to end on the
-same spot, and the CLI's variant options."""
+same spot, and the CLI's variant options. Turn decisions: settings, picks and
+errors, showdown trees translated onto a depth-0 turn trunk, and one turn spot
+end to end (a showdown search, a smaller one re-searched at the off-tree bet,
+the depth-0 trunk)."""
 
 from __future__ import annotations
 
@@ -23,16 +26,18 @@ from pokerbot.search import size_eval as sz
 from pokerbot.search import spot_eval as se
 from pokerbot.search.combos import NUM_COMBOS
 from pokerbot.search.config import search_config
-from pokerbot.search.tree import DECISION, TreeConfig, build_tree
+from pokerbot.search.solver import RangeSolver
+from pokerbot.search.tree import CHANCE, DECISION, VALUE, TreeConfig, build_tree
 from pokerbot.search.tree_map import (
     StrategySnapshot,
+    action_set_differences,
     match_nodes,
     offtree_edges,
     path_nodes,
     subtree_nodes,
     translate_sigma,
 )
-from pokerbot.search.value_leaf import ShowdownOracle, make_leaf_evaluator
+from pokerbot.search.value_leaf import FixedLeafValues, ShowdownOracle, make_leaf_evaluator
 
 pytest.importorskip("pokerbot.search.batch_solver")
 
@@ -625,3 +630,239 @@ def test_resolve_mix_solves_lines_the_profile_never_enters(variant_result):
     uniform = solver.uniform[turn].cpu()
     assert torch.allclose(out[0.0][turn], uniform)  # untouched: uniform
     assert not torch.allclose(out[RESOLVE_MIX][turn], uniform, atol=1e-3)
+
+
+# -- turn decisions --------------------------------------------------------------------
+
+SPEC_TURN = ActionSpec(streets=(PRE, FLOP, FLOP, LATE), max_raises=1)  # turn bets 0.5 / 1 pot
+DEPTH0 = {"tree": {"depth_streets_turn": 0}}
+# "board0 xx BTN vs check" (the flop checked through, the big blind checks the turn):
+# "full" solves the turn to showdown with the whole turn abstraction (111 nodes, two river
+# cards), "lean" (100 nodes) lacks the turn's 0.5-pot bet (69 nodes), and "depth0" ends at
+# value-net leaves at the end of the turn (21 nodes, 5 leaves): the trunk
+TURNS = sz.SizeSettings(
+    variants=(sz.Variant("full", 200), sz.Variant("lean", 100), sz.Variant("depth0", 200, DEPTH0)),
+    trunk="depth0",
+    budget=0.01,
+    river_iters=10,
+    river_batch=512,
+    eval_max_runouts=None,
+    device="cpu",
+    search=dict(TINY.search),
+    street=2,
+)
+
+
+def _turn_spot(pick: str = "0:xx:btn_vs_check"):
+    engine, cfg = _config()
+    (spot,) = sz.select_spots(engine, cfg, picks=[pick], street=2)
+    return spot, cfg
+
+
+def test_turn_settings_spots_and_errors(monkeypatch):
+    # street: left out of the comparable settings on the flop; the turn's time budget
+    assert "street" not in TINY.comparable() and TURNS.comparable()["street"] == 2
+    cfg = sz.size_config(TURNS, 100)
+    flop = search_config(sz.config_path(sz.DEFAULT_CONFIG)).budget(1)
+    assert cfg.budget(2) == TURNS.budget and cfg.budget(1) == flop
+    assert cfg.tree.max_nodes == cfg.tree.max_nodes_flop == 100
+    with pytest.raises(ValueError, match="street must be"):
+        sz.SizeSettings(street=3)
+    with pytest.raises(ValueError, match="resolve_iters"):
+        replace(TURNS, resolve_iters=10)
+    # a variant's leaf.turn_net survives the run's own leaf settings (sections merge one deep)
+    s = replace(TURNS, search={**TINY.search, "leaf": {"net_every": 2}})
+    extra = {**DEPTH0, "leaf": {"turn_net": "river.pt"}}
+    over = sz.size_overrides(s, 100, "net.pt", extra=extra)
+    want = {"net_every": 2, "turn_net": "river.pt", "mode": "value_net", "net": "net.pt"}
+    assert over["leaf"] == want
+    c = sz.size_config(s, 100, "net.pt", extra=extra)
+    leaf = (c.leaf.turn_net, c.leaf.net, c.leaf.net_every, c.leaf.mode)
+    assert leaf == ("river.pt", "net.pt", 2, "value_net")
+    assert c.tree.depth_streets_turn == 0 and c.tree.chance_cards == 2
+    # turn picks: <board>:<line>:<type>, or boards x lines x types
+    engine, gcfg = _config()
+    picks = ["1:bc:bb_first", "0:xbc:btn_vs_check"]
+    got = sz.select_spots(engine, gcfg, picks=picks, street=2)
+    assert [s.label for s in got] == ["board1 bc BB first", "board0 xbc BTN vs check"]
+    by = {s.label: s for s in se.turn_spots(engine, gcfg, 2, 5)}
+    for g in got:
+        assert g.state.public_key() == by[g.label].state.public_key()
+    some = sz.select_spots(engine, gcfg, 1, 5, ["btn_vs_check"], street=2, lines=["bc", "xx"])
+    assert [s.label for s in some] == ["board0 bc BTN vs check", "board0 xx BTN vs check"]
+    assert [sz.spot_line(s.label) for s in some] == ["bc", "xx"]
+    assert sz.spot_line("board0 BB first") is None
+    for bad in ("0:bb_first", "0:xr:bb_first", "x:xx:bb_first", "0:xx:river", "0:xx:bb_first:1"):
+        with pytest.raises(ValueError, match="bad turn spot"):
+            sz.select_spots(engine, gcfg, picks=[bad], street=2)
+    # a showdown trunk cannot be scored on turn spots; flop spots are not turn decisions
+    assert sz.trunk_problem(TURNS) is None and sz.trunk_problem(TINY) is None
+    for trunk in ("full", "lean"):
+        with pytest.raises(ValueError, match="depth_streets_turn"):
+            sz.check_settings(replace(TURNS, trunk=trunk))
+    (flop_spot,) = sz.select_spots(engine, gcfg, picks=["0:bb_first"])
+    with pytest.raises(ValueError, match="not turn decisions"):
+        sz.evaluate_sizes(flop_spot, UniformBlueprint(SPEC_TURN), gcfg, TURNS, ShowdownOracle)
+    with pytest.raises(ValueError, match="not flop decisions"):
+        sz.check_settings(TINY, got)
+
+    def never(*a, **k):
+        raise AssertionError("evaluated a spot")
+
+    monkeypatch.setattr(sz, "evaluate_sizes", never)
+    with pytest.raises(ValueError, match="depth_streets_turn"):
+        sz.run_size_evaluation(got, None, gcfg, replace(TURNS, trunk="full"), {}, "x.json")
+    with pytest.raises(ValueError, match="not turn decisions"):
+        sz.run_size_evaluation([flop_spot], None, gcfg, TURNS, {}, "x.json")
+
+
+def test_showdown_trees_on_a_depth0_turn_trunk():
+    spot, cfg = _turn_spot()
+    st = spot.state
+    seat = int(st.current_player)  # the button; the big blind checked
+    tc = TreeConfig(spec=SPEC_TURN, max_nodes=10**6, chance_cards=2, leaf_mode="value_net")
+
+    def tree(**k):
+        return build_tree(cfg, st.button, st.board, st.history, replace(tc, **k))
+
+    full, lean = tree(), tree(max_nodes=100)  # solved to showdown: river deals and betting
+    trunk = tree(depth_streets_turn=0, chance_cards=None)  # VALUE leaves where they deal
+    assert full.last_street == 3 and trunk.last_street == 2
+    kinds = trunk.kind.tolist()
+    leaves = [n for n, k in enumerate(kinds) if k == VALUE]
+    assert len(leaves) == 5 and CHANCE not in kinds
+    # every turn decision of the trunk matches the showdown tree exactly; leaves stay unmatched
+    m = match_nodes(full, trunk)
+    dec = [n for n, k in enumerate(kinds) if k == DECISION]
+    assert all(m.src_of[n] >= 0 and not m.translated[n] for n in dec)
+    assert all(m.src_of[n] == -1 for n in leaves)
+    for n in leaves:  # where the showdown tree deals the river
+        kids = [c for c in full.children[m.src_of[int(trunk.parent[n])]].tolist() if c >= 0]
+        assert any(int(full.kind[c]) == CHANCE for c in kids)
+    # its strategy at every turn decision, child by child; nothing lost or unmatched
+    ranges = torch.ones(2, NUM_COMBOS)
+    src_solver = RangeSolver(full, ranges)
+    torch.manual_seed(1)
+    sigma = torch.rand_like(src_solver.sigma) * src_solver.sigma.gt(0)
+    src = StrategySnapshot(full, src_solver.dec_nodes, sigma, src_solver.ranges)
+    zeros = FixedLeafValues(torch.zeros(2, len(leaves), NUM_COMBOS))
+    dst = RangeSolver(trunk, ranges, value_leaves=zeros)
+    sig, rep = translate_sigma(src, dst, seat, strict=True, match=m)
+    assert rep["translated_nodes"] == {"searcher": 0, "opponent": 0}
+    assert sum(rep["unmatched_nodes"].values()) == 0 and set(rep["fill"]) == {"exact"}
+    s_index = {n: d for d, n in enumerate(src.dec_nodes.tolist())}
+    for d, n in enumerate(dst.dec_nodes.tolist()):
+        s = m.src_of[n]
+        sa, da = full.child_actions(s), trunk.child_actions(n)
+        assert sorted(sa) == sorted(da)
+        for j, a in enumerate(da):
+            assert torch.equal(sig[d, j], sigma[s_index[s], sa.index(a)]), (n, a)
+    # nothing is off the full tree; the lean one lacks the big blind's 0.5-pot turn bet
+    assert offtree_edges(m, trunk, 1 - seat) == []
+    (edge,) = offtree_edges(match_nodes(lean, trunk), trunk, 1 - seat)
+    assert trunk.histories[edge] == ((2, 1, 2, 250),)
+    # the subset check on the trunk's betting street: the river (and its cards) do not count
+    assert sz.flop_sizes(lean.street_actions, 2) == "1"
+    assert action_set_differences(full, trunk) == ["chance cards differ: 2 vs None"]
+    assert action_set_differences(full, trunk, [2]) == []
+    assert action_set_differences(lean, trunk, [2]) == []
+    narrow = tree(depth_streets_turn=0, max_nodes=15)  # the turn's pot-sized bet only
+    assert sz.flop_sizes(narrow.street_actions, 2) == "1"
+    diffs = action_set_differences(full, narrow, [2])
+    assert diffs == ["street 2: src-only actions [('raise', 0.5)]"]
+
+
+@pytest.fixture(scope="module")
+def turn_result():
+    torch.manual_seed(0)
+    spot, cfg = _turn_spot()
+    keep: dict = {}
+    res = sz.evaluate_sizes(
+        spot, UniformBlueprint(SPEC_TURN), cfg, TURNS, ShowdownOracle, keep=keep, log=lambda m: None
+    )
+    return res, keep
+
+
+def test_turn_end_to_end(turn_result):
+    res, keep = turn_result
+    seat = res["seat"]
+    sr, pr = res["searches"], res["profiles"]
+    assert (res["street"], res["line"], res["trunk"], res["leaves"]) == (2, "xx", "depth0", 5)
+    assert list(sr) == ["full", "lean", "depth0"]
+    assert [(sr[n]["nodes"], sr[n]["leaves"]) for n in sr] == [(111, 0), (69, 0), (21, 5)]
+    assert all(x["subset_of_trunk"] and x["ranges_max_diff"] == 0 for x in sr.values())
+    # every profile scored on the trunk's 5 turn-end leaves x 48 river cards
+    assert list(pr) == sz.profile_order(TURNS)
+    for name, p in pr.items():
+        if p.get("same_as"):
+            continue
+        assert p["instances"] + p["skipped"] == 48 * 5, name
+        assert torch.isfinite(torch.tensor([p["chips"], *p["br"], p["one_sided_mbb"]])).all()
+        assert p["one_sided_mbb"] == pytest.approx(10 * p["br"][1 - seat])
+    assert pr["full_research"]["same_as"] == "full" and pr["depth0_research"]["same_as"] == "depth0"
+    # translation: exact at every turn decision of the showdown tree with the trunk's sizes
+    solver, snaps, sig = keep["eval_solver"], keep["snaps"], keep["sigmas"]
+    for name in ("full", "depth0"):
+        rep = sr[name]["translate"]
+        assert rep["translated_nodes"] == {"searcher": 0, "opponent": 0}
+        assert sum(rep["unmatched_nodes"].values()) == 0
+        m = keep["matches"][name]
+        s_index = {n: d for d, n in enumerate(snaps[name].dec_nodes.tolist())}
+        for d, n in enumerate(solver.dec_nodes.tolist()):
+            s = m.src_of[n]
+            sa, da = snaps[name].tree.child_actions(s), solver.tree.child_actions(n)
+            for j, a in enumerate(da):
+                got, want = sig[name][d, j], snaps[name].sigma[s_index[s], sa.index(a)]
+                assert torch.equal(got, want), (name, n, a)
+    assert torch.equal(sig["depth0"], snaps["depth0"].sigma)
+    assert sr["lean"]["translate"]["translated_nodes"]["opponent"] > 0
+    # the re-search: at the big blind's 0.5-pot turn bet, exact along the path
+    r = sr["lean"]["research"]
+    assert r["count"] == 1 and r["all_paths_exact"] and r["seeded_locks"] == 0
+    assert r["edges"][0]["history"] == [[2, 1, 2, 250]]
+    (rs,) = keep["researches"]["lean"]
+    t = rs.snapshot.tree
+    assert t.histories[t.current_node] == ((2, 1, 2, 250),) and t.last_street == 3
+    sub = set(subtree_nodes(solver.tree, rs.edge))
+    want, _ = translate_sigma(rs.snapshot, solver, seat, strict=True)
+    for d, n in enumerate(solver.dec_nodes.tolist()):
+        expect = want[d].cpu() if n in sub else sig["lean"][d]
+        assert torch.equal(sig["lean_research"][d], expect), n
+    # JSON round trip and the report, with means per spot type and per flop line
+    back = json.loads(json.dumps(res))
+    assert back == res
+    other = {**back, "label": "board0 bc BB first", "line": "bc", "spot_type": "bb_first"}
+    md = sz.render_markdown({"settings": TURNS.comparable(), "meta": {}, "spots": [back, other]})
+    assert md.startswith("# Turn tree size") and "Evaluated: turn decisions." in md
+    assert "Turn spots: the trunk ends at the end of turn betting" in md
+    assert "| turn sizes | river sizes |" in md and "turn budget 0.01 s" in md
+    assert "| board0 xx BTN vs check | full | 111 | 48 | 0 | 0.5/1 | all-in only |" in md
+    assert "| board0 xx BTN vs check | depth0 | 21 | 8 | 5 | 0.5/1 | - |" in md
+    for group in ("mean BB first (1)", "mean BTN vs check (1)", "mean xx (1)", "mean bc (1)"):
+        assert f"| {group} |" in md
+    assert "the opponent takes a turn size" in md and "within the turn budget" in md
+    flop_md = sz.render_markdown({"settings": TINY.comparable(), "meta": {}, "spots": []})
+    assert flop_md.startswith("# Flop tree size") and "Turn spots" not in flop_md
+
+
+def test_cli_turn_options(capsys):
+    cli = _load_cli()
+    ap = cli.build_parser()
+    base = ["--blueprint", "uniform", "--oracle", "showdown", "--street", "turn"]
+    argv = [*base, "--lines", "xbc", "bc", "--spots", "0:xx:bb_first", "--budget", "2"]
+    argv += ["--variant", "prod=6000", "--variant", "depth0=6000:" + json.dumps(DEPTH0)]
+    args = ap.parse_args([*argv, "--trunk", "depth0"])
+    s = cli.settings_from_args(args)
+    assert s.street == 2 and s.budget == 2 and s.trunk_name() == "depth0"
+    assert s.variants[1] == sz.Variant("depth0", 6000, DEPTH0)
+    assert args.lines == ["xbc", "bc"] and args.spots == ["0:xx:bb_first"]
+    assert ap.parse_args(base[:-2]).street == "flop"
+    assert ap.parse_args(base).lines == list(se.TURN_LINES)
+    with pytest.raises(SystemExit):
+        ap.parse_args([*base, "--lines", "xr"])
+    with pytest.raises(SystemExit):  # a showdown trunk on turn spots
+        cli.main([*argv, "--trunk", "prod"])
+    assert "depth_streets_turn" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main([*argv, "--trunk", "depth0", "--resolve-iters", "5"])
+    assert "resolve_iters" in capsys.readouterr().err

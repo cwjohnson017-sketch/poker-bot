@@ -1,11 +1,12 @@
-"""Flop tree size under a fixed time budget, scored with an exact river.
+"""Flop (and turn) tree size under a fixed time budget, scored with an exact river.
 
 The question: under the production flop budget (4 s), do bigger flop trees
 (more bet sizes, fewer DCFR iterations) give a less exploitable strategy than
 the production 6,000-node trees? More generally, which of several named search
 **variants** plays the better flop: each a node budget and search-config
 overrides of its own (:class:`Variant`), e.g. the production 20,000-node tree
-next to ``tree.keep_open`` trees of 20,000 and 34,170 nodes.
+next to ``tree.keep_open`` trees of 20,000 and 34,170 nodes. The same for turn
+decisions (``SizeSettings.street = 2``; see "Turn decisions" below).
 
 For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
 :func:`evaluate_sizes`
@@ -20,7 +21,8 @@ For one flop decision (a :class:`~pokerbot.search.spot_eval.Spot`),
    (``<name>_it<iters>``, a reference without the time limit). A variant's
    overrides go over ``SizeSettings.search``; its ``max_nodes`` (as
    ``tree.max_nodes`` and ``tree.max_nodes_flop``), the time budget and the
-   leaf settings go over both (:func:`size_overrides`);
+   leaf settings go over both, one level deep (:func:`size_overrides`: a
+   variant's ``leaf.turn_net`` stays);
 2. takes one budget search's tree as the scoring trunk (``SizeSettings.trunk``,
    default the last variant: without variants, the largest size) and puts
    every search's average strategy on it with
@@ -77,6 +79,22 @@ its strategy for the nearest size it has; the re-searched profiles answer it
 as the agent would. Only off-tree edges are re-searched: the agent re-searches
 at its on-tree decisions too, for every size, which this leaves out.
 
+**Turn decisions** (``street=2``; spots from :func:`select_turn_spots`, after
+the flop lines of :data:`~pokerbot.search.spot_eval.TURN_LINES`). Searches are
+rooted at the turn with the turn time budget: solved to showdown by default,
+or with ``tree.depth_streets_turn: 0`` ending at value-net leaves at the end of
+turn betting (valued by ``leaf.turn_net`` when set, else ``leaf.net``). The
+trunk must be such a depth-0 search's tree (:func:`trunk_problem`; checked
+before any search runs), so every (leaf, river card) river subgame is solved
+exactly as on the flop. A search solved to showdown is scored on its turn
+strategy alone: its turn decisions match the trunk's by history (where it
+deals the river the trunk has a leaf, which is never matched, and its river
+decisions have no trunk node), and its river plan gives way to the exact river
+equilibrium, as river searches replace it in play. Re-searches happen at
+off-tree opponent turn actions; the subset check compares the trunk's betting
+streets only; there is nothing to re-solve below a turn trunk
+(``resolve_iters`` is refused).
+
 Before the measured searches of a spot, a short search on it (the smallest
 tree's variant, :func:`warmup_config`) warms the blueprint's caches
 (``spot_warmup``), so every variant starts from the same cache state.
@@ -112,6 +130,7 @@ from .spot_eval import (
     HUGE_BUDGET,
     SPOT_NAMES,
     SPOT_TYPES,
+    TURN_LINES,
     EvalSettings,
     SearchRun,
     Spot,
@@ -130,6 +149,7 @@ from .spot_eval import (
     offtree_mass,
     run_search,
     scoring_solver,
+    turn_spots,
 )
 from .tree import DECISION, VALUE, SubgameTree
 from .tree_map import (
@@ -148,6 +168,8 @@ DEFAULT_SIZES = (6000, 10000, 20000)
 
 RESEARCH = "_research"
 RESOLVED = "_resolved"
+STREET_NAMES = ("preflop", "flop", "turn", "river")
+STREETS = {"flop": 1, "turn": 2}  # the streets whose decisions can be evaluated
 
 
 # -- settings ---------------------------------------------------------------------
@@ -181,7 +203,7 @@ class Variant:
 @dataclass
 class SizeSettings:
     sizes: tuple[int, ...] = DEFAULT_SIZES  # tree.max_nodes per search (without variants)
-    budget: float = 4.0  # flop time budget (seconds per decision)
+    budget: float = 4.0  # time budget of the evaluated street (seconds per decision)
     iters: int | None = None  # also a fixed-iteration search per variant
     config: str = DEFAULT_CONFIG  # base search config (YAML)
     seed: int = 0  # search seed (gadget rollouts)
@@ -191,7 +213,7 @@ class SizeSettings:
     river_batch: int = 256  # halved automatically on CUDA out-of-memory
     eval_max_runouts: int | None = EXACT_FLOP_RUNOUTS  # None: the search's solver.max_runouts
     strict: bool = False  # raise when a search's strategy loses mass on the trunk
-    research: bool = True  # re-search at off-tree opponent flop actions (budget searches)
+    research: bool = True  # re-search at off-tree opponent actions (budget searches)
     spot_warmup: bool = True  # warm the blueprint caches on each spot first
     device: str = "auto"
     search: dict = field(default_factory=dict)  # extra search_config overrides (every search)
@@ -202,6 +224,7 @@ class SizeSettings:
     score_translated: bool = True  # False: skip translated profiles that have re-searches
     resolve_iters: int = 0  # > 0: also <name>_resolved profiles (re-solved below the flop)
     resolve_mix: float = 0.0  # uniform mixed into the flop locks while re-solving
+    street: int = 1  # the decisions evaluated: 1 flop, 2 turn (turn spots, a depth-0 trunk)
 
     def __post_init__(self) -> None:
         self.variants = tuple(
@@ -228,6 +251,14 @@ class SizeSettings:
         self.resolve_mix = float(self.resolve_mix or 0.0)
         if not 0.0 <= self.resolve_mix < 1.0:
             raise ValueError(f"resolve_mix must be in [0, 1), got {self.resolve_mix}")
+        self.street = int(self.street)
+        if self.street not in STREETS.values():
+            raise ValueError(f"street must be 1 (flop) or 2 (turn), got {self.street}")
+        if self.street == 2 and self.resolve_iters:
+            raise ValueError(
+                "resolve_iters needs decisions below the root street, and a turn trunk (leaves "
+                "at the end of the turn) has none: drop resolve_iters for turn evaluations"
+            )
 
     def budget_variants(self) -> tuple[Variant, ...]:
         """The budget searches in report order: ``variants``, or one per size
@@ -260,6 +291,7 @@ class SizeSettings:
             "score_translated": True,
             "resolve_iters": 0,
             "resolve_mix": 0.0,
+            "street": 1,
         }
         for k, v in defaults.items():
             if d[k] == v:
@@ -323,9 +355,10 @@ def size_overrides(
 ) -> dict:
     """``search_config`` overrides of one search over ``settings.config``:
     ``settings.search`` first, then ``extra`` (a variant's own overrides), then
-    this run's ``tree.max_nodes``, its flop time budget (or ``iters`` fixed
-    iterations under a huge budget), value-net leaves and ``leaf.net =
-    net_path`` when given."""
+    this run's ``tree.max_nodes`` (and ``max_nodes_flop``), its time budget on
+    ``settings.street`` (or ``iters`` fixed iterations under a huge budget),
+    value-net leaves and ``leaf.net = net_path`` when given. Sections merge one
+    level deep, so e.g. a variant's ``leaf.turn_net`` stays."""
     o: dict[str, Any] = {
         "device": str(settings.torch_device()),
         "fallback_on_error": False,
@@ -335,7 +368,8 @@ def size_overrides(
     o = _merge(o, extra)
     o = _merge(o, {"tree": {"max_nodes": int(max_nodes), "max_nodes_flop": int(max_nodes)}})
     if iters is None:
-        o = _merge(o, {"time_budget": {"flop": float(settings.budget)}})
+        street = STREET_NAMES[settings.street]
+        o = _merge(o, {"time_budget": {street: float(settings.budget)}})
     else:
         huge = {"flop": HUGE_BUDGET, "turn": HUGE_BUDGET, "river": HUGE_BUDGET}
         o = _merge(o, {"min_iterations": int(iters), "time_budget": huge})
@@ -396,10 +430,17 @@ def select_spots(
     seed: int = 5,
     types: Sequence[str] = SPOT_TYPES,
     picks: Sequence[str] | None = None,
+    street: int = 1,
+    lines: Sequence[str] = tuple(TURN_LINES),
 ) -> list[Spot]:
     """:func:`~pokerbot.search.spot_eval.exploit_spots` (``boards`` x ``types``),
     or with ``picks`` exactly those spots in that order, each ``"<board>:<type>"``
-    (e.g. ``"0:bb_first"``, ``"1:btn_vs_check"``) on the same board sequence."""
+    (e.g. ``"0:bb_first"``, ``"1:btn_vs_check"``) on the same board sequence.
+    ``street=2``: the turn spots of :func:`select_turn_spots` instead."""
+    if street == 2:
+        return select_turn_spots(engine, game_config, boards, seed, lines, types, picks)
+    if street != 1:
+        raise ValueError(f"street must be 1 (flop) or 2 (turn), got {street}")
     if not picks:
         return exploit_spots(engine, game_config, boards, seed, types)
     want = []
@@ -411,6 +452,85 @@ def select_spots(
     every = exploit_spots(engine, game_config, max(b for b, _ in want) + 1, seed, SPOT_TYPES)
     by = {(s.board_index, s.spot_type): s for s in every}
     return [by[w] for w in want]
+
+
+def spot_line(label: str) -> str | None:
+    """The flop line of a turn spot's label (``"board0 xbc BTN vs check"`` ->
+    ``"xbc"``; :data:`~pokerbot.search.spot_eval.TURN_LINES`), else ``None``."""
+    parts = str(label).split()
+    return parts[1] if len(parts) > 2 and parts[1] in TURN_LINES else None
+
+
+def select_turn_spots(
+    engine: Any,
+    game_config: Any,
+    boards: int = 1,
+    seed: int = 5,
+    lines: Sequence[str] = tuple(TURN_LINES),
+    types: Sequence[str] = SPOT_TYPES,
+    picks: Sequence[str] | None = None,
+) -> list[Spot]:
+    """:func:`~pokerbot.search.spot_eval.turn_spots` (``boards`` x ``lines`` x
+    ``types``), or with ``picks`` exactly those spots in that order, each
+    ``"<board>:<line>:<type>"`` (e.g. ``"0:xbc:btn_vs_check"``) on the same
+    board sequence."""
+    if not picks:
+        return turn_spots(engine, game_config, boards, seed, lines, types)
+    want = []
+    for p in picks:
+        parts = str(p).split(":")
+        b, line, t = (parts + ["", ""])[:3]
+        if len(parts) != 3 or not b.isdigit() or line not in TURN_LINES or t not in SPOT_TYPES:
+            raise ValueError(
+                f"bad turn spot {p!r}: expected <board>:<line>:<type>, line one of "
+                f"{tuple(TURN_LINES)}, type one of {SPOT_TYPES}"
+            )
+        want.append((int(b), line, t))
+    every = turn_spots(engine, game_config, max(w[0] for w in want) + 1, seed)
+    by = {(s.board_index, spot_line(s.label), s.spot_type): s for s in every}
+    return [by[w] for w in want]
+
+
+def spot_street_errors(spots: Sequence[Spot], street: int) -> list[str]:
+    """Labels of ``spots`` whose state is not on ``street`` (spots without a
+    state are not checked)."""
+    return [s.label for s in spots if s.state is not None and int(s.state.street) != street]
+
+
+def trunk_problem(settings: SizeSettings) -> str | None:
+    """Why the trunk variant cannot be scored exactly on ``settings.street``,
+    from its config (``None`` when it can): turn evaluations need turn trees
+    that end at value-net leaves at the end of the turn (``tree.depth_streets_turn:
+    0``, or ``depth_streets: 0`` without it), since
+    :func:`~pokerbot.search.exact_eval.trunk_exploitability` solves every river
+    exactly from the trunk's turn-end leaves. Flop trunks are not checked."""
+    if settings.street != 2:
+        return None
+    name = settings.trunk_name()
+    v = next(v for v in settings.budget_variants() if v.name == name)
+    tc = variant_config(settings, v).tree
+    depth = tc.depth_streets if tc.depth_streets_turn is None else tc.depth_streets_turn
+    if int(depth) <= 0:  # as TreeBuilder: turn trees with depth >= 1 are solved to showdown
+        return None
+    return (
+        f"the scoring trunk {name!r} solves turn trees to showdown, but turn spots are scored "
+        "on a trunk with value-net leaves at the end of the turn (every river solved exactly): "
+        'use a variant with {"tree": {"depth_streets_turn": 0}} as the trunk'
+    )
+
+
+def check_settings(settings: SizeSettings, spots: Sequence[Spot] = ()) -> None:
+    """``ValueError`` unless every spot is on ``settings.street`` and the trunk
+    can be scored there (:func:`trunk_problem`)."""
+    bad = spot_street_errors(spots, settings.street)
+    if bad:
+        raise ValueError(
+            f"spots {bad} are not {STREET_NAMES[settings.street]} decisions "
+            f"(settings.street {settings.street})"
+        )
+    problem = trunk_problem(settings)
+    if problem:
+        raise ValueError(problem)
 
 
 # -- re-searches at off-tree opponent actions --------------------------------------
@@ -736,6 +856,23 @@ def _blueprint_on(solver: Any, blueprint: Any, game_config: Any) -> tuple:
     return blueprint_profile(solver, blueprint)
 
 
+def _check_trunk_tree(tree: SubgameTree, name: str) -> None:
+    """``ValueError`` unless ``tree`` ends at value-net leaves at the end of the
+    turn, as :func:`~pokerbot.search.exact_eval.trunk_exploitability` needs
+    (a turn tree solved to showdown has no leaves; a flop tree with
+    ``depth_streets: 0`` has them at the end of the flop)."""
+    if tree.last_street != 2 or not bool((tree.kind == VALUE).any()):
+        hint = (
+            'use a variant with {"tree": {"depth_streets_turn": 0}} as the trunk'
+            if tree.root_street == 2
+            else "use a trunk with tree.depth_streets 1"
+        )
+        raise ValueError(
+            f"the scoring trunk {name!r} must end at value-net leaves at the end of the turn "
+            f"(its tree's last street is {STREET_NAMES[tree.last_street]}): {hint}"
+        )
+
+
 def _tree_info(tree: Any) -> dict:
     return {
         "decision_nodes": int((tree.kind == DECISION).sum()),
@@ -764,6 +901,7 @@ def evaluate_sizes(
     defaults to ``blueprint.spec``. ``keep`` (a dict) receives the scoring
     solver, the snapshots, the re-searches and the sigmas, for tests."""
     t_spot = time.perf_counter()
+    check_settings(settings, [spot])
     state = spot.state
     seat = int(state.current_player)
     river_spec = blueprint.spec if river_spec is None else river_spec
@@ -807,6 +945,7 @@ def evaluate_sizes(
         )
         snaps[name] = StrategySnapshot.of(run.solver, "cpu")
         if name == trunk_name:
+            _check_trunk_tree(run.solver.tree, name)
             eval_solver = scoring_solver(run.solver, settings.eval_max_runouts)
             if settings.resolve_iters:
                 trunk_agent, trunk_cfg = run.agent, run.solver.cfg
@@ -817,8 +956,9 @@ def evaluate_sizes(
     assert eval_solver is not None
     trunk = snaps[trunk_name]
     ttree = trunk.tree
+    solved = range(ttree.root_street, ttree.last_street + 1)  # the trunk's betting streets
     for name, snap in snaps.items():
-        diffs = action_set_differences(snap.tree, ttree)
+        diffs = action_set_differences(snap.tree, ttree, solved)
         searches[name]["subset_of_trunk"] = not diffs
         searches[name]["subset_issues"] = diffs
         searches[name]["ranges_max_diff"] = float((snap.ranges - trunk.ranges).abs().max())
@@ -854,7 +994,7 @@ def evaluate_sizes(
             f"{lost['searcher']['nodes']} / {lost['opponent']['nodes']}"
         )
 
-    # re-searches at the opponent's off-tree flop actions, as in play
+    # re-searches at the opponent's off-tree actions on the root street, as in play
     researched: dict[str, list[Research]] = {}
     if settings.research:
         for name, _variant, iters in plan:
@@ -965,6 +1105,11 @@ def evaluate_sizes(
         "label": spot.label,
         "board_index": spot.board_index,
         "spot_type": spot.spot_type,
+        **(
+            {"street": settings.street, "line": spot_line(spot.label)}
+            if settings.street != 1
+            else {}
+        ),
         "board": [int(c) for c in state.board],
         "seat": seat,
         "hole": [int(c) for c in state.hole_cards(seat)],
@@ -1005,7 +1150,9 @@ def run_size_evaluation(
     finished spots and only the others run. A failing spot is logged and
     recorded under ``errors`` (and retried on resume). ``warmup`` (a spot) is
     searched once with two iterations first, so CUDA start-up stays out of the
-    timings."""
+    timings. Spots off ``settings.street`` and a trunk that cannot be scored
+    there raise ``ValueError`` before anything runs (:func:`check_settings`)."""
+    check_settings(settings, [*spots, *([warmup] if warmup is not None else [])])
     out_json = Path(out_json)
     data: dict[str, Any] = {
         "settings": settings.comparable(),
@@ -1140,11 +1287,17 @@ def _variant_rows(st: dict) -> list[tuple[str, int, dict]]:
 
 
 def _groups(spots: Sequence[dict]) -> list[tuple[str, list[dict]]]:
+    """The overall mean, then per spot type and per flop line (turn spots), each
+    when it is a proper subset."""
     groups = [("**mean**", list(spots))]
     for t in SPOT_TYPES:
         g = [s for s in spots if s["spot_type"] == t]
         if g and len(g) < len(spots):
             groups.append((f"mean {SPOT_NAMES[t]} ({len(g)})", g))
+    for line in TURN_LINES:
+        g = [s for s in spots if s.get("line") == line]
+        if g and len(g) < len(spots):
+            groups.append((f"mean {line} ({len(g)})", g))
     return groups
 
 
@@ -1205,10 +1358,13 @@ def render_markdown(data: dict) -> str:
     rows = _variant_rows(st)
     named = bool(st.get("variants") or st.get("trunk"))
     per = "variant" if st.get("variants") else "size"
-    lines = ["# Flop tree size under a fixed time budget", ""]
+    street = int(st.get("street", 1))
+    sn = STREET_NAMES[street]
+    lines = [f"# {sn.capitalize()} tree size under a fixed time budget", ""]
     lines.append(
         f"Blueprint `{meta.get('blueprint')}`, leaf model `{meta.get('leaf_model')}`, "
-        f"device {meta.get('device')}{', GPU ' + meta['gpu'] if meta.get('gpu') else ''}."
+        f"device {meta.get('device')}{', GPU ' + meta['gpu'] if meta.get('gpu') else ''}. "
+        f"Evaluated: {sn} decisions."
     )
     ref = f"; reference: {st['iters']} fixed iterations per {per}" if st.get("iters") else ""
     runouts = st.get("eval_max_runouts")
@@ -1225,8 +1381,14 @@ def render_markdown(data: dict) -> str:
     trunk_txt = (
         f"the `{trunk}` search's tree" if named else f"the {st['sizes'][-1]}-node search's tree"
     )
+    leaves = (
+        "value-net leaves at the end of the turn"
+        if street == 1
+        else "turn trees solved to showdown, or with `tree.depth_streets_turn: 0` ending at "
+        "value-net leaves at the end of the turn"
+    )
     lines.append(
-        f"Searches: `{st['config']}` (value-net leaves at the end of the turn) {where}, flop "
+        f"Searches: `{st['config']}` ({leaves}) {where}, {sn} "
         f"budget {st['budget']:g} s with the config's iteration settings{ref}.{extra} "
         + (
             f"A short search on each spot first warms the blueprint caches, so every {per} "
@@ -1242,13 +1404,21 @@ def render_markdown(data: dict) -> str:
         f"DCFR iterations, {st['mix']:g} uniform mixed into both river ranges), best responses "
         f"backed up through the trunk on the plain root ranges; all-ins over {allin}."
     )
+    if street == 2:
+        lines += [
+            "",
+            "Turn spots: the trunk ends at the end of turn betting, so a search solved to "
+            "showdown is scored on its turn strategy alone. Its river plan is dropped: every "
+            "river is played by the exact river equilibrium of the scoring (the blueprint's "
+            "river abstraction), as river searches would replace that plan in play.",
+        ]
     if res_cols:
         lines += [
             "",
-            "**Re-searched** profiles are what the agent plays: when the opponent takes a flop "
+            f"**Re-searched** profiles are what the agent plays: when the opponent takes a {sn} "
             "size the search's tree lacks (after a history the tree has), the same agent "
             "searches again there, with that size forced into its tree, its root info reused "
-            "and its own earlier flop decisions locked to what it played. Below each such "
+            f"and its own earlier {sn} decisions locked to what it played. Below each such "
             "action the profile is the re-search's strategy; elsewhere the first search's. "
             "**Translated** profiles answer those sizes with the first search's strategy for "
             "the nearest size it has. Only off-tree actions are re-searched (the agent also "
@@ -1358,7 +1528,7 @@ def render_markdown(data: dict) -> str:
         lines += [
             "",
             "Each re-search is a full decision of the same agent (tree, setup and solve within "
-            "the flop budget); the opponent actions are raise-to amounts in chips.",
+            f"the {sn} budget); the opponent actions are raise-to amounts in chips.",
         ]
 
     # re-solves
@@ -1406,8 +1576,8 @@ def render_markdown(data: dict) -> str:
         "nodes",
         "decision nodes",
         "leaves",
-        "flop sizes",
-        "turn sizes",
+        f"{sn} sizes",
+        f"{STREET_NAMES[street + 1]} sizes",
         "iterations",
         "total s",
         "setup s",
@@ -1421,8 +1591,10 @@ def render_markdown(data: dict) -> str:
         def m(key: str) -> float | None:
             return _mean([x.get(key) for x in xs])
 
-        def sizes(street: int) -> str:
-            got = {flop_sizes(x["street_actions"], street) for x in xs if x.get("street_actions")}
+        def sizes(s: int) -> str:
+            if s == 3 and all(x.get("leaves") for x in xs):
+                return "-"  # turn trees ending at leaves: no river
+            got = {flop_sizes(x["street_actions"], s) for x in xs if x.get("street_actions")}
             return got.pop() if len(got) == 1 else "varies"
 
         it, solve = m("iterations"), m("solve_seconds")
@@ -1434,8 +1606,8 @@ def render_markdown(data: dict) -> str:
                 _f(m("nodes")),
                 _f(m("decision_nodes")),
                 _f(m("leaves")),
-                sizes(1),
-                sizes(2),
+                sizes(street),
+                sizes(street + 1),
                 _f(it),
                 _f(m("total_seconds"), 2),
                 _f(m("setup_seconds"), 2),
@@ -1550,7 +1722,7 @@ def render_markdown(data: dict) -> str:
         lines += [
             "",
             "A re-searched profile without re-searches (the trunk's own, or one whose tree has "
-            "every opponent flop size of the trunk's) is the translated one and is scored once.",
+            f"every opponent {sn} size of the trunk's) is the translated one and is scored once.",
         ]
     total = sum(s["seconds"] for s in spots)
     lines += ["", f"{len(spots)} spots, {total / 60:.1f} min of evaluation."]
@@ -1565,10 +1737,13 @@ __all__ = [
     "DEFAULT_SIZES",
     "RESEARCH",
     "RESOLVED",
+    "STREETS",
+    "STREET_NAMES",
     "Research",
     "SizeSettings",
     "Variant",
     "act_again",
+    "check_settings",
     "compose_research",
     "config_path",
     "display_name",
@@ -1589,9 +1764,13 @@ __all__ = [
     "search_runs",
     "seed_played",
     "select_spots",
+    "select_turn_spots",
     "size_config",
     "size_overrides",
+    "spot_line",
+    "spot_street_errors",
     "street_root_state",
+    "trunk_problem",
     "variant_config",
     "variant_from_arg",
     "warmup_config",

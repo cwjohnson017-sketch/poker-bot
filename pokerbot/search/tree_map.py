@@ -501,19 +501,32 @@ def path_nodes(tree: SubgameTree, node: int) -> list[int]:
     return out[::-1]
 
 
-def action_set_differences(src_tree: SubgameTree, dst_tree: SubgameTree) -> list[str]:
+def action_set_differences(
+    src_tree: SubgameTree, dst_tree: SubgameTree, streets: Collection[int] | None = None
+) -> list[str]:
     """Why ``src``'s abstraction is not a subset of ``dst``'s: per street, spec
     entries only ``src`` keeps, higher raise caps, or other chance cards.
-    Empty when every ``src`` action set is contained in ``dst``'s."""
+    Empty when every ``src`` action set is contained in ``dst``'s.
+
+    ``streets`` limits the comparison to those streets' actions and raise caps,
+    and to the chance cards only when ``dst`` deals any: e.g. the streets a
+    turn tree with leaves at the end of the turn solves, for a ``src`` solved
+    to showdown, whose river (and river cards) ``dst`` does not have."""
     out = []
-    for s, (a, b) in enumerate(zip(src_tree.street_actions, dst_tree.street_actions, strict=True)):
+    pairs = zip(src_tree.street_actions, dst_tree.street_actions, strict=True)
+    for s, (a, b) in enumerate(pairs):
+        if streets is not None and s not in streets:
+            continue
         extra = [tuple(x) for x in a if tuple(x) not in {tuple(y) for y in b}]
         if extra:
             out.append(f"street {s}: src-only actions {extra}")
     for s, (a, b) in enumerate(zip(src_tree.raise_caps, dst_tree.raise_caps, strict=True)):
+        if streets is not None and s not in streets:
+            continue
         if a > b:
             out.append(f"street {s}: src raise cap {a} > dst {b}")
-    if src_tree.chance_cards_used != dst_tree.chance_cards_used:
+    deals = streets is None or bool((dst_tree.kind == CHANCE).any())
+    if deals and src_tree.chance_cards_used != dst_tree.chance_cards_used:
         out.append(
             f"chance cards differ: {src_tree.chance_cards_used} vs {dst_tree.chance_cards_used}"
         )
