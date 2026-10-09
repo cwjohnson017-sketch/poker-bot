@@ -38,9 +38,12 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
   * value-net search 216 one-sided and 95 two-sided, against the corrected
     blueprint's 1,117 and 978;
   * rollout search is no better than the blueprint (1,217 / 1,065).
-* **Smoke match** (1,000 hands): no fallbacks in 1,230 decisions, and every
-  river decision started from the new cache. The win rate needs the
-  10,000-hand match (running): -77 mbb/hand luck-adjusted, CI [-581, +457].
+* **Head to head, 10,000 hands against the blueprint** (Round 2's deals):
+  * **+255 mbb/hand luck-adjusted, 95% CI [+91, +430]; raw +189, CI [+12,
+    +374]**;
+  * 0 fallbacks; every turn and river decision continued from the cache;
+  * against Round 2's run on the same deals: +56 luck-adjusted, CI [-88, +200]
+    (not significant).
 
 **Round 2 (2026-10-07; details in "Round 2" below):**
 
@@ -1360,7 +1363,7 @@ and `turn_v3w` 166-212 (mean 184).
     the production states the exact leaf check uses.
   * `configs/search_value_net.yaml` now uses `turn_v4e`.
 
-### 8. Smoke match of the Round 3 production search
+### 8. Matches of the Round 3 production search
 
 The final production config (`runs/r3/match_search_config_used.yaml`) played
 against the blueprint (`scripts/match_search.py`, `configs/match_search_vn.yaml`;
@@ -1385,10 +1388,28 @@ The match was 500 duplicate deals (1,000 hands, seeds 2000-2009), 0.98 h.
 * **The win rate is not measured by 1,000 hands:** luck-adjusted -77 mbb/hand,
   95% CI [-581, +457]; raw -6, CI [-628, +593]. That is consistent both with
   zero and with Round 2's +199 (CI [+44, +364] over 10,000 hands).
-* **Running:** a 10,000-hand match on Round 2's seeds 1000-1099, the same
-  deals as Round 2's match (`runs/r3/match_r3.cmd`, about 10 h, resumable with
-  `--resume`). It measures the Round 3 production search in play, paired
-  with Round 2's run.
+**10,000 hands** (`runs/r3/match_r3.json`):
+* 5,000 duplicate deals on Round 2's seeds 1000-1099, the same deals as Round
+  2's match, so the two runs pair deal by deal;
+* 10.1 h;
+* 0 fallbacks in 12,715 search decisions;
+* all 3,849 turn and 2,502 river decisions started from the cache;
+* flop 4.09 s (max 4.26), turn 2.01 s, river 1.00 s.
+
+| mbb/hand, 95% CI | raw | luck-adjusted |
+|---|---|---|
+| **Round 3 production** | **+189 [+12, +374]** | **+255 [+91, +430]** |
+| Round 2 production, same deals | +162 [-13, +340] | +199 [+44, +364] |
+| paired difference, Round 3 - Round 2 | +27 [-118, +171] | +56 [-88, +200] |
+
+* **Significant on both measures.** The Round 3 production search beats its
+  blueprint by about 0.19-0.25 bb/hand. It is the first match whose raw CI
+  excludes zero too.
+* **Against Round 2:** +27 raw and +56 luck-adjusted on the same deals. That is
+  positive but not significant: the paired CI is about +-145. That fits the
+  exploitability gains, which are concentrated on the turn and river.
+* The first 1,000 deals had the difference at -210 luck-adjusted. Early match
+  estimates swing by hundreds of mbb/hand.
 
 ### 9. Tooling and other changes
 
@@ -1513,14 +1534,11 @@ Next, in order of expected value:
    * bf16, fused feature gathers or a smaller head should close that, and the
      same leaves would then improve the river roots cached for continual
      resolving.
-2. **A match of the round-3 production search.**
-   * Both production changes this round (turn decisions, flop leaf net) were
-     chosen on exact exploitability.
-   * The smoke match checks stability and timing only. A 10,000-hand match
-     against the blueprint, or a duplicate match against the Round 2
-     production search, would measure them in play.
-   * Separating configs that differ by a few percent of exploitability needs
-     far more hands than separating search from the blueprint.
+2. **A direct match against the Round 2 search.**
+   * Round 3's production beats the blueprint by +255 luck-adjusted over
+     10,000 hands, +56 over Round 2's run on the same deals, CI +-145.
+   * A search-against-search duplicate match would measure the difference
+     directly, but needs tens of thousands of hands at this effect size.
 3. **The flop's exploitability floor.**
    * On the 6,000-node trunk, an 11% better turn-end net bought only 2-3% less
      exploitability, and the search is near-converged in its own game (3
