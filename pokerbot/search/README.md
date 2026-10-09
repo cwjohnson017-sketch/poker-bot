@@ -24,6 +24,9 @@ and for preflop play.
 | `batch_solver.py` | `BatchRiverSolver`: DCFR on many river subgames sharing one betting tree, `river_tree` |
 | `exact_eval.py` | exact exploitability of a flop/turn strategy with every river subgame solved (`trunk_exploitability`), `map_sigma` |
 | `tree_policy.py` | the blueprint's strategy on every decision node of a tree (`blueprint_profile`), batched for distilled neural blueprints (`node_policies`) |
+| `spot_eval.py` | exact-river exploitability of flop search decisions on the evaluation spots (`exploit_spots`, `turn_spots`, `score_profile`), `scripts/eval_search_exploit.py` |
+| `size_eval.py` | named search variants (node budget + config overrides) under a time budget, scored on one trunk: translated, re-searched at off-tree opponent sizes, and re-solved below the root street; flop or turn spots (`scripts/eval_tree_size.py`) |
+| `tree_map.py` | a strategy translated onto a richer tree with the same root (`translate_sigma`), off-tree edges for re-searches |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
 | `gadget.py` | safe resolving gadget, continual-resolving cache |
 | `agent.py` | `SearchAgent`, `make_search_agent` (match runner: `search:<blueprint spec>`) |
@@ -108,6 +111,14 @@ before the 1.0 re-raise: at every flop-search budget the turn's only opening
 bet is all-in. `tree.keep_open: true` drops re-raise entries first on such ties.
 On the board0 spots, the 6000 / 10000 / 20000 budgets then give 3,108 / 6,066 /
 16,122 nodes, with fewer flop sizes than today's 5,802 / 8,478 / 18,294.
+
+The same tie leaves a 6000-node turn tree solved to showdown with no river bet
+below all-in. Production avoids this by solving the turn at depth 0
+(`tree.depth_streets_turn: 0`): turn betting only, with `VALUE` leaves at the
+end of the turn valued by `leaf.turn_net`, the river net averaged over the river
+cards. That keeps the blueprint's whole turn abstraction in about 170 nodes,
+and the river is searched with the whole river abstraction. On 18 turn spots
+it beat the showdown solve in every spot (`docs/value_net_eval.md`, Round 3).
 
 ## Solver
 

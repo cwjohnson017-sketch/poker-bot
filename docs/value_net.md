@@ -6,6 +6,10 @@ and ReBeL. The default flop search solves flop and turn (`depth_streets: 1`),
 so its leaves sit at the **end of turn betting**, just before the river card.
 
 Status (2026-10-06): implemented and evaluated; results in `docs/value_net_eval.md`.
+Since Round 3 (2026-10-09), turn decisions also use value-net leaves. They are
+depth-0 turn solves whose turn-end leaves average the river net over the river
+cards (section 1's evaluator), with the river roots below them cached for
+continual resolving. Flop searches use the turn-end net (section 6).
 
 ## 1. Which leaves first: a river net, averaged over river cards
 
