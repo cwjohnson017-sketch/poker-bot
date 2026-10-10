@@ -24,6 +24,9 @@ and for preflop play.
 | `batch_solver.py` | `BatchRiverSolver`: DCFR on many river subgames sharing one betting tree, `river_tree` |
 | `exact_eval.py` | exact exploitability of a flop/turn strategy with every river subgame solved (`trunk_exploitability`), `map_sigma` |
 | `tree_policy.py` | the blueprint's strategy on every decision node of a tree (`blueprint_profile`), batched for distilled neural blueprints (`node_policies`) |
+| `spot_eval.py` | exact-river exploitability of flop search decisions on the evaluation spots (`exploit_spots`, `turn_spots`, `score_profile`), `scripts/eval_search_exploit.py` |
+| `size_eval.py` | named search variants (node budget + config overrides) under a time budget, scored on one trunk: translated, re-searched at off-tree opponent sizes, and re-solved below the root street; flop or turn spots (`scripts/eval_tree_size.py`) |
+| `tree_map.py` | a strategy translated onto a richer tree with the same root (`translate_sigma`), off-tree edges for re-searches |
 | `solver.py` | `RangeSolver`: DCFR / CFR+, alternating updates, exact best response and exploitability |
 | `gadget.py` | safe resolving gadget, continual-resolving cache |
 | `agent.py` | `SearchAgent`, `make_search_agent` (match runner: `search:<blueprint spec>`) |
@@ -53,7 +56,10 @@ and for preflop play.
    enters through the resolve gadget.
 5. Read the average strategy of our actual combo at the current node, sample a
    child and play its concrete action. Cache what we played (for locks) and
-   the values at every next-street root the game can still reach.
+   the values at every next-street root the game can still reach: the chance
+   children under our action or, for a turn solve that ends at turn-end
+   leaves valued by a river net (`tree.depth_streets_turn: 0`), the river
+   roots below those leaves (see "Safe resolving gadget").
 
 ## Tree layout
 
@@ -84,10 +90,11 @@ Building happens in two steps. A recursive walk over scalar-engine states
 (`poker_engine` or the reference engine) produces a skeleton. Betting never
 depends on the cards, so a chance event keeps a single template subtree, and
 the BFS expansion then copies it once per card. Depth limit: the current street
-plus `depth_streets` more (default 1). Turn and river solves always run to
-showdown. At the limit a `LEAF` sits where the next street's card would be
-dealt. It is a decision of the leaf chooser (the searcher's opponent) among
-`k` `CONTINUATION` children.
+plus `depth_streets` more (default 1; `depth_streets_turn`, when set, for trees
+rooted on the turn). Turn solves run to showdown unless that depth is 0, and
+river solves always do. At the limit a `LEAF` sits where the next street's card
+would be dealt. It is a decision of the leaf chooser (the searcher's opponent)
+among `k` `CONTINUATION` children.
 
 **Node budget** (`max_nodes`; `max_nodes_flop` for trees rooted on the flop,
 when set). The skeleton gives exact expanded counts
@@ -104,6 +111,14 @@ before the 1.0 re-raise: at every flop-search budget the turn's only opening
 bet is all-in. `tree.keep_open: true` drops re-raise entries first on such ties.
 On the board0 spots, the 6000 / 10000 / 20000 budgets then give 3,108 / 6,066 /
 16,122 nodes, with fewer flop sizes than today's 5,802 / 8,478 / 18,294.
+
+The same tie leaves a 6000-node turn tree solved to showdown with no river bet
+below all-in. Production avoids this by solving the turn at depth 0
+(`tree.depth_streets_turn: 0`): turn betting only, with `VALUE` leaves at the
+end of the turn valued by `leaf.turn_net`, the river net averaged over the river
+cards. That keeps the blueprint's whole turn abstraction in about 170 nodes,
+and the river is searched with the whole river abstraction. On 18 turn spots
+it beat the showdown solve in every spot (`docs/value_net_eval.md`, Round 3).
 
 ## Solver
 
@@ -189,10 +204,12 @@ blueprints share betting paths across leaves.
 
 Design: `docs/value_net.md`. `leaf.mode: value_net` (it sets
 `tree.leaf_mode`) makes every depth-limit leaf a `VALUE` terminal: no
-children, actor -1, its engine state kept in `tree.states`. Only turn-end
-leaves on 4-card boards are supported, i.e. flop solves with
-`depth_streets: 1` (a flop solve with `depth_streets: 0` would need a turn net
-and raises `ValueError`). Turn and river solves have no leaves either way.
+children, actor -1, its engine state kept in `tree.states`. Turn-end leaves
+sit on 4-card boards: flop solves with `depth_streets: 1`, and turn solves of
+depth 0 (`tree.depth_streets_turn: 0`, or `depth_streets: 0` with it unset),
+valued by `leaf.turn_net` when it is set. Flop-end leaves (a flop solve with
+`depth_streets: 0`) need a turn-start net (`FlopEndLeafEvaluator`,
+`docs/turn_start_net.md`). River solves have no leaves.
 
 `ValueLeafEvaluator` values a leaf on board `b4` by the exact chance average
 of a river-start net `N_R` over the 48 river cards, using the solver's
@@ -339,6 +356,49 @@ tests check it drops from 52 to 0.015 chips on a 200 pot.
   stores our reach, the opponent's reach and the opponent's
   **best-response** values at every chance child under the action we take.
   The next street starts from exactly those vectors.
+* **Turn-end leaves.** A turn solve that stops at `VALUE` leaves at the end of
+  turn betting (`tree.depth_streets_turn: 0`) has no chance children. When a
+  river net averaged over the river cards values the leaves
+  (`ValueLeafEvaluator`, any river predictor: `leaf.turn_net` or `leaf.net` a
+  river net), the cache stores the river roots below the leaves under our
+  action instead (`gadget.card_value_provider`). For a leaf on board `b4` and
+  each river card `x` off it:
+  * the key is `(history of the leaf, b4 + x)`, the key a chance child dealing
+    `x` gets in a turn tree solved to showdown (a chance child's history is
+    its parent's betting history);
+  * both reaches at the leaf, times `[avoids x]`;
+  * the opponent's values, in chips:
+
+        opp_values(c) = [c avoids x] * m^x_us(c) * pot * ev^x_opp(c)
+
+    with `m^x_us = blocked_sum(our leaf reach * [avoids x])`, `pot = 2c` and
+    `ev^x_opp` the net's output for the opponent on `b4 + x`
+    (`RiverAverage.card_values`). This is the solver's value of a chance
+    child: weighted by our reach and not multiplied by the chance weight. The
+    48 terms average, with weight `1 / 44`, to the leaf value the solve used.
+
+  The river search uses them like any cached root (`cached_root`,
+  `gadget: cache`). With a checked-down river and `ShowdownOracle` the entries
+  equal those of the turn tree solved to showdown with the same turn strategy
+  (`test_river_cache.py`). `T` is then the net's value at the river root (both
+  players playing the net's river), not a best response to a river strategy
+  we have committed to; DeepStack's continual re-solving does the same at its
+  depth-limited leaves.
+
+  Not stored: a turn-end net (`TurnEndLeafEvaluator`) predicts only the
+  average over the river cards, and flop-end leaves (flop solves with
+  `depth_streets: 0`) are not handled. The next street then starts from the
+  blueprint ranges with `gadget.terminate`; `last_stats["cache_skipped_leaves"]`
+  counts those leaves.
+
+  Cost: the net runs on 48 rows per stored leaf, after the solve's time
+  budget (`last_stats["cache_seconds"]`, `cache_net_rows`). Each entry is three
+  float32 `[1326]` vectors, 16 KB, so 764 KB per leaf. On this CPU (4 torch
+  threads, shared with other jobs) with `river_v3`: a 100 bb turn tree after a
+  2.5x open, a call and a checked flop, `DEFAULT_SPEC`, 243 nodes and 51
+  leaves. It stores the 26 leaves under a check in 109 ms (1,248 entries,
+  20 MB) and the 11 under a pot bet in 51 ms; one solver iteration there takes
+  287 ms.
 * Without a cached solve (the first decision of a street, e.g. the first flop
   decision), `gadget.terminate` says where `T` comes from. It is computed
   once per street root and reused by later decisions on that street.
@@ -547,6 +607,13 @@ python -m pytest tests/search -q        # add -s for the CPU timing line
     river evaluator's leaf values and solve, and `net_every`.
   * The agent picks the provider from the checkpoint kind and plays; turn-end
     self-play states; the data and training CLIs.
+* `test_river_cache.py`: continual resolving below turn-end leaves. Per-card
+  values average to the leaf values (exact oracle and a nonlinear toy net);
+  with a checked-down river the depth-0 turn tree stores the same keys,
+  reaches and opponent values as the turn tree solved to showdown, after every
+  turn action, with and without the gadget; turn-end nets and flop trees store
+  nothing new; an agent with depth-0 turn trees searches the river from the
+  cache.
 * `test_tree_policy.py`: covers the following.
   * The batched blueprint profile equals per-node `policy_matrix` queries on
     every combo that can reach a node, and the fallback path for other

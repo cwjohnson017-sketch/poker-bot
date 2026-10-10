@@ -203,6 +203,9 @@ class ValueTrainConfig:
     eval_chunk: int = 1024
     data_device: str = "auto"  # auto | cpu | cuda: where the samples live
     seed: int = 0
+    # relative sampling weights per source, e.g. "3:4" draws on-policy samples (source 3)
+    # four times as often as the others (weight 1); "" samples uniformly
+    source_weights: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -292,6 +295,33 @@ def split_holdout(
     if n > 1 and not bool(held.any()):
         held[torch.randint(0, n, (1,), generator=g)] = True
     return (~held).nonzero().squeeze(1), held.nonzero().squeeze(1)
+
+
+def parse_source_weights(spec: str) -> dict[int, float]:
+    """``"3:4"`` or ``"2:0.5,3:4"`` -> ``{3: 4.0}`` / ``{2: 0.5, 3: 4.0}``; ``""`` -> ``{}``."""
+    out: dict[int, float] = {}
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        src, sep, w = part.partition(":")
+        if not sep or not src.strip().isdigit():
+            raise ValueError(f"bad source weight {part!r}: expected <source>:<weight>")
+        if float(w) < 0:
+            raise ValueError(f"source weight {part!r} is negative")
+        out[int(src)] = float(w)
+    return out
+
+
+def sampling_cdf(source: torch.Tensor, weights: dict[int, float]) -> torch.Tensor | None:
+    """Cumulative sampling probabilities (float64) of samples with sources ``source``
+    under per-source ``weights`` (1 for unlisted sources); ``None`` without weights."""
+    if not weights:
+        return None
+    w = torch.ones(source.shape[0], dtype=torch.float64, device=source.device)
+    for s, x in weights.items():
+        w[source == s] = x
+    cdf = w.cumsum(0)
+    if not float(cdf[-1]) > 0:
+        raise ValueError("source weights leave no sample to draw")
+    return cdf / cdf[-1]
 
 
 def value_loss(pred: torch.Tensor, b: dict, kind: str = "huber", delta: float = 1.0):
@@ -497,6 +527,10 @@ def train_value_net(
     else:
         val_ds = ds
         tr, va = split_holdout(ds, cfg.holdout, cfg.holdout_by, cfg.seed)
+    if dev.type == "cuda":
+        # building the board features of ~1M boards leaves GBs of cached temporaries;
+        # without releasing them the residual head's activations spill out of VRAM
+        torch.cuda.empty_cache()
     log(
         f"# value net: {len(tr):,} train / {len(va):,} held-out samples on {ddev} "
         f"({len(ds.cache):,} boards, {ds.dropped} dropped by max_exploit), "
@@ -511,6 +545,15 @@ def train_value_net(
     amp = dev.type == "cuda"
     g = torch.Generator(device=ddev).manual_seed(cfg.seed + 1)
     tr_dev = tr.to(ddev)
+    tr_src = ds.source[tr].to(ddev)
+    cdf = sampling_cdf(tr_src, parse_source_weights(cfg.source_weights))
+    if cdf is not None:
+        p = cdf.diff(prepend=cdf.new_zeros(1))
+        share = {
+            SOURCE_NAMES.get(s, str(s)): float(p[tr_src == s].sum())
+            for s in torch.unique(tr_src).tolist()
+        }
+        log(f"# sampling shares by source: {', '.join(f'{k} {v:.3f}' for k, v in share.items())}")
     every = cfg.eval_every or max(1, cfg.steps // 10)
     va_log = va[: cfg.eval_samples]
     history: list[dict[str, float]] = []
@@ -523,7 +566,12 @@ def train_value_net(
             lr *= (step + 1) / cfg.warmup
         for pg in opt.param_groups:
             pg["lr"] = lr
-        idx = tr_dev[torch.randint(0, len(tr_dev), (cfg.batch,), generator=g, device=ddev)]
+        if cdf is None:
+            pick = torch.randint(0, len(tr_dev), (cfg.batch,), generator=g, device=ddev)
+        else:
+            u = torch.rand(cfg.batch, generator=g, device=ddev, dtype=torch.float64)
+            pick = torch.searchsorted(cdf, u).clamp_(max=len(tr_dev) - 1)
+        idx = tr_dev[pick]
         b = ds.batch(idx, net_cfg.buckets, dev)
         loss = value_loss(_forward(net, b, amp), b, cfg.loss, cfg.huber_delta)
         opt.zero_grad(set_to_none=True)

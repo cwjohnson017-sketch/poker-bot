@@ -84,6 +84,30 @@ def test_exploit_spots_match_search_noise():
         se.exploit_spots(engine, cfg, 1, 5, ["river"])
 
 
+def test_turn_spots():
+    engine, cfg = _config()
+    spots = se.turn_spots(engine, cfg, 2, 5)
+    assert len(spots) == 2 * 3 * 3
+    assert spots[0].label == "board0 xx BB first" and spots[4].label == "board0 xbc BTN vs check"
+    assert all(int(s.state.street) == 2 and len(s.state.board) == 4 for s in spots)
+    flops = {s.board_index: list(s.state.board)[:3] for s in spots}
+    assert flops == {
+        s.board_index: list(s.state.board) for s in se.exploit_spots(engine, cfg, 2, 5)
+    }
+    # pots after the flop lines (xx, xbc, bc), and who acts on the turn
+    assert [int(s.state.pot) for s in spots[:9:3]] == [500, 1000, 1250]
+    assert int(spots[0].state.current_player) == 1  # BB first
+    assert int(spots[1].state.current_player) == 0  # BTN vs check
+    lead = list(spots[5].state.history)[-1]  # xbc BTN vs lead: BB bets half of 1000
+    assert (int(lead[0]), int(lead[1]), int(lead[2].amount)) == (2, 1, 500)
+    flop_bet = [h for h in spots[6].state.history if int(h[0]) == 1][0]  # bc: BB bets 375
+    assert (int(flop_bet[1]), int(flop_bet[2].amount)) == (1, 375)
+    one = se.turn_spots(engine, cfg, 1, 5, ["bc"], ["btn_vs_check"])
+    assert [s.label for s in one] == ["board0 bc BTN vs check"]
+    with pytest.raises(ValueError, match="lines"):
+        se.turn_spots(engine, cfg, 1, 5, ["xr"])
+
+
 def test_search_overrides_share_the_trunk():
     ro = se.search_overrides(TINY)
     vn = se.search_overrides(TINY, "value_net", "net.pt", 2, None, 4)

@@ -29,6 +29,8 @@ from pokerbot.search.value_train import (
     ValueTrainConfig,
     checkdown_samples,
     load_shards,
+    parse_source_weights,
+    sampling_cdf,
     save_shard,
     train_value_net,
 )
@@ -244,6 +246,32 @@ def test_learns_checkdown_values():
     assert o["oracle"]["mae"] < o["mae"]
     assert abs(rep["gv_target_sum_mean"]) < 1e-3  # check-down targets are zero-sum
     assert set(rep["by_pot"]) and set(rep["by_source"]) == {"blueprint", "perturbed", "random"}
+
+
+def test_source_weighted_sampling():
+    assert parse_source_weights("") == {}
+    assert parse_source_weights("3:4") == {3: 4.0}
+    assert parse_source_weights(" 2:0.5, 3:4 ") == {2: 0.5, 3: 4.0}
+    for bad in ("3", "x:1", "3:-1"):
+        with pytest.raises(ValueError):
+            parse_source_weights(bad)
+    source = torch.tensor([0, 3, 1, 3, 2, 0])
+    assert sampling_cdf(source, {}) is None
+    cdf = sampling_cdf(source, {3: 4.0, 2: 0.0})
+    p = cdf.diff(prepend=cdf.new_zeros(1))
+    assert torch.allclose(p, torch.tensor([1, 4, 1, 4, 0, 1], dtype=torch.float64) / 11)
+    g = torch.Generator().manual_seed(0)
+    pick = torch.searchsorted(cdf, torch.rand(20000, generator=g, dtype=torch.float64))
+    share = (source[pick] == 3).double().mean()
+    assert abs(float(share) - 8 / 11) < 0.02 and not bool((source[pick] == 2).any())
+    with pytest.raises(ValueError, match="no sample"):
+        sampling_cdf(source, {s: 0.0 for s in range(4)})
+    # training with weights runs and reports as usual
+    data = checkdown_samples(200, seed=14)
+    cfg = ValueTrainConfig(steps=20, batch=32, warmup=5, holdout=0.15, seed=1, source_weights="2:3")
+    net_cfg = ValueNetConfig(buckets=32, width=64, layers=2)
+    _, rep = train_value_net(None, None, net_cfg, cfg, device="cpu", log=None, raw=data)
+    assert rep["train"]["source_weights"] == "2:3" and rep["overall"]["samples"] > 10
 
 
 def test_shards_and_cli(tmp_path):
