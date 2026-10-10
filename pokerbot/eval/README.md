@@ -28,6 +28,17 @@ Everything that says whether a bot got better lives here (DESIGN.md 5.7).
   CI half-width shrinks as `1/sqrt(hands)`: going from 20k to 200k hands cuts it
   by about 3.2x. Read the half-width off a short run first, then size the
   real one.
+* **Luck adjustment** (`luck.py`; `run_match` / `run_duplicate_match` with
+  `luck_adjust=True`; `play_match.py --adjust`; `match.luck_adjust` in a
+  config): heads-up results are also reported with card luck removed. A hand
+  that ends in a called all-in before the river scores its equity, and each
+  new street subtracts `2c * (E_new - E_old)`, the change in seat 0's
+  check-down value (`c` chips in per player, `E` the equity against the other
+  hand given the board so far). Both terms have zero mean, so the adjusted
+  win rate estimates the same quantity with a narrower interval. These are
+  the chance terms of AIVAT; its action terms are not implemented. Equities
+  are shared by the two seatings of a duplicate deal, so mirror matches
+  still cancel exactly.
 
 ## Agent specs
 
@@ -188,6 +199,22 @@ opponent's `spec` when it has one, so the learner plays in the blueprint's
 action abstraction. Otherwise the agent runs through `ScalarVecPolicy`, which
 rebuilds each slot as a scalar `GameState` and calls `policy()` one slot at
 a time. That path is for tests and small checks, not for the 4070 Ti config.
+
+**Richer learner actions** (`configs/abr_4070ti_rich.yaml`). By default the
+learner is confined to the opponent's action abstraction, so it can't use bet
+sizes the blueprint never considers, as a real opponent would. With
+`abr.learner_actions` (a spec mapping: `streets`, `max_raises`, `dedupe`), the
+learner picks among its own action set, and every choice is played as real
+chips (`VecNLHE.step_concrete`). The opponent records each off-tree size the
+way it would in real play: translated into its own abstraction by the
+randomized pseudo-harmonic mapping (`abr.offtree: harmonic`,
+`env.actions.harmonic_abstract`, which mirrors `abstraction.actions.map_offtree`),
+or by the nearest size (`nearest`). The learner keeps its own history of the
+real actions and its own legal mask (`LearnerView`). This needs a vectorized
+opponent: `ScalarVecPolicy` rebuilds slots from their abstract history, which
+off-tree raises make inexact, so it is rejected. A run on a richer set can find
+more than one confined to the blueprint's abstraction, so compare results only
+under the same config.
 
 How to read it: `final` is what the exploiter wins, which is a lower bound on
 exploitability, like LBR's but able to find multi-street lines. The

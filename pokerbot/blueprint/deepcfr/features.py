@@ -7,7 +7,9 @@ The canonical feature dict (every tensor has a leading batch dim ``n``):
 * ``hist [n, T]`` long: env history tokens (0 = padding, left-aligned).
 * ``hist_amt [n, T]`` float: chips each action put in / starting stack.
 * ``scalars [n, S]`` float: ``obs["scalars"]`` (14 values) followed, when
-  enabled, by ``equity`` (1) and ``equity_hist`` (``hist_bins``).
+  enabled, by ``equity`` (1) and ``equity_hist`` (``hist_bins``), then by the
+  11 table-lookup strength columns of :mod:`.strength`
+  (``strength_tables``).
 * ``legal [n, A]`` bool.
 
 ``hist_mask`` is always ``hist != 0`` and is recomputed by the network, so
@@ -23,6 +25,7 @@ import torch
 
 from ...env.obs import NUM_SCALARS
 from ...env.vec_env import HISTORY_LEN
+from .strength import NUM_STRENGTH
 
 FEATURE_KEYS = ("cards", "card_mask", "hist", "hist_amt", "scalars", "legal")
 
@@ -34,7 +37,9 @@ class FeatureConfig:
     ``equity_samples > 0`` appends the Monte Carlo equity vs a random hand;
     ``hist_runouts > 0`` appends a ``hist_bins``-bin river-equity histogram
     over that many sampled runouts (``hist_opp_samples`` opponents per
-    runout, 0 = exact against all 990).
+    runout, 0 = exact against all 990). ``strength_tables`` (a bucket-build
+    directory) appends 11 hand-strength columns looked up per canonical hand
+    class (:mod:`.strength`).
     """
 
     equity_samples: int = 0
@@ -42,6 +47,7 @@ class FeatureConfig:
     hist_bins: int = 10
     hist_opp_samples: int = 0
     history_len: int = HISTORY_LEN
+    strength_tables: str | None = None
 
     @property
     def num_scalars(self) -> int:
@@ -50,6 +56,8 @@ class FeatureConfig:
             n += 1
         if self.hist_runouts > 0:
             n += self.hist_bins
+        if self.strength_tables:
+            n += NUM_STRENGTH
         return n
 
     def obs_kwargs(self) -> dict[str, int]:

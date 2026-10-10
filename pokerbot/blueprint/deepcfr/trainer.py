@@ -14,11 +14,22 @@ network from the same iteration, as in the Deep CFR paper):
 3. Save ``checkpoints/p{p}/iter{t}.pt``. The list of all checkpoints is the
    SD-CFR average strategy (:class:`~.policy.SDCFRPolicy`).
 
+With ``training.tabular_preflop`` the regret samples of preflop nodes are
+also summed into a table per seat (:mod:`.preflop`, linear weights ``t``);
+both seats play preflop from its regret-matching strategy, and each
+iteration's strategy table is saved in that iteration's checkpoint.
+
+With ``memory.holdout > 0`` that fraction of the regret samples goes to a
+separate validation reservoir instead; after each fit the net's
+iteration-weighted R^2 on it is logged per street (``val_r2_*``: 1 - weighted
+MSE / weighted mean square target, so predicting zero scores 0).
+
 Every ``save_every`` iterations the memories and RNG states are saved as a
 resume point; every ``eval.every`` iterations the current average strategy
 plays duplicate matches against ``EquityThresholdAgent`` and against the
-average strategy of the previous evaluation. Logs: ``log.csv`` and
-TensorBoard (``tb/``) under the run directory.
+average strategy of the previous evaluation, on the same deals every time
+(``eval.seed``), with luck-adjusted results next to the raw ones. Logs:
+``log.csv`` and TensorBoard (``tb/``) under the run directory.
 """
 
 from __future__ import annotations
@@ -35,10 +46,12 @@ import numpy as np
 import torch
 
 from ...config import git_hash
+from ...env.obs import SCALAR_NAMES
 from .checkpoint import list_checkpoints, load_net, save_net, write_meta
 from .config import DeepCFRConfig, spec_to_dict
-from .memory import ReservoirMemory
+from .memory import ReservoirMemory, decode
 from .networks import AdvantageNet, num_params
+from .preflop import PreflopRegrets, PreflopTree, TablePolicy
 from .traversal import FrontierTraverser, NetPolicy
 
 CSV_FIELDS = (
@@ -54,7 +67,14 @@ CSV_FIELDS = (
     "roots",
     "max_frontier",
     "cut_slots",
+    "allin_leaves",
+    "preflop_samples",
     "regret_abs_mean",
+    "val_r2_preflop",
+    "val_r2_flop",
+    "val_r2_turn",
+    "val_r2_river",
+    "val_r2_all",
     "traversal_s",
     "train_s",
     "slot_steps_per_s",
@@ -67,9 +87,14 @@ EVAL_FIELDS = (
     "mbb_per_hand",
     "ci_low",
     "ci_high",
+    "mbb_adj",
+    "ci_adj_low",
+    "ci_adj_high",
     "hands",
     "eval_s",
 )
+STREETS = ("preflop", "flop", "turn", "river")
+_STREET_COL = SCALAR_NAMES.index("preflop")  # street one-hot in the scalars
 
 
 class _Prefetcher:
@@ -94,6 +119,62 @@ class _Prefetcher:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+_WIDEN = (torch.uint16, torch.uint32, torch.uint64)
+
+
+class _ChunkSampler:
+    """Minibatches sliced on the device from large chunks of the memory.
+
+    A host thread draws ``rows`` rows uniformly (with replacement), gathers them
+    in the compact storage dtypes and moves them to ``device``; the training
+    loop then takes minibatches in a random order from the device chunk, so the
+    host does one gather per ``rows / batch`` steps instead of one per step.
+    Every minibatch is still a uniform sample of the memory."""
+
+    def __init__(
+        self, mem: ReservoirMemory, batch: int, device: torch.device, rows: int, steps: int
+    ) -> None:
+        self.batch, self.device = int(batch), device
+        self.rows = max(int(rows), self.batch)
+        self.per_chunk = self.rows // self.batch
+        n_chunks = -(-int(steps) // self.per_chunk)
+        seed = int(mem.rng.integers(2**62))
+        self.gen = torch.Generator(device=device).manual_seed(seed)
+        self.q: queue.Queue = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(
+            target=self._run, args=(mem, np.random.default_rng(seed), n_chunks), daemon=True
+        )
+        self.thread.start()
+        self.cur: dict[str, torch.Tensor] | None = None
+        self.perm: torch.Tensor | None = None
+        self.pos = self.per_chunk
+
+    def _run(self, mem: ReservoirMemory, rng: np.random.Generator, n: int) -> None:
+        try:
+            for _ in range(n):
+                idx = np.sort(rng.integers(0, len(mem), size=self.rows))
+                host = mem.gather_compact(idx)
+                # CUDA cannot index unsigned 16/32/64-bit tensors (the iteration
+                # column is stored as uint16): widen them on the host
+                host = {k: v.long() if v.dtype in _WIDEN else v for k, v in host.items()}
+                self.q.put({k: v.to(self.device) for k, v in host.items()})
+        except Exception as e:  # surfaced in the training thread
+            self.q.put(e)
+
+    def get(self) -> dict[str, torch.Tensor]:
+        if self.pos >= self.per_chunk:
+            item = self.q.get()
+            if isinstance(item, Exception):
+                raise item
+            self.cur = item
+            self.perm = torch.randperm(self.rows, device=self.device, generator=self.gen)
+            self.pos = 0
+        assert self.cur is not None and self.perm is not None
+        idx = self.perm[self.pos * self.batch : (self.pos + 1) * self.batch]
+        self.pos += 1
+        return decode({k: v[idx] for k, v in self.cur.items()})
 
 
 class DeepCFRTrainer:
@@ -127,6 +208,13 @@ class DeepCFRTrainer:
             ReservoirMemory(cfg.memory.capacity, A, S, T, V, cfg.seed * 10 + p, f"adv_p{p}")
             for p in (0, 1)
         ]
+        self.val_mem: list[ReservoirMemory] | None = None
+        if cfg.memory.holdout > 0:
+            cap = cfg.memory.holdout_capacity
+            self.val_mem = [
+                ReservoirMemory(cap, A, S, T, V, cfg.seed * 10 + 7 + p, f"val_p{p}") for p in (0, 1)
+            ]
+        self._holdout_rng = np.random.default_rng(cfg.seed * 10 + 9)
         self.strat_mem: list[ReservoirMemory] | None = None
         if cfg.traversal.record_strategy:
             cap = cfg.memory.strategy_capacity or cfg.memory.capacity
@@ -134,7 +222,13 @@ class DeepCFRTrainer:
                 ReservoirMemory(cap, A, S, T, V, cfg.seed * 10 + 5 + p, f"strat_p{p}")
                 for p in (0, 1)
             ]
+        self.preflop: list[PreflopRegrets] | None = None
+        preflop_tree = None
+        if cfg.training.tabular_preflop:
+            preflop_tree = PreflopTree.build(self.game_config, self.spec, self.device)
+            self.preflop = [PreflopRegrets(preflop_tree, self.device) for _ in (0, 1)]
         self.nets: list[AdvantageNet | None] = [None, None]
+        self._anchor: Any = None  # eval.anchor agent, built at the first evaluation
         self.checkpoints: list[list[tuple[int, Path]]] = [[], []]
         self.iteration = 0
         self.last_eval_iter = 0
@@ -152,6 +246,8 @@ class DeepCFRTrainer:
             "fallback": cfg.training.fallback,
             "git": git_hash(),
         }
+        if preflop_tree is not None:
+            self.meta["preflop"] = preflop_tree.to_meta()
         write_meta(self.ckpt_root, self.meta)
         (self.out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2, default=str))
         if resume:
@@ -171,10 +267,13 @@ class DeepCFRTrainer:
         )
 
     # ---------------------------------------------------------------- policies
-    def policy(self, p: int) -> NetPolicy:
-        return NetPolicy(
+    def policy(self, p: int) -> NetPolicy | TablePolicy:
+        net = NetPolicy(
             self.nets[p], self.cfg.training.fallback, self.amp_dtype, self.cfg.traversal.infer_chunk
         )
+        if self.preflop is None:
+            return net
+        return TablePolicy(net, self.preflop[p].tree, self.preflop[p].strategy())
 
     # ---------------------------------------------------------------- phases
     def collect(self, p: int, t: int) -> dict[str, float]:
@@ -187,23 +286,77 @@ class DeepCFRTrainer:
             "roots": 0,
             "max_frontier": 0,
             "cut_slots": 0,
+            "allin_leaves": 0,
+            "preflop_samples": 0,
         }
         reg_sum = 0.0
         remaining = tr.traversals_per_iter
+        # this iteration's preflop regrets join the table after the traversals,
+        # so every batch plays the same strategy (like the nets)
+        pending = self.preflop[p].pending() if self.preflop is not None else None
         while remaining > 0:
             k = min(tr.roots_per_batch, remaining)
             res = self.traverser.traverse(p, policies, t, k)
-            self.adv_mem[p].add_batch(res.samples)
+            if pending is not None:
+                n_pre = self.preflop[p].add_samples(pending, res.samples, float(t))
+                agg["preflop_samples"] += n_pre
+            self._store(p, res.samples)
             if self.strat_mem is not None and res.strategy is not None:
                 self.strat_mem[1 - p].add_batch(res.strategy)
             s = res.stats
-            for key in ("nodes", "slot_steps", "roots", "cut_slots"):
+            for key in ("nodes", "slot_steps", "roots", "cut_slots", "allin_leaves"):
                 agg[key] += s[key]
             agg["max_frontier"] = max(agg["max_frontier"], s["max_frontier"])
             reg_sum += s["regret_abs_mean"] * s["nodes"]
             remaining -= k
         agg["regret_abs_mean"] = reg_sum / max(1, agg["nodes"])
+        if pending is not None:
+            self.preflop[p].regret += pending
         return agg
+
+    def _store(self, p: int, samples: dict[str, torch.Tensor]) -> None:
+        """Regret samples into ``p``'s memory, minus the held-out fraction."""
+        if self.val_mem is None:
+            self.adv_mem[p].add_batch(samples)
+            return
+        n = int(samples["target"].shape[0])
+        hold = self._holdout_rng.random(n) < self.cfg.memory.holdout
+        mask = torch.from_numpy(hold).to(samples["target"].device)
+        self.val_mem[p].add_batch({k: v[mask] for k, v in samples.items()})
+        self.adv_mem[p].add_batch({k: v[~mask] for k, v in samples.items()})
+
+    @torch.no_grad()
+    def validate(self, p: int, net: AdvantageNet, chunk: int = 65536) -> dict[str, float]:
+        """Iteration-weighted R^2 of ``net`` on ``p``'s held-out samples, per
+        street and overall (NaN without a validation memory)."""
+        out = {f"val_r2_{k}": float("nan") for k in (*STREETS, "all")}
+        mem = self.val_mem[p] if self.val_mem is not None else None
+        if mem is None or len(mem) == 0:
+            return out
+        res = torch.zeros(4, dtype=torch.float64, device=self.device)
+        tot = torch.zeros(4, dtype=torch.float64, device=self.device)
+        for lo in range(0, len(mem), chunk):
+            b = mem.gather(np.arange(lo, min(len(mem), lo + chunk)), self.device)
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=self.amp_dtype or torch.float32,
+                enabled=self.amp_dtype is not None,
+            ):
+                adv = net(b)
+            legal = b["legal"].float()
+            w = b["iteration"].double()
+            err = (((adv.float() - b["target"]) ** 2) * legal).sum(1).double() * w
+            sq = ((b["target"] ** 2) * legal).sum(1).double() * w
+            street = b["scalars"][:, _STREET_COL : _STREET_COL + 4].argmax(1)
+            res.index_add_(0, street, err)
+            tot.index_add_(0, street, sq)
+        r, q = res.cpu().numpy(), tot.cpu().numpy()
+        for i, k in enumerate(STREETS):
+            if q[i] > 0:
+                out[f"val_r2_{k}"] = float(1 - r[i] / q[i])
+        if q.sum() > 0:
+            out["val_r2_all"] = float(1 - r.sum() / q.sum())
+        return out
 
     def train_net(self, p: int) -> tuple[AdvantageNet, float, float]:
         """Fit ``p``'s advantage net on its memory. Returns (net, final loss, first loss)."""
@@ -215,13 +368,19 @@ class DeepCFRTrainer:
             net = AdvantageNet(self.net_cfg).to(self.device)
             net.load_state_dict(self.nets[p].state_dict())
         net.train()
-        opt = torch.optim.Adam(net.parameters(), lr=tc.lr, weight_decay=tc.weight_decay)
-        steps = tc.sgd_steps
-        pre = (
-            _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
-            if tc.prefetch > 0
-            else None
+        params = list(net.parameters())
+        opt = torch.optim.Adam(
+            params, lr=tc.lr, weight_decay=tc.weight_decay, fused=self.device.type == "cuda"
         )
+        # exponential moving average of the weights (the returned net), with the
+        # usual warm-up so the random initialization does not linger in it
+        ema = [q.detach().clone() for q in params] if tc.ema_decay > 0 else None
+        steps = tc.sgd_steps
+        pre: _Prefetcher | _ChunkSampler | None = None
+        if tc.chunk_rows > 0:
+            pre = _ChunkSampler(mem, tc.batch_size, self.device, tc.chunk_rows, steps)
+        elif tc.prefetch > 0:
+            pre = _Prefetcher(mem, tc.batch_size, self.device, tc.prefetch, steps)
         tail = max(1, steps // 10)
         losses: list[torch.Tensor] = []
         first = float("nan")
@@ -240,13 +399,20 @@ class DeepCFRTrainer:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if tc.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), tc.grad_clip)
+                torch.nn.utils.clip_grad_norm_(params, tc.grad_clip)
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    decay = min(tc.ema_decay, (1 + step) / (10 + step))
+                    torch._foreach_lerp_(ema, params, 1.0 - decay)
             if step == 0:
                 first = float(loss.detach())
             if step >= steps - tail:
                 losses.append(loss.detach())
         final = float(torch.stack(losses).mean()) if losses else float("nan")
+        if ema is not None:
+            with torch.no_grad():
+                torch._foreach_copy_(params, ema)
         return net.eval(), final, first
 
     def run(self, iterations: int | None = None) -> None:
@@ -263,9 +429,11 @@ class DeepCFRTrainer:
             t1 = time.time()
             net, loss, first = self.train_net(p)
             t2 = time.time()
+            val = self.validate(p, net)
             self.nets[p] = net
+            table = self.preflop[p].strategy() if self.preflop is not None else None
             path = save_net(
-                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype
+                self.ckpt_root, p, t, net, self.meta, self.cfg.training.checkpoint_dtype, table
             )
             self.checkpoints[p].append((t, path))
             row = {
@@ -277,6 +445,7 @@ class DeepCFRTrainer:
                 "adv_mem_seen": self.adv_mem[p].seen,
                 "strat_mem_size": len(self.strat_mem[1 - p]) if self.strat_mem else 0,
                 **st,
+                **val,
                 "traversal_s": t1 - t0,
                 "train_s": t2 - t1,
                 "slot_steps_per_s": st["slot_steps"] / max(1e-9, t1 - t0),
@@ -306,21 +475,52 @@ class DeepCFRTrainer:
         gcfg = game_config(self.meta["game"], engine)
         dev = str(ec.device or self.device)
         cur = NeuralBlueprintAgent.from_dir(
-            self.ckpt_root, ec.last_n, t, device=dev, name=f"sdcfr_{t}"
+            self.ckpt_root,
+            ec.last_n,
+            t,
+            device=dev,
+            name=f"sdcfr_{t}",
+            sample_net=ec.sample_net,
+            stride=ec.stride,
         )
         opponents = []
         if ec.vs_equity:
             opponents.append(("equity", EquityThresholdAgent(**ec.equity)))
+        if ec.anchor:
+            if self._anchor is None:
+                from ...agents.registry import make_agent
+
+                self._anchor = make_agent(ec.anchor)
+                self._anchor.name = "anchor"
+            opponents.append(("anchor", self._anchor))
         prev_t = self.last_eval_iter if self.last_eval_iter else t - 1
         if ec.vs_previous and prev_t >= 1:
             prev = NeuralBlueprintAgent.from_dir(
-                self.ckpt_root, ec.last_n, prev_t, device=dev, name=f"sdcfr_{prev_t}"
+                self.ckpt_root,
+                ec.last_n,
+                prev_t,
+                device=dev,
+                name=f"sdcfr_{prev_t}",
+                sample_net=ec.sample_net,
+                stride=ec.stride,
             )
             opponents.append(("previous", prev))
         rows = []
+        seed = t if ec.seed is None else int(ec.seed)  # fixed seed: the same deals every time
+        nan = float("nan")
         for label, opp in opponents:
             t0 = time.time()
-            res = run_duplicate_match(cur, opp, gcfg, ec.deals, seed=t, engine=engine)
+            res = run_duplicate_match(
+                cur,
+                opp,
+                gcfg,
+                ec.deals,
+                seed=seed,
+                engine=engine,
+                luck_adjust=ec.luck_adjust,
+                adjust_device=dev,
+            )
+            adj = res.adjusted_stats
             row = {
                 "iteration": t,
                 "opponent": label,
@@ -328,6 +528,9 @@ class DeepCFRTrainer:
                 "mbb_per_hand": res.mbb_per_hand,
                 "ci_low": res.ci[0],
                 "ci_high": res.ci[1],
+                "mbb_adj": adj.mbb_per_hand if adj else nan,
+                "ci_adj_low": adj.ci_low if adj else nan,
+                "ci_adj_high": adj.ci_high if adj else nan,
                 "hands": res.hands,
                 "eval_s": time.time() - t0,
             }
@@ -343,10 +546,15 @@ class DeepCFRTrainer:
             self.adv_mem[p].save(mem_dir / f"adv_p{p}")
             if self.strat_mem is not None:
                 self.strat_mem[p].save(mem_dir / f"strat_p{p}")
+        if self.val_mem is not None:
+            for p in (0, 1):
+                self.val_mem[p].save(mem_dir / f"val_p{p}")
         roots = self.traverser._roots
         state = {
             "iteration": self.iteration,
             "last_eval_iter": self.last_eval_iter,
+            "holdout_rng": self._holdout_rng.bit_generator.state,
+            "preflop": [r.state_dict() for r in self.preflop] if self.preflop else None,
             "traverser_gen": self.traverser.generator.get_state(),
             "roots_gen": roots.generator.get_state() if roots is not None else None,
             "roots_n": roots.n if roots is not None else 0,
@@ -371,6 +579,10 @@ class DeepCFRTrainer:
                 self.strat_mem[p] = ReservoirMemory.load(
                     mem_dir / f"strat_p{p}", capacity=self.strat_mem[p].capacity
                 )
+            if self.val_mem is not None and (mem_dir / f"val_p{p}").exists():
+                self.val_mem[p] = ReservoirMemory.load(
+                    mem_dir / f"val_p{p}", capacity=self.val_mem[p].capacity
+                )
             cks = list_checkpoints(self.ckpt_root, p)
             # nets saved after the resume point are discarded (their data is gone)
             for it, f in cks:
@@ -382,6 +594,13 @@ class DeepCFRTrainer:
                 self.nets[p] = net
         self.iteration = t
         self.last_eval_iter = int(state.get("last_eval_iter", 0))
+        if state.get("holdout_rng") is not None:
+            self._holdout_rng.bit_generator.state = state["holdout_rng"]
+        if self.preflop is not None:
+            if not state.get("preflop"):
+                raise ValueError("resume point has no preflop regrets (tabular_preflop was off)")
+            for r, d in zip(self.preflop, state["preflop"], strict=True):
+                r.load_state_dict(d)
         self.traverser.generator.set_state(state["traverser_gen"])
         if state.get("roots_gen") is not None and state["roots_n"]:
             self.traverser.new_roots(int(state["roots_n"]))
@@ -399,25 +618,41 @@ class DeepCFRTrainer:
         if self._tb is not None:
             t, p = row["iteration"], row["player"]
             for k in CSV_FIELDS[2:]:
+                if k.startswith("val_r2_") and not np.isfinite(row[k]):
+                    continue
                 self._tb.add_scalar(f"p{p}/{k}", float(row[k]), t)
             self._tb.flush()
+        r2 = ""
+        if np.isfinite(row["val_r2_all"]):
+            r2 = " val R2 " + " ".join(f"{row[f'val_r2_{k}']:.3f}" for k in (*STREETS, "all"))
         self._log(
             f"iter {row['iteration']} p{row['player']}: loss {row['loss']:.4f} "
             f"(first {row['loss_first']:.4f}) mem {row['adv_mem_size']} nodes {row['nodes']} "
             f"trav {row['traversal_s']:.1f}s ({row['slot_steps_per_s']:.0f} slot-steps/s) "
-            f"train {row['train_s']:.1f}s"
+            f"train {row['train_s']:.1f}s{r2}"
         )
 
     def _write_eval(self, row: dict[str, Any]) -> None:
         if self.cfg.logging.csv:
             _append_csv(self.out / "eval.csv", EVAL_FIELDS, row)
+        adjusted = np.isfinite(row["mbb_adj"])
         if self._tb is not None:
             tag = f"eval/mbb_vs_{row['opponent']}"
             self._tb.add_scalar(tag, row["mbb_per_hand"], row["iteration"])
+            if adjusted:
+                self._tb.add_scalar(
+                    f"eval/mbb_adj_vs_{row['opponent']}", row["mbb_adj"], row["iteration"]
+                )
             self._tb.flush()
+        adj = (
+            f"; luck-adjusted {row['mbb_adj']:+.1f} [{row['ci_adj_low']:+.1f}, "
+            f"{row['ci_adj_high']:+.1f}]"
+            if adjusted
+            else ""
+        )
         self._log(
             f"eval iter {row['iteration']} vs {row['opponent']}: {row['mbb_per_hand']:+.1f} mbb/h "
-            f"[{row['ci_low']:+.1f}, {row['ci_high']:+.1f}] over {row['hands']} hands"
+            f"[{row['ci_low']:+.1f}, {row['ci_high']:+.1f}]{adj} over {row['hands']} hands"
         )
 
     def close(self) -> None:
@@ -427,6 +662,12 @@ class DeepCFRTrainer:
 
 def _append_csv(path: Path, fields: tuple[str, ...], row: dict[str, Any]) -> None:
     new = not path.exists()
+    if not new:
+        # keep the columns of an existing file (a run resumed with newer code)
+        with open(path, newline="") as fh:
+            header = next(csv.reader(fh), None)
+        if header:
+            fields = tuple(header)
     with open(path, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         if new:

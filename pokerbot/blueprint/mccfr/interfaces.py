@@ -81,8 +81,13 @@ def normalize_action(a: Any) -> tuple:
     if kind is None:
         raise ValueError(f"unknown abstract action {a!r}")
     if kind == "raise":
-        if len(args) != 1 or float(args[0]) <= 0:
+        if len(args) not in (1, 2) or float(args[0]) <= 0:
             raise ValueError(f"raise needs one positive pot fraction: {a!r}")
+        if len(args) == 2:  # only as the street's first raise, or only as a re-raise
+            w = str(args[1]).strip().lower()
+            if w not in ("open", "reraise"):
+                raise ValueError(f"raise condition must be 'open' or 'reraise': {a!r}")
+            return ("raise", float(args[0]), w)
         return ("raise", float(args[0]))
     if args:
         raise ValueError(f"{kind} takes no argument: {a!r}")

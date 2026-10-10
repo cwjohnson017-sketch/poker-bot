@@ -84,6 +84,41 @@ def test_sdcfr_average_is_reach_weighted():
     assert len(last) == 1
 
 
+def test_sdcfr_sampled_net_mixture_is_the_average():
+    pol = SDCFRPolicy([(1, FixedNet([1.0, -1.0])), (3, FixedNet([1.0, 1.0]))])
+    rng = np.random.default_rng(0)
+    draws = np.array([pol.sample_index(rng) for _ in range(4000)])
+    assert abs(draws.mean() - 0.75) < 0.03  # net of iteration 3 has weight 3 / 4
+    feats = {"legal": torch.ones(1, 2, dtype=torch.bool)}
+    assert torch.allclose(pol.net_probs(feats, 0)[0], torch.tensor([1.0, 0.0]))
+    assert torch.allclose(pol.net_probs(feats, 1)[0], torch.tensor([0.5, 0.5]))
+    # at the root, drawing a net per hand plays exactly the average policy
+    w = torch.softmax(pol.log_w, 0).float()
+    mix = w[0] * pol.net_probs(feats, 0)[0] + w[1] * pol.net_probs(feats, 1)[0]
+    assert torch.allclose(mix, pol.act_probs(feats)[0])
+
+
+def test_neural_agent_sample_net_keeps_one_net_per_hand(tmp_path):
+    run = make_run(tmp_path)
+    engine = get_engine()
+    config = game_config({}, engine)
+    agent = make_agent(f"neural:{run},sample_net=true")
+    assert isinstance(agent, NeuralBlueprintAgent) and agent.sample_net
+    drawn = []
+    orig = agent.policies[0].sample_index
+
+    def spy(rng):
+        drawn.append(orig(rng))
+        return drawn[-1]
+
+    agent.policies[0].sample_index = spy
+    res = run_match([agent, RandomAgent()], config, 60, seed=4, engine=engine)
+    assert res.hands == 60  # on_illegal="raise": all actions legal
+    # seat 0 draws at most once per hand, whatever the number of decisions
+    assert 0 < len(drawn) <= 60 and set(drawn) <= {0, 1, 2}
+    assert abs(agent.last_probs.sum() - 1) < 1e-9
+
+
 def test_agent_greedy_is_deterministic(tmp_path):
     run = make_run(tmp_path, iters=1)
     engine = get_engine()
@@ -97,3 +132,44 @@ def test_agent_greedy_is_deterministic(tmp_path):
 def test_unknown_agent_still_errors():
     with pytest.raises(ValueError):
         make_agent("nope")
+
+
+def test_stacked_nets_match_one_by_one():
+    """StackedAdvantageNets (all nets in batched matmuls, shared-board and
+    shared-history shortcuts) equals evaluating the nets one by one."""
+    from pokerbot.blueprint.deepcfr.features import features_from_obs
+    from pokerbot.blueprint.deepcfr.networks import AdvantageNet, NetConfig, StackedAdvantageNets
+    from pokerbot.env import GameConfig, VecNLHE
+
+    torch.manual_seed(0)
+    cfg = NetConfig(
+        card_dim=8,
+        card_hidden=24,
+        hist_type="mlp",
+        hist_dim=8,
+        hist_hidden=16,
+        width=32,
+        card_embedding=True,
+    )
+    nets = [AdvantageNet(cfg).eval() for _ in range(3)]
+    stacked = StackedAdvantageNets(nets)
+    env = VecNLHE(64, GameConfig(), "cpu", seed=4)
+    g = torch.Generator().manual_seed(5)
+    for _ in range(12):
+        f = features_from_obs(env.obs())
+        for feats in (f, {k: v[:1].expand(40, *v.shape[1:]).clone() for k, v in f.items()}):
+            if feats is not f:  # one public state, different hole cards: the range-query shortcuts
+                feats["cards"][:, :2] = torch.randperm(52, generator=g)[:2]
+                board = set(feats["cards"][0, 2:].tolist())
+                holes = [
+                    h
+                    for h in torch.combinations(torch.arange(52), 2).tolist()
+                    if not board & set(h)
+                ][:40]
+                feats["cards"][:, :2] = torch.tensor(holes)
+            with torch.no_grad():
+                want = torch.stack([n(feats) for n in nets])
+            torch.testing.assert_close(stacked(feats), want, rtol=1e-4, atol=1e-5)
+        a = torch.multinomial(env.legal_mask().float(), 1, generator=g).squeeze(1)
+        env.step(torch.where(a == 0, 1, a))
+        env.reset(env.done)

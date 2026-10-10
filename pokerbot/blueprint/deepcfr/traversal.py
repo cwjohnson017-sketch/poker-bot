@@ -37,8 +37,23 @@ players sample from their current policies until the hand ends, and the
 payoff is used as the leaf value of its owner edge. That leaf is an unbiased
 sample of the edge's counterfactual value under the current strategies, so
 regrets stay unbiased (with more variance); rolled-out slots record no
-samples. Memory: live slots <= ``max_frontier_nodes``; recorded nodes <=
+samples. After ``max_steps`` frontier steps every remaining slot is cut.
+Memory: live slots <= ``max_frontier_nodes``; recorded nodes <=
 ``max_steps * max_frontier_nodes`` (in practice far fewer).
+
+**Variance reduction** (both off by default, both unbiased). The deal of a
+root is fixed, so the traverser's equity against the opponent's actual hand
+``E_s`` on each street ``s`` is computed once per root (exact on the flop,
+turn and river, Monte Carlo preflop; :func:`~pokerbot.env.equity.street_equities`).
+
+* ``allin_equity``: a hand that ends in a called all-in before the river is
+  scored ``stake * (2 E_s - 1)`` (the expectation over the undealt board)
+  instead of the pre-dealt runout.
+* ``chance_cv = beta``: when a slot moves to a new street with ``c`` chips in
+  per player, its value gets ``-beta * 2c * (E_new - E_old)``, a check-down
+  control variate with zero mean given the history. A slot carries these
+  corrections until it branches or ends, and they are added to the value of
+  the edge it reports to.
 
 :func:`rollout` (play env slots to the end with a policy per seat) and
 :func:`actor_probs` are the reusable pieces for the search component.
@@ -55,12 +70,16 @@ import torch
 from ...env.actions import DEFAULT_SPEC, ActionSpec
 from ...env.cards import make_generator
 from ...env.config import GameConfig
+from ...env.equity import street_equities
 from ...env.vec_env import VecNLHE
 from .features import FeatureConfig, features_from_obs, index_features
 from .networks import regret_matching
+from .strength import StrengthTables, add_strength, load_strength
 
 PolicyFn = Callable[[dict[str, torch.Tensor]], torch.Tensor]
 """Maps a feature dict ``[n, ...]`` to action probabilities ``[n, A]`` (0 on illegal)."""
+
+_ROLLOUT_STEPS = 256  # safety bound on the steps after max_steps (hands are far shorter)
 
 
 def uniform_policy(feats: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -140,9 +159,11 @@ def rollout(
     generator: torch.Generator | None = None,
     obs_kwargs: dict[str, Any] | None = None,
     max_steps: int = 256,
+    strength: StrengthTables | None = None,
 ) -> torch.Tensor:
     """Play every live slot of ``env`` to the end (in place), each seat sampling
-    from its policy. Returns ``payoffs [n, 2]`` (long chips)."""
+    from its policy. Returns ``payoffs [n, 2]`` (long chips). ``strength``
+    appends the table-lookup strength columns for nets that expect them."""
     obs_kwargs = obs_kwargs or {}
     for _ in range(max_steps):
         live = (~env.done).nonzero().squeeze(1)
@@ -150,6 +171,8 @@ def rollout(
             break
         feats = features_from_obs(env.obs(generator=generator, **obs_kwargs))
         sub = index_features(feats, live)
+        if strength is not None:
+            sub = add_strength(sub, strength)
         probs = actor_probs(sub, env.actor[live], policies)
         a = env.tab.call_index[env.street.clamp(0, 3)].clone()
         a[live] = sample_actions(probs, generator)
@@ -185,6 +208,9 @@ class TraversalConfig:
     max_steps: int = 64  # frontier steps before the remaining slots are rolled out
     value_scale: float | None = None  # chips per value unit; default: big blind
     record_strategy: bool = False  # opponent (infoset, policy) samples for a strategy memory
+    allin_equity: bool = False  # score all-ins called before the river by their equity
+    chance_cv: float = 0.0  # beta of the street-change control variate (0 = off)
+    preflop_equity_samples: int = 1024  # Monte Carlo runouts for the preflop equity
     features: FeatureConfig = field(default_factory=FeatureConfig)
 
     @staticmethod
@@ -204,7 +230,9 @@ class TraversalResult:
     units) and ``iteration``. ``strategy``: opponent rows with ``target`` =
     the opponent's policy, or None. ``node_*`` describe every branching node
     in creation order (for tests and diagnostics); ``root_value [K]`` is the
-    traverser's backed-up value of each root hand.
+    traverser's backed-up value of each root hand. ``root_equity [K, 4]`` is
+    the traverser's equity per street against the opponent's hand when
+    ``allin_equity`` or ``chance_cv`` is on, else None.
     """
 
     samples: dict[str, torch.Tensor]
@@ -215,6 +243,7 @@ class TraversalResult:
     edge_value: torch.Tensor
     root_value: torch.Tensor
     stats: dict[str, float]
+    root_equity: torch.Tensor | None = None
 
 
 def _compact(feats: dict[str, torch.Tensor], vocab: int) -> dict[str, torch.Tensor]:
@@ -246,6 +275,8 @@ class FrontierTraverser:
         self.generator = make_generator(seed * 2 + 1, self.device)
         self._roots: VecNLHE | None = None
         self.value_scale = float(self.cfg.value_scale or self.game_config.big_blind)
+        path = self.cfg.features.strength_tables
+        self.strength = load_strength(path) if path else None
 
     def new_roots(self, k: int) -> VecNLHE:
         """``k`` freshly dealt hands (buttons alternate per slot and per call)."""
@@ -282,9 +313,27 @@ class FrontierTraverser:
         scale = self.value_scale
         obs_kwargs = cfg.features.obs_kwargs()
 
+        use_cv = cfg.chance_cv != 0.0
+        use_eq = cfg.allin_equity or use_cv
+        root_eq = None  # [K, 4] traverser equity vs the opponent's hand per street
+        if use_eq:
+            c9 = env.cards
+            hero, opp = (c9[:, 0:2], c9[:, 2:4]) if p == 0 else (c9[:, 2:4], c9[:, 0:2])
+            root_eq = street_equities(hero, opp, c9[:, 4:9], cfg.preflop_equity_samples, gen)
+
+        root_str = None  # [K, 2, 4, 11] strength columns per root, seat and street
+        if self.strength is not None:
+            cols = self.strength.root_features(env.cards.cpu().numpy())
+            root_str = torch.from_numpy(cols).to(dev)
+
         root_value = torch.zeros(K, dtype=torch.float32, device=dev)
         pre_done = env.done.clone()
         root_value[pre_done] = env.payoffs[pre_done, p].float() / scale
+        if cfg.allin_equity and bool(pre_done.any()):
+            # both all-in from the blinds: nothing to decide, score the runout by equity
+            i = pre_done.nonzero().squeeze(1)
+            stake = env.contrib[i].min(1).values.float()
+            root_value[i] = stake * (2 * root_eq[i, 0] - 1) / scale
         live0 = (~pre_done).nonzero().squeeze(1)
         env = env.select(live0)
         n = env.n
@@ -292,11 +341,14 @@ class FrontierTraverser:
         root = live0
         cut = torch.zeros(n, dtype=torch.bool, device=dev)
         depth = torch.zeros(n, dtype=torch.long, device=dev)
+        # chance control-variate corrections since the slot's last branching node
+        corr = torch.zeros(n, dtype=torch.float32, device=dev)
 
         node_feats: list[dict[str, torch.Tensor]] = []
         node_pol: list[torch.Tensor] = []
         node_parent: list[torch.Tensor] = []
         node_root: list[torch.Tensor] = []
+        node_corr: list[torch.Tensor] = []
         counts: list[int] = []
         strat: list[dict[str, torch.Tensor]] = []
         leaf_edge: list[torch.Tensor] = []
@@ -307,6 +359,7 @@ class FrontierTraverser:
         slot_steps = 0
         max_front = n
         num_cut = 0
+        allin_leaves = 0
         steps = 0
 
         def record_leaves(own: torch.Tensor, rt: torch.Tensor, val: torch.Tensor) -> None:
@@ -316,10 +369,17 @@ class FrontierTraverser:
             rleaf_idx.append(rt[~e])
             rleaf_val.append(val[~e])
 
-        while env.n > 0 and steps < cfg.max_steps:
+        while env.n > 0:
+            if steps >= cfg.max_steps:  # past max_steps: roll every slot out
+                if steps >= cfg.max_steps + _ROLLOUT_STEPS:
+                    raise RuntimeError("traversal did not finish its rollouts")
+                cut = torch.ones_like(cut)
             n = env.n
             feats = features_from_obs(env.obs(generator=gen, **obs_kwargs))
             actor = env.actor
+            if root_str is not None:
+                cols = root_str[root, actor.clamp(min=0), env.street.clamp(0, 3)]
+                feats["scalars"] = torch.cat([feats["scalars"], cols], 1)
             probs = actor_probs(feats, actor, policies)
             is_trav = actor == p
             legal = feats["legal"]
@@ -336,6 +396,8 @@ class FrontierTraverser:
                 node_pol.append(probs[e_idx])
                 node_parent.append(owner[e_idx])
                 node_root.append(root[e_idx])
+                if use_cv:
+                    node_corr.append(corr[e_idx])
             counts.append(m)
             if cfg.record_strategy:
                 o_idx = (~is_trav & ~cut).nonzero().squeeze(1)
@@ -354,30 +416,49 @@ class FrontierTraverser:
             root = torch.cat([root[s_idx], root[child_slot]])
             cut = torch.cat([cut[s_idx], torch.zeros_like(r, dtype=torch.bool)])
             depth = torch.cat([depth[s_idx], depth[child_slot] + 1])
+            corr = torch.cat([corr[s_idx], torch.zeros(r.numel(), dtype=corr.dtype, device=dev)])
             num_nodes += m
 
             env = env.select(new_idx)
+            pre_street = env.street.clone() if use_eq else None
             pay, done = env.step(new_act)
             slot_steps += n
             max_front = max(max_front, env.n)
+            if use_cv:
+                # a new street was dealt: check-down control variate
+                mv = (~done & (env.street != pre_street)).nonzero().squeeze(1)
+                if mv.numel():
+                    rt = root[mv]
+                    d_eq = root_eq[rt, env.street[mv]] - root_eq[rt, pre_street[mv]]
+                    c = env.contrib[mv, p].float()  # equal for both seats once a street closes
+                    corr[mv] -= cfg.chance_cv * 2.0 * c * d_eq / scale
             d_idx = done.nonzero().squeeze(1)
             if d_idx.numel():
-                record_leaves(owner[d_idx], root[d_idx], pay[d_idx, p].float() / scale)
+                val = pay[d_idx, p].float() / scale
+                if cfg.allin_equity:
+                    ps = pre_street[d_idx]
+                    ro = ~env.folded[d_idx].any(1) & (ps < 3)  # all-in called before the river
+                    j = d_idx[ro]
+                    if j.numel():
+                        stake = env.contrib[j].min(1).values.float()
+                        val[ro] = stake * (2 * root_eq[root[j], ps[ro]] - 1) / scale
+                        allin_leaves += int(j.numel())
+                if use_cv:
+                    val = val + corr[d_idx]
+                record_leaves(owner[d_idx], root[d_idx], val)
             keep = (~done).nonzero().squeeze(1)
             if keep.numel() < env.n:
                 env = env.select(keep)
                 owner, root, cut, depth = owner[keep], root[keep], cut[keep], depth[keep]
+                corr = corr[keep]
             steps += 1
-
-        if env.n > 0:  # past max_steps: finish by outcome-sampled rollouts
-            pay = rollout(env, policies, gen, obs_kwargs)
-            record_leaves(owner, root, pay[:, p].float() / scale)
 
         # ------------------------------------------------------------ backup
         N = num_nodes
         pol = torch.cat(node_pol, 0) if N else torch.zeros(0, A, dtype=torch.float32, device=dev)
         parent = torch.cat(node_parent) if N else torch.zeros(0, dtype=torch.long, device=dev)
         nroot = torch.cat(node_root) if N else torch.zeros(0, dtype=torch.long, device=dev)
+        ncorr = torch.cat(node_corr) if (N and use_cv) else None
         ev = torch.zeros(N * A, dtype=torch.float32, device=dev)
         if leaf_edge:
             ev[torch.cat(leaf_edge)] = torch.cat(leaf_val)
@@ -394,10 +475,12 @@ class FrontierTraverser:
                 continue
             v = (pol[lo:hi] * ev2[lo:hi]).sum(1)
             nv[lo:hi] = v
+            # the parent edge also gets the corrections between it and this node
+            up = v + ncorr[lo:hi] if ncorr is not None else v
             par = parent[lo:hi]
             top = par < 0
-            ev[par[~top]] = v[~top]
-            root_value[nroot[lo:hi][top]] = v[top]
+            ev[par[~top]] = up[~top]
+            root_value[nroot[lo:hi][top]] = up[top]
 
         if N:
             samples = {k: torch.cat([f[k] for f in node_feats], 0) for k in node_feats[0]}
@@ -430,6 +513,7 @@ class FrontierTraverser:
             "frontier_steps": steps,
             "max_frontier": max_front,
             "cut_slots": num_cut,
+            "allin_leaves": allin_leaves,
             "regret_abs_mean": float(regret.abs().sum() / samples["legal"].sum().clamp(min=1))
             if N
             else 0.0,
@@ -443,4 +527,5 @@ class FrontierTraverser:
             edge_value=ev2,
             root_value=root_value,
             stats=stats,
+            root_equity=root_eq,
         )

@@ -62,3 +62,31 @@ def test_make_agent_registers_search_prefix():
     a.new_hand(0, cfg)
     act = a.act(s, 0, rng)  # preflop: blueprint
     assert s.legal_actions().is_legal(act)
+
+
+def test_played_lock_keeps_the_taken_action_exact():
+    """A lock on a tree that lost one of our played sizes: the action we took
+    keeps its probability, the lost mass goes to the other children."""
+    import torch
+
+    from pokerbot.search.agent import played_lock
+
+    g = torch.Generator().manual_seed(0)
+    old_acts = [(1, 0), (2, 375), (2, 500), (2, 10000)]
+    old = torch.rand(6, 4, generator=g)
+    old[5, 2:] = 0  # a combo that only checks or bets 375
+    old = old / old.sum(1, keepdim=True)
+    acts = [(1, 0), (2, 500), (2, 10000)]  # the re-search tree dropped 375
+    for slot in range(3):
+        s = played_lock(acts, slot, old_acts, old)
+        torch.testing.assert_close(s.sum(1), torch.ones(6))
+        taken = old[:, old_acts.index(acts[slot])]
+        torch.testing.assert_close(s[:, slot], taken)
+        others = [j for j in range(3) if j != slot]
+        rest = old[:, [old_acts.index(acts[j]) for j in others]]
+        lost = old[:, 1:2]
+        tot = rest.sum(1, keepdim=True)
+        want = torch.where(tot > 0, rest * (1 + lost / tot.clamp(min=1e-30)), lost / 2)
+        torch.testing.assert_close(s[:, others], want)
+    # nothing dropped: the played strategy as it was
+    torch.testing.assert_close(played_lock(old_acts, 1, old_acts, old), old)

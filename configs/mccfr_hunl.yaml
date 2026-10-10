@@ -53,13 +53,14 @@ mccfr:
     # root). Build them with the equity-histogram / EMD k-means of
     # pokerbot/abstraction (about 1.3 h on the 4070 Ti):
     #   python scripts/build_buckets.py --config configs/buckets_hunl.yaml --device cuda
-    # then use (bucket counts must match the tables' 1000 per street):
-    # tables: {preflop: null,
-    #          flop: data/abstraction/buckets_hunl/flop.npy,
-    #          turn: data/abstraction/buckets_hunl/turn.npy,
-    #          river: data/abstraction/buckets_hunl/river.npy}
+    # Every label in a table must be below that street's bucket count. The
+    # river table uses 793 of its 1000: river equity has only 1950 distinct
+    # values, so the quantile seeding de-duplicates to fewer centres.
     # A blueprint trained on tables needs the same files at play time.
-    tables: {preflop: null, flop: null, turn: null, river: null}
+    tables: {preflop: null,
+             flop: data/abstraction/buckets_hunl/flop.npy,
+             turn: data/abstraction/buckets_hunl/turn.npy,
+             river: data/abstraction/buckets_hunl/river.npy}
 
   # Pluribus schedule scaled to iterations (~25M iterations = 10 minutes on 16
   # cores): Linear CFR discounting every "10 minutes" for the first "400",

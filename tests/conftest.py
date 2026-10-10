@@ -61,3 +61,21 @@ def tiny_neural_run(tmp_path_factory):
     finally:
         torch.set_num_threads(threads)
     return run
+
+
+@pytest.fixture(scope="session")
+def tiny_distilled_run(tiny_neural_run, tmp_path_factory):
+    """``tiny_neural_run`` distilled into one average-strategy net per seat (the
+    lockstep ``vec_rollouts`` path supports it)."""
+    import torch
+
+    from pokerbot.blueprint.deepcfr.distill import DistillConfig, distill
+
+    out = tmp_path_factory.mktemp("distilled")
+    threads = torch.get_num_threads()
+    try:
+        cfg = DistillConfig(rows=3000, n_envs=64, steps=40, batch=256, holdout=0.1)
+        distill(tiny_neural_run, out, cfg, device="cpu", log=None)
+    finally:
+        torch.set_num_threads(threads)
+    return out

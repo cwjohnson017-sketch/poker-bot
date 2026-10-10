@@ -50,6 +50,11 @@ _KIND_CODES = {
     "allin": K_ALLIN,
 }
 
+# when a sized raise is offered: always, only as the street's first voluntary
+# raise (an opening bet or raise), or only facing a voluntary raise (a re-raise)
+W_ANY, W_OPEN, W_RERAISE = 0, 1, 2
+_WHEN_CODES = {"open": W_OPEN, "reraise": W_RERAISE}
+
 AbstractAction = tuple
 
 
@@ -66,8 +71,13 @@ class ActionSpec:
             for a in st:
                 if a[0] not in _KIND_CODES:
                     raise ValueError(f"unknown abstract action {a}")
-                if a[0] in ("raise", "raise_x") and not (len(a) == 2 and a[1] > 0):
-                    raise ValueError(f"bad size in {a}")
+                if a[0] in ("raise", "raise_x"):
+                    if len(a) not in (2, 3) or not a[1] > 0:
+                        raise ValueError(f"bad size in {a}")
+                    if len(a) == 3 and a[2] not in _WHEN_CODES:
+                        raise ValueError(f"condition must be 'open' or 'reraise' in {a}")
+                elif len(a) != 1:
+                    raise ValueError(f"{a[0]} takes no size or condition: {a}")
             names = [a[0] for a in st]
             if names.count("fold") != 1 or names.count("check_call") != 1:
                 raise ValueError("every street needs exactly one fold and one check_call")
@@ -79,7 +89,9 @@ class ActionSpec:
 
     def describe(self, street: int, index: int) -> str:
         a = self.streets[street][index]
-        return a[0] if len(a) == 1 else f"{a[0]} {a[1]:g}"
+        if len(a) == 1:
+            return a[0]
+        return f"{a[0]} {a[1]:g}" + (f" ({a[2]})" if len(a) == 3 else "")
 
     def tables(self, device: torch.device | str) -> SpecTables:
         return SpecTables.build(self, device)
@@ -106,6 +118,7 @@ DEFAULT_SPEC = ActionSpec(
 class SpecTables:
     kind: torch.Tensor  # [4, A] abstract kind codes (K_*), K_INVALID for padding
     param: torch.Tensor  # [4, A] size in thousandths (0 when unused)
+    when: torch.Tensor  # [4, A] W_ANY / W_OPEN / W_RERAISE
     concrete: torch.Tensor  # [4, A] concrete kind (FOLD/CHECK_CALL/RAISE; CHECK_CALL for padding)
     fold_index: torch.Tensor  # [4]
     call_index: torch.Tensor  # [4]
@@ -119,11 +132,14 @@ class SpecTables:
         A = spec.num_actions
         kind = torch.full((4, A), K_INVALID, dtype=torch.long)
         param = torch.zeros((4, A), dtype=torch.long)
+        when = torch.zeros((4, A), dtype=torch.long)
         for s, st in enumerate(spec.streets):
             for i, a in enumerate(st):
                 kind[s, i] = _KIND_CODES[a[0]]
-                if len(a) == 2:
+                if len(a) >= 2:
                     param[s, i] = int(round(float(a[1]) * 1000))
+                if len(a) == 3:
+                    when[s, i] = _WHEN_CODES[a[2]]
         concrete = torch.full((4, A), CHECK_CALL, dtype=torch.long)
         concrete[kind == K_FOLD] = FOLD
         concrete[(kind == K_RAISE_POT) | (kind == K_RAISE_MULT) | (kind == K_ALLIN)] = RAISE
@@ -134,6 +150,7 @@ class SpecTables:
         return SpecTables(
             kind.to(d),
             param.to(d),
+            when.to(d),
             concrete.to(d),
             fold_index.to(d),
             call_index.to(d),
@@ -182,14 +199,20 @@ def legal_mask(
     targets: torch.Tensor,
     max_raise_to: torch.Tensor,
 ) -> torch.Tensor:
-    """``[n, A]`` bool. Inactive (finished) rows allow only check_call, a no-op."""
+    """``[n, A]`` bool. Inactive (finished) rows allow only check_call, a no-op.
+
+    A sized raise conditioned ``open`` is offered only while ``n_raises == 0``
+    on the street, one conditioned ``reraise`` only once ``n_raises >= 1``."""
     kind = tab.kind[street]
     can_raise = (raise_ok & (n_raises < tab.max_raises))[:, None]
+    when = tab.when[street]
+    first = (n_raises == 0)[:, None]
+    cond = (when == W_ANY) | ((when == W_OPEN) & first) | ((when == W_RERAISE) & ~first)
     fold_l = (kind == K_FOLD) & (to_call > 0)[:, None]
     call_l = kind == K_CHECK_CALL
     allin_l = (kind == K_ALLIN) & can_raise
     sized = (kind == K_RAISE_POT) | (kind == K_RAISE_MULT)
-    sized_l = sized & can_raise & (targets < max_raise_to[:, None])
+    sized_l = sized & can_raise & cond & (targets < max_raise_to[:, None])
     if tab.dedupe:
         same = (targets[:, :, None] == targets[:, None, :]) & sized_l[:, None, :] & tab.tril
         sized_l = sized_l & ~same.any(2)
@@ -236,6 +259,70 @@ def nearest_abstract(
         kind == FOLD,
         tab.fold_index[street],
         torch.where(kind == CHECK_CALL, tab.call_index[street], r_idx),
+    )
+
+
+def harmonic_abstract(
+    tab: SpecTables,
+    street: torch.Tensor,
+    kind: torch.Tensor,
+    amount: torch.Tensor,
+    targets: torch.Tensor,
+    legal: torch.Tensor,
+    pot: torch.Tensor,
+    max_bet: torch.Tensor,
+    to_call: torch.Tensor,
+    max_raise_to: torch.Tensor,
+    u: torch.Tensor,
+) -> torch.Tensor:
+    """Abstract index of a concrete action by the randomized pseudo-harmonic
+    mapping: the vectorized mirror of
+    :func:`pokerbot.abstraction.actions.map_offtree` (``_translate_py`` /
+    Rust ``ActionAbstraction::translate``) at a state whose abstract and real
+    pots agree.
+
+    Fold maps to fold (check/call when fold is not legal), check/call to
+    check/call. A raise maps to check/call when no abstract raise is legal; to
+    the legal raise entry at the actor's all-in when the raise is all-in; else
+    by pot fraction ``(raise_to - max_bet) / (pot + to_call)``: below the
+    smallest legal raise to it, above the largest to it, otherwise between the
+    neighbours ``a < x <= b`` to ``a`` when ``u < (b - x)(1 + a) / ((b - a)(1 + x))``.
+    ``u [n]`` is uniform on [0, 1).
+    """
+    akind = tab.kind[street]
+    is_r = (akind == K_RAISE_POT) | (akind == K_RAISE_MULT) | (akind == K_ALLIN)
+    legal_r = is_r & legal
+    any_r = legal_r.any(1)
+    denom = (pot + to_call).clamp(min=1).double()
+    frac = (targets - max_bet[:, None]).double() / denom[:, None]
+    x = (amount - max_bet).double() / denom
+    inf = torch.full_like(frac, float("inf"))
+    ge = legal_r & (frac >= x[:, None])
+    lt = legal_r & (frac < x[:, None])
+    b_idx = torch.where(ge, frac, inf).argmin(1)
+    a_idx = torch.where(lt, frac, -inf).argmax(1)
+    has_b, has_a = ge.any(1), lt.any(1)
+    fa = frac.gather(1, a_idx[:, None]).squeeze(1)
+    fb = frac.gather(1, b_idx[:, None]).squeeze(1)
+    xc = torch.minimum(torch.maximum(x, fa), fb)
+    p_a = torch.where(
+        fb > fa,
+        ((fb - xc) * (1.0 + fa)) / ((fb - fa).clamp(min=1e-12) * (1.0 + xc)),
+        torch.ones_like(x),
+    )
+    between = torch.where(u.double() < p_a, a_idx, b_idx)
+    r_idx = torch.where(~has_a, b_idx, torch.where(~has_b, a_idx, between))
+    # an all-in raise maps to the legal raise entry at the all-in amount
+    at_max = legal_r & (targets == max_raise_to[:, None])
+    to_allin = (amount >= max_raise_to) & at_max.any(1)
+    r_idx = torch.where(to_allin, at_max.long().argmax(1), r_idx)
+    call = tab.call_index[street]
+    fold = tab.fold_index[street]
+    fold_ok = legal.gather(1, fold[:, None]).squeeze(1)
+    return torch.where(
+        kind == FOLD,
+        torch.where(fold_ok, fold, call),
+        torch.where((kind == CHECK_CALL) | ~any_r, call, r_idx),
     )
 
 

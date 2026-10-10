@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from pokerbot.blueprint.deepcfr.memory import ReservoirMemory
@@ -81,3 +82,36 @@ def test_save_load_roundtrip(tmp_path):
     assert len(big) == 20 and big.capacity == 80
     big.add_batch(_batch(np.arange(100, 170)))
     assert len(big) == 80
+
+
+def test_chunk_sampler_draws_uniform_minibatches():
+    from pokerbot.blueprint.deepcfr.trainer import _ChunkSampler
+
+    mem = _mem(50, 0)
+    mem.add_batch(_batch(np.arange(50)))
+    sampler = _ChunkSampler(mem, batch=10, device=torch.device("cpu"), rows=40, steps=400)
+    counts = np.zeros(50)
+    for _ in range(400):
+        b = sampler.get()
+        assert b["cards"].dtype == torch.long and b["target"].dtype == torch.float32
+        assert b["scalars"].shape == (10, 5) and b["legal"].dtype == torch.bool
+        ids = b["scalars"][:, 0].long().numpy()
+        counts[ids] += 1
+    freq = counts / counts.sum()
+    assert np.abs(freq - 1 / 50).max() < 0.012  # 4000 draws over 50 rows
+    # CUDA cannot index unsigned 16-bit tensors: the device chunk must not hold any
+    assert all(v.dtype not in (torch.uint16, torch.uint32) for v in sampler.cur.values())
+
+
+@pytest.mark.gpu
+def test_chunk_sampler_on_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    from pokerbot.blueprint.deepcfr.trainer import _ChunkSampler
+
+    mem = _mem(50, 0)
+    mem.add_batch(_batch(np.arange(50)))
+    sampler = _ChunkSampler(mem, batch=10, device=torch.device("cuda"), rows=40, steps=8)
+    for _ in range(8):
+        b = sampler.get()
+        assert b["iteration"].is_cuda and b["iteration"].dtype == torch.float32

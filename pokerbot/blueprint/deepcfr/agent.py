@@ -5,7 +5,10 @@ engine, or the match runner's masked view) with the scalar mirror of the env
 encoder (:mod:`.scalar`), asks its seat's :class:`~.policy.SDCFRPolicy` for
 the average policy over the abstract actions, samples one (or takes the most
 likely with ``greedy``), and converts it to a concrete action with the env's
-sizing rule.
+sizing rule. With ``sample_net=True`` it instead draws one net per hand and
+seat (probability proportional to its iteration weight) and plays that net's
+policy for the whole hand: the same average strategy in distribution, at one
+forward pass per decision instead of one per net.
 
 Opponent raises off the abstraction are mapped to an abstract index when the
 history is encoded. With ``offtree="harmonic"`` (the default) that is the
@@ -14,7 +17,8 @@ randomized with the ``rng`` passed to ``act`` and drawn once per opponent
 action per hand (kept until ``new_hand``). ``offtree="nearest"`` records the
 nearest legal size, exactly the index ``VecNLHE.step_concrete`` records.
 
-Registered in the agent factory as ``neural:<checkpoint dir>``.
+Registered in the agent factory as ``neural:<checkpoint dir>``
+(``neural:<dir>,sample_net=true`` for the one-net-per-hand mode).
 
 The agent is also a :class:`~pokerbot.agents.policy.PolicyAgent`:
 ``policy(state, seat)`` and ``policy_batch(state, seat, holes)`` return the
@@ -56,6 +60,7 @@ class NeuralBlueprintAgent(BaseAgent):
         greedy: bool = False,
         name: str | None = None,
         offtree: str = "harmonic",
+        sample_net: bool = False,
     ) -> None:
         super().__init__(name)
         if len(policies) != 2:
@@ -65,6 +70,8 @@ class NeuralBlueprintAgent(BaseAgent):
         self.sp = ScalarSpec.build(spec)
         self.features = features or FeatureConfig()
         self.greedy = greedy
+        self.sample_net = bool(sample_net)
+        self._net_index: dict[int, int] = {}  # seat -> net drawn for this hand
         self.offtree = check_offtree(offtree)
         self.trained_game: dict[str, Any] | None = None
         self._warned = False
@@ -92,13 +99,18 @@ class NeuralBlueprintAgent(BaseAgent):
         greedy: bool = False,
         name: str | None = None,
         offtree: str = "harmonic",
+        sample_net: bool = False,
+        stride: int | None = None,
     ) -> NeuralBlueprintAgent:
         meta = read_meta(path)
         kw = dict(
             last_n=last_n,
             max_iter=max_iter,
+            stride=stride,
             device=device,
-            reach_weighted=reach_weighted,
+            # a distilled average-strategy run: one softmax policy net per seat
+            reach_weighted=reach_weighted and bool(meta.get("reach_weighted", True)),
+            policy_head=meta.get("policy_head", "regret"),
             fallback=meta.get("fallback", "uniform"),
         )
         pols = [SDCFRPolicy.from_dir(path, p, **kw) for p in (0, 1)]
@@ -109,6 +121,7 @@ class NeuralBlueprintAgent(BaseAgent):
             greedy=greedy,
             name=name,
             offtree=offtree,
+            sample_net=sample_net,
         )
         agent.trained_game = meta.get("game")
         return agent
@@ -116,6 +129,7 @@ class NeuralBlueprintAgent(BaseAgent):
     def new_hand(self, seat: int, config: Any) -> None:
         super().new_hand(seat, config)
         self.policies[seat].new_hand()
+        self._net_index.pop(seat, None)
         for k in [k for k in self._offtree_memo if k[0] == seat]:
             del self._offtree_memo[k]
         g = self.trained_game
@@ -179,12 +193,19 @@ class NeuralBlueprintAgent(BaseAgent):
         )
         self.offtree_mapped += len(self._offtree_memo) - n_memo
         pol = self.policies[seat]
-        probs = pol.act_probs(feats)[0].double().cpu().numpy()
+        if self.sample_net:
+            idx = self._net_index.get(seat)
+            if idx is None:
+                idx = self._net_index[seat] = pol.sample_index(rng)
+            probs = pol.net_probs(feats, idx)[0].double().cpu().numpy()
+        else:
+            probs = pol.act_probs(feats)[0].double().cpu().numpy()
         probs = np.where(np.asarray(info.legal), np.clip(probs, 0.0, None), 0.0)
         probs = probs / probs.sum()
         self.last_probs = probs
         a = int(np.argmax(probs)) if self.greedy else int(rng.choice(len(probs), p=probs))
-        pol.observe(a)
+        if not self.sample_net:
+            pol.observe(a)
         kind = self.sp.concrete_kind(info.street, a)
         if kind == FOLD:
             return self.fold()
