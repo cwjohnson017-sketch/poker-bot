@@ -15,7 +15,7 @@ source "$HOME/.cargo/env"
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 uv pip install "torch==2.11.*" --index-url https://download.pytorch.org/whl/cu128
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev,train]"   # train: tensorboard (a trainer test expects its logs)
 (cd engine && maturin develop --release)
 python - <<'EOF'
 import torch, poker_engine

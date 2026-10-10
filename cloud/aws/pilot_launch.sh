@@ -23,7 +23,7 @@ echo "AMI $AMI (root device $ROOT_DEV)"
 if ! aws_ ec2 describe-key-pairs --key-names "$KEY" >/dev/null 2>&1; then
     mkdir -p "$HOME/.ssh"
     aws_ ec2 create-key-pair --key-name "$KEY" --key-type ed25519 \
-        --query KeyMaterial --output text > "$SSH_KEY"
+        --query KeyMaterial --output text | tr -d '\r' > "$SSH_KEY"   # aws.exe writes CRLF
     chmod 600 "$SSH_KEY"
     echo "created key pair $KEY -> $SSH_KEY"
 fi
@@ -35,7 +35,7 @@ SG=$(aws_ ec2 describe-security-groups --filters Name=group-name,Values="$SG_NAM
     --query "SecurityGroups[0].GroupId" --output text)
 if [[ $SG == None ]]; then
     SG=$(aws_ ec2 create-security-group --group-name "$SG_NAME" --vpc-id "$VPC" \
-        --description "pokerbot: SSH from the owner's IP" --query GroupId --output text)
+        --description "pokerbot SSH from the owner IP only" --query GroupId --output text)
 fi
 aws_ ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 \
     --cidr "$MY_IP/32" >/dev/null 2>&1 || true   # already allowed

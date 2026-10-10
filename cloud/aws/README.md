@@ -10,8 +10,9 @@ Settings are in `common.sh`:
 ```bash
 bash cloud/aws/pilot_launch.sh      # billed from here; self-terminates after MAX_HOURS (4)
 bash cloud/aws/pilot_sync.sh        # code at HEAD, blueprint + tables, nets (~3.3 GB)
-source cloud/aws/common.sh && load_state && remote 'bash poker-bot/cloud/aws/remote_setup.sh'
-source cloud/aws/common.sh && load_state && remote 'bash poker-bot/cloud/aws/remote_pilot.sh'
+source cloud/aws/common.sh && load_state
+remote_detached setup bash poker-bot/cloud/aws/remote_setup.sh    # ~5 min; log ~/setup.log
+remote_detached pilot bash poker-bot/cloud/aws/remote_pilot.sh    # ~40 min; poker-bot/pilot/summary.txt
 bash cloud/aws/pilot_terminate.sh   # results to runs/aws/pilot/, then terminate
 ```
 
