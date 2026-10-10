@@ -46,9 +46,11 @@ if [[ $MARKET == spot ]]; then
     MARKET_OPT=(--instance-market-options
         'MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}')
 fi
+SUBNET_OPT=()
+if [[ -n ${SUBNET:-} ]]; then SUBNET_OPT=(--subnet-id "$SUBNET"); fi   # pick the AZ (capacity)
 USER_DATA=$(printf '#!/bin/bash\nshutdown -h +%d\n' $((MAX_HOURS * 60)))
 INSTANCE_ID=$(aws_ ec2 run-instances --image-id "$AMI" --instance-type "$TYPE" --key-name "$KEY" \
-    --security-group-ids "$SG" "${MARKET_OPT[@]}" \
+    --security-group-ids "$SG" "${MARKET_OPT[@]}" "${SUBNET_OPT[@]}" \
     --block-device-mappings "DeviceName=$ROOT_DEV,Ebs={VolumeSize=$DISK_GB,VolumeType=gp3,DeleteOnTermination=true}" \
     --instance-initiated-shutdown-behavior terminate \
     --user-data "$USER_DATA" \
