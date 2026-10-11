@@ -76,6 +76,40 @@ on 3 spots.
 If depth-0 flop search becomes competitive, it is also worth having on its own:
 the whole flop abstraction in about 200 nodes, and about 3x the iterations.
 
+### Stage 1 result (2026-10-11): v2 does not improve on v1, so stage 3
+
+* **`turn_start_v2`:** held-out MAE 0.029 against v1's 0.039 (the held-out sets
+  differ).
+* **Gate, re-solved** (`runs/r4/depth0_resolved.json`, `--resolve-iters 400`):
+  * every flop decision of both players is locked to the profile's;
+  * every turn decision is solved again on the production trunk with production's
+    leaf net;
+  * so the profiles differ only in their flop strategies.
+
+  mbb/hand, exact river, lower is better:
+
+  | spot | production, one-sided | v1, one-sided | v2, one-sided | production, two-sided | v1, two-sided | v2, two-sided |
+  |---|---:|---:|---:|---:|---:|---:|
+  | board0 BB first | -105 | 96 | 86 | 172 | 302 | 287 |
+  | board0 BTN vs check | 582 | 638 | 631 | 161 | 290 | 282 |
+  | board1 BB first | -72 | 12 | 27 | 174 | 204 | 214 |
+  | **mean** | **135** | **249** | **248** | **169** | **266** | **261** |
+
+* **The hybrid scoring** (production's turn strategy behind the depth-0 flop) gave
+  the same picture:
+  * one-sided: v1 280, v2 278, production 147-157;
+  * two-sided: 307 / 310 against 187-197.
+
+  Re-solving the turn shrinks the gap only a little:
+  * one-sided, from about 127 to 114 mbb/hand;
+  * two-sided, from about 116 to 95.
+* **Reading.**
+  * 4x the data and a lower held-out MAE left the flop decisions as they were.
+  * So the loss is not fit error. Likely sources are the targets themselves
+    (turn-start values solved with `turn_v4e` leaves) or a mismatch between the
+    training ranges and the flop search's ranges.
+  * A flop-root net trained on turn-start leaves would add another lossy step.
+
 ## Stage 2: flop-root net and preflop (AWS-scale data)
 
 * **Flop-root data.** Flop-root subgames (both ranges at the start of the flop)
