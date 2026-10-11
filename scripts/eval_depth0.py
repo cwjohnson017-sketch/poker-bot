@@ -25,6 +25,9 @@ Per spot:
    (``spot_eval.score_profile``): one-sided (opponent's BR against the searcher)
    and two-sided, in mbb/hand.
 
+``--out-json`` is rewritten after every spot; ``--resume`` keeps the spots already in it
+(written with the same settings) and runs only the rest, e.g. after an interruption.
+
 python scripts/eval_depth0.py --blueprint runs/dcfr4_distilled_v2 \
     --spots 0:bb_first 0:btn_vs_check 1:bb_first --out-json runs/tree_size/depth0.json
 python scripts/eval_depth0.py --blueprint runs/dcfr4_distilled_v2 \
@@ -106,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-plain", action="store_true", help="score the re-solved profiles only")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out-json", default="runs/tree_size/depth0.json")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep the spots already in --out-json (same settings) and run only the rest",
+    )
     args = ap.parse_args(argv)
     if args.no_plain and not args.resolve_iters:
         ap.error("--no-plain needs --resolve-iters")
@@ -125,6 +133,14 @@ def main(argv: list[str] | None = None) -> int:
         configs[name] = lambda path=path: search_config(path, **over)
     boards = 1 + max(int(s.partition(":")[0]) for s in args.spots)
     spots = select_spots(engine, gcfg, boards, 5, picks=args.spots)
+    done: dict[str, dict] = {}
+    if args.resume and Path(args.out_json).exists():
+        prev = json.loads(Path(args.out_json).read_text())
+        same = ("blueprint", "config", "river_iters", "resolve_iters", "resolve_mix", "no_plain")
+        diff = [k for k in same if prev["args"].get(k) != getattr(args, k)]
+        if diff or prev.get("depth0_configs") != d0_paths:
+            raise SystemExit(f"--resume: {args.out_json} has other settings ({diff or 'configs'})")
+        done = {s["label"]: s for s in prev["spots"]}
     warm = select_spots(engine, gcfg, 1, 1005, ["bb_first"])[0]
     for name, cfg in configs.items():
         run_search(f"warmup-{name}", bp, warm.state, gcfg, cfg())
@@ -133,6 +149,11 @@ def main(argv: list[str] | None = None) -> int:
     mbb = 1000.0 / float(gcfg.big_blind)
     order: list[str] = []
     for spot in spots:
+        if spot.label in done:
+            out["spots"].append(done[spot.label])
+            order = list(done[spot.label]["profiles"])
+            log(f"{spot.label}: already in {args.out_json}, kept")
+            continue
         t_spot = time.perf_counter()
         state = spot.state
         seat = int(state.current_player)
