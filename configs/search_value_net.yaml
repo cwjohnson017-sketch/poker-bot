@@ -42,10 +42,11 @@ search:
 
   leaf:
     mode: value_net
-    # turn-end net, round 3: 2048 x 8 layers, 120k steps. 11% lower leaf error than round 2's
-    # turn_v3w at production leaf states, 2-3% less exploitable on 12 flop spots, 58 instead
-    # of 62 flop iterations in 4 s (docs/value_net_eval.md, Round 3)
-    net: runs/value_net/turn_v4e.pt
+    # turn-end net, round 4: turn_v5x, 2048 x 12 layers, 240k steps on river_v4rx targets.
+    # 6-11% lower exact leaf error than round 3's turn_v4e at flop-search leaf states; on 12
+    # flop spots two-sided 91 against 95 mbb/hand (better in 11), 58 instead of 61 flop
+    # iterations in 4 s (docs/value_net_eval.md, Round 4)
+    net: runs/value_net/turn_v5x.pt
     # trees rooted on the turn: river net x 48 river cards. Round 4: river_v4rx, the residual-
     # head river net (fused Triton head: pokerbot/search/head_kernel.py) trained 160k steps
     # with the third on-policy round (turn searches' leaves). 22% lower error than river_v3

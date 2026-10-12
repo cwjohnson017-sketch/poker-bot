@@ -1700,6 +1700,19 @@ pot units, MAE / game value):
 
 That is 6-11% less leaf error (4-9% on game value) for 5% fewer iterations.
 
+**12 flop spots** (Round 3's `exploit12` setup: 300 iterations, 6000-node
+trees, unsafe first decision, exact river; `runs/r4/exploit12_v5x.md`;
+mbb/hand):
+
+| | two-sided | one-sided | per-combo excess over the blueprint | ms/iteration |
+|---|---:|---:|---:|---:|
+| `turn_v4e` | 95 | 217 | 4 / 6 / 78 / 3.8% | 8.5 |
+| **`turn_v5x`** | **91** | **212** | 4 / 5 / 73 / 3.6% | 9.4 |
+
+`turn_v5x` is better in 11 of 12 spots on both measures. A 4% gain fits Round
+3's 2-3% for an 11% better leaf, and production now uses
+`leaf.net: runs/value_net/turn_v5x.pt`.
+
 ### 6. CUDA-graph replay of DCFR iterations
 
 A depth-0 turn tree has about 180 nodes. An iteration launches hundreds of
