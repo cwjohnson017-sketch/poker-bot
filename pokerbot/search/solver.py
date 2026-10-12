@@ -85,8 +85,11 @@ class SolverConfig:
     dtype: str = "float32"
     seed: int = 0
     # replay each DCFR iteration as a CUDA graph (RangeSolver.solve) when the tree's
-    # terminals allow it: one launch instead of hundreds of small kernels per iteration
+    # terminals allow it: one launch instead of hundreds of small kernels per iteration.
+    # Small trees only: launch overhead dominates there, while big (flop) trees are
+    # GPU-bound and their capture is dear
     cuda_graph: bool = True
+    graph_max_nodes: int = 8000
 
 
 def runouts_for(
@@ -498,12 +501,15 @@ class RangeSolver:
 
     def graph_ok(self) -> bool:
         """Whether :meth:`solve` may replay iterations from a CUDA graph: CUDA,
-        ``cfg.cuda_graph``, DCFR (CFR+ weights the strategy sum by ``t`` on the
-        host), no rollout leaves, and a value-leaf provider, if the tree has
-        ``VALUE`` nodes, that declares ``graph_safe`` (no host syncs or host-side
-        state in its regret-update calls)."""
+        ``cfg.cuda_graph``, at most ``cfg.graph_max_nodes`` nodes, DCFR (CFR+
+        weights the strategy sum by ``t`` on the host), no rollout leaves, and a
+        value-leaf provider, if the tree has ``VALUE`` nodes, that declares
+        ``graph_safe`` (no host syncs or host-side state in its regret-update
+        calls)."""
         cfg = self.cfg
         if not (cfg.cuda_graph and self.device.type == "cuda" and cfg.algorithm == "dcfr"):
+            return False
+        if self.tree.num_nodes > cfg.graph_max_nodes:
             return False
         term = self.terminals
         if not isinstance(term, TerminalEvaluator) or len(term.cont_ids):
