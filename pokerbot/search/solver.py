@@ -86,10 +86,10 @@ class SolverConfig:
     seed: int = 0
     # replay each DCFR iteration as a CUDA graph (RangeSolver.solve) when the tree's
     # terminals allow it: one launch instead of hundreds of small kernels per iteration.
-    # Small trees only: launch overhead dominates there, while big (flop) trees are
-    # GPU-bound and their capture is dear
+    # Depth-0 turn searches (about 180 nodes) run 74% more iterations in 2 s; 20k-node
+    # flop searches, GPU-bound, 3% more in 4 s (docs/value_net_eval.md, Round 4)
     cuda_graph: bool = True
-    graph_max_nodes: int = 8000
+    graph_max_nodes: int = 32768  # larger trees solve eagerly
 
 
 def runouts_for(

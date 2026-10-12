@@ -1659,6 +1659,91 @@ little, on every measure:
 The steps from 40k to 80k bought 24 / 19 mbb/hand on the spots; doubling
 again buys 3 / 4. Production uses `river_v4rx` (same cost per call).
 
+### 5. Flop leaves: the turn-end net on `river_v4rx` targets
+
+The flop search's leaf model is the turn-end net `turn_v4e`, trained to
+imitate `river_v3`'s fan-out. `river_v4rx`'s fan-out is more accurate at
+flop-search leaf states too.
+
+* **Relabelling.** `turn_b` (1.5M states) took 12 min with the fused head
+  (Round 3, PyTorch head: 20.5 min). The three on-policy rounds' turn-end
+  states took 1 min.
+* **`turn_v5e`:** `turn_v4e`'s recipe (2048 x 8, 120k steps, 38 min) on
+  1.75M states.
+
+**Exact check at flop-search leaf states** (400 held-out states per round;
+pot units, MAE / game value):
+
+| model | round 3 states | round 2 states |
+|---|---|---|
+| `river_v4rx` x 44 rivers (reference; `river_v3`: 0.0197 / 0.0053 on round 2) | 0.0164 / 0.0048 | 0.0158 / 0.0044 |
+| `turn_v4e` (production) | 0.0332 / 0.0103 | 0.0315 / 0.0091 |
+| `turn_v5e` | 0.0317 / 0.0109 | 0.0314 / 0.0092 |
+
+* **The better targets do not reach the flop's leaves.** `river_v4rx`'s
+  fan-out is 20% better than `river_v3`'s, but the turn-end net trained on it
+  is no better than `turn_v4e`. Round 3 found the same with `river_v3r`.
+* **The turn-end net's own fit dominates.** Against its targets it reaches
+  0.0225, three times the bucket-oracle floor (0.0069), and its exact error
+  is twice the fan-out's.
+* The 12-spot flop evaluation of `turn_v5e` was stopped after the leaf
+  checks.
+
+**`turn_v5x`: more depth and steps.** Round 3 found depth and steps paid, so
+`turn_v5x` is 2048 x 12 layers (48M parameters) at 240k steps on the same data
+(1.9 h). Against its targets it reaches 0.0208 (`turn_v5e` 0.0225).
+
+| exact check, MAE / game value | round 3 states | round 2 states | flop iterations in 4 s |
+|---|---|---|---:|
+| `turn_v4e` (production) | 0.0332 / 0.0103 | 0.0315 / 0.0091 | 61 |
+| **`turn_v5x`** | **0.0297 / 0.0099** | **0.0295 / 0.0083** | 58 |
+
+That is 6-11% less leaf error (4-9% on game value) for 5% fewer iterations.
+
+### 6. CUDA-graph replay of DCFR iterations
+
+A depth-0 turn tree has about 180 nodes. An iteration launches hundreds of
+small kernels, so the launches, not the GPU work, set its cost: about 5 ms of
+`river_v3`'s 9 ms per iteration was outside the net.
+
+* **`RangeSolver.solve`** captures one iteration (both players' updates) as a
+  CUDA graph and replays it. The capture runs at the call's first iteration
+  from t = 3, after that iteration runs eagerly on the capture stream. The
+  graph is freed when `solve` returns.
+* **When it applies** (`graph_ok()`):
+  * CUDA, `solver.cuda_graph` (default on);
+  * at most `solver.graph_max_nodes` nodes (32768);
+  * DCFR;
+  * no rollout leaves;
+  * a value-leaf provider that declares `graph_safe`: `RiverAverage` /
+    `TurnEndLeafEvaluator` with a `ValueNetPredictor` and `net_every: 1`.
+    The on-policy recorder declares itself unsafe.
+* **Exactness.** The DCFR factors are computed on the device from the
+  iteration number, set before each replay. They are rounded as the eager
+  path rounds them: `torch.where` on two Python floats gives float32 factors,
+  even in a float64 solve. In float64, eager and graph solves then agree to
+  1e-9 relative. In float32, eager solves already differ from each other run
+  to run, as CUDA atomics accumulate in any order. The safe-resolving gadget's
+  entry strategy is now updated in place, because the graph reads its storage.
+* **Speed:**
+  * depth-0 turn search in 2 s: **318 iterations against 183**, +74%, over
+    12 spots;
+  * flop search in 4 s (20k nodes, GPU-bound): 64 against 62.
+
+**18 turn spots at 2 s, production with and without graphs**
+(`runs/r4/turn_eval_graph.md`):
+
+| | iterations | own game | one-sided | two-sided |
+|---|---:|---:|---:|---:|
+| eager | 180 | 45 | 613 | 159 |
+| **CUDA graphs** | **316** | **30** | **605** | **148** |
+
+* The extra iterations cut two-sided exploitability by 11 mbb/hand (7%),
+  better or equal in 15 of 18 spots. The largest gains (-30) are on board 0
+  after the button's flop bet was called.
+* **The turn over Round 4:** 189 two-sided (Round 3 production, `river_v3`)
+  -> 157 (`river_v4rl`) -> 148 (`river_v4rx` with graphs): -22%.
+
 
 **Worked**
 
