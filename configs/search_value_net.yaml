@@ -46,7 +46,13 @@ search:
     # turn_v3w at production leaf states, 2-3% less exploitable on 12 flop spots, 58 instead
     # of 62 flop iterations in 4 s (docs/value_net_eval.md, Round 3)
     net: runs/value_net/turn_v4e.pt
-    turn_net: runs/value_net/river_v3.pt  # trees rooted on the turn: river net x 48 river cards
+    # trees rooted on the turn: river net x 48 river cards. Round 4: river_v4rl, the residual-
+    # head river net (fused Triton head: pokerbot/search/head_kernel.py) trained 80k steps with
+    # the third on-policy round (turn searches' leaves). 22% lower error than river_v3 at the
+    # turn searches' leaf states against exact solves; on 18 turn spots at 200 iterations
+    # one-sided 616 against 652, two-sided 161 against 191 (docs/value_net_eval.md, Round 4).
+    # Without Triton its head runs about 4x slower: install the gpu extra
+    turn_net: runs/value_net/river_v4rl.pt
     net_every: 1
 
   gadget:
