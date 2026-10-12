@@ -37,7 +37,8 @@ Measured on synthetic check-down data (``value_train.checkdown_samples``) the
 pre-LN residual trunk beats the plain MLP (held-out MAE 0.0059 vs 0.0072 pot at
 40k samples, 3k steps); the residual head gains ~12% there but costs ~4x train
 time and ~7x inference time, so both ``block="resnet"`` and
-``residual_head=False`` are the defaults.
+``residual_head=False`` are the defaults. At inference on CUDA the head runs as
+one fused Triton kernel (:mod:`.head_kernel`) when Triton is installed.
 
 :class:`ValueNetPredictor` is the inference entry point for the solver.
 """
@@ -53,6 +54,7 @@ import torch
 from torch import nn
 
 from ..env.evaluator import evaluate7_batch
+from . import head_kernel
 from .combos import NUM_CARDS, NUM_COMBOS, blocked_sum, combo_table, incidence
 
 C = NUM_COMBOS
@@ -456,7 +458,10 @@ class RiverValueNet(nn.Module):
         if pct is None:
             raise ValueError("the residual head needs pct")
         valid = bucket < K
-        ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
+        if head_kernel.applies(self.head, dev):  # inference on CUDA: one fused Triton pass
+            ev = head_kernel.fused_head(self.head, ev, r, pct, valid, m, ctx)
+        else:
+            ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
         with torch.autocast(dev.type, enabled=False):
             ev = zero_sum(ev.float(), r, m) * valid[:, None, :]
         if out is not None:
