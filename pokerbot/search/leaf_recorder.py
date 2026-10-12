@@ -75,6 +75,10 @@ class RecordingLeafProvider:
     """A leaf-value provider that forwards to ``inner`` and records leaf states
     into ``store`` on every ``every``-th regret update (``cached=True`` call)."""
 
+    # its host-side call counting and recording cannot run inside a CUDA graph (set
+    # here so that ``__getattr__`` does not forward the inner provider's)
+    graph_safe = False
+
     def __init__(
         self,
         inner: Any,
