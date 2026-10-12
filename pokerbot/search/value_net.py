@@ -202,12 +202,13 @@ class BoardFeatureCache:
     def _add(self, boards: torch.Tensor, keys: list[int]) -> None:
         start, k = len(self), len(keys)
         self._reserve(start + k)
-        step = 8192
+        step = 8192  # also bounds the int64 temporaries: [step, 1326] per chunk
         for s in range(0, k, step):
             e = min(k, s + step)
-            self._rank2[start + s : start + e] = strength_rank2(boards[s:e])
-        nvalid = (self._rank2[start : start + k] >= 0).sum(1)
-        self._den[start : start + k] = (2 * (nvalid - 1)).clamp(min=1).float()
+            rank2 = strength_rank2(boards[s:e])
+            self._rank2[start + s : start + e] = rank2
+            nvalid = (rank2 >= 0).sum(1)
+            self._den[start + s : start + e] = (2 * (nvalid - 1)).clamp(min=1).float()
         self._boards[start : start + k] = boards
         for i, key in enumerate(keys):
             self._index[key] = start + i
