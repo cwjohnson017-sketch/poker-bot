@@ -1646,6 +1646,19 @@ The turn's two-sided exploitability falls by 32 mbb/hand (17%), in every spot.
 The largest gains (52 mbb/hand) come after the big blind's 3/4-pot flop bet was
 called.
 
+**`river_v4rx`: 160k steps** (95 min). The longer schedule still helps a
+little, on every measure:
+
+| | `river_v4rl` (80k) | **`river_v4rx` (160k)** |
+|---|---:|---:|
+| held-out MAE, all / on-policy / on-policy turn | 0.0329 / 0.0307 / 0.0400 | **0.0324 / 0.0302 / 0.0397** |
+| held-out game value, on-policy turn | 0.0142 | **0.0136** |
+| exact turn-search check: MAE / weighted MAE / game value | 0.0233 / 0.0246 / 0.0100 | **0.0232 / 0.0234 / 0.0093** |
+| 18 turn spots at 200 iterations: one-sided / two-sided | 617 / 161 | **614 / 157** |
+
+The steps from 40k to 80k bought 24 / 19 mbb/hand on the spots; doubling
+again buys 3 / 4. Production uses `river_v4rx` (same cost per call).
+
 
 **Worked**
 
