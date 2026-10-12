@@ -37,7 +37,8 @@ Measured on synthetic check-down data (``value_train.checkdown_samples``) the
 pre-LN residual trunk beats the plain MLP (held-out MAE 0.0059 vs 0.0072 pot at
 40k samples, 3k steps); the residual head gains ~12% there but costs ~4x train
 time and ~7x inference time, so both ``block="resnet"`` and
-``residual_head=False`` are the defaults.
+``residual_head=False`` are the defaults. At inference on CUDA the head runs as
+one fused Triton kernel (:mod:`.head_kernel`) when Triton is installed.
 
 :class:`ValueNetPredictor` is the inference entry point for the solver.
 """
@@ -45,6 +46,7 @@ time and ~7x inference time, so both ``block="resnet"`` and
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,7 @@ import torch
 from torch import nn
 
 from ..env.evaluator import evaluate7_batch
+from . import head_kernel
 from .combos import NUM_CARDS, NUM_COMBOS, blocked_sum, combo_table, incidence
 
 C = NUM_COMBOS
@@ -200,12 +203,13 @@ class BoardFeatureCache:
     def _add(self, boards: torch.Tensor, keys: list[int]) -> None:
         start, k = len(self), len(keys)
         self._reserve(start + k)
-        step = 8192
+        step = 8192  # also bounds the int64 temporaries: [step, 1326] per chunk
         for s in range(0, k, step):
             e = min(k, s + step)
-            self._rank2[start + s : start + e] = strength_rank2(boards[s:e])
-        nvalid = (self._rank2[start : start + k] >= 0).sum(1)
-        self._den[start : start + k] = (2 * (nvalid - 1)).clamp(min=1).float()
+            rank2 = strength_rank2(boards[s:e])
+            self._rank2[start + s : start + e] = rank2
+            nvalid = (rank2 >= 0).sum(1)
+            self._den[start + s : start + e] = (2 * (nvalid - 1)).clamp(min=1).float()
         self._boards[start : start + k] = boards
         for i, key in enumerate(keys):
             self._index[key] = start + i
@@ -456,7 +460,10 @@ class RiverValueNet(nn.Module):
         if pct is None:
             raise ValueError("the residual head needs pct")
         valid = bucket < K
-        ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
+        if head_kernel.applies(self.head, dev):  # inference on CUDA: one fused Triton pass
+            ev = head_kernel.fused_head(self.head, ev, r, pct, valid, m, ctx)
+        else:
+            ev = ev + self._head(ev, r, pct, valid, m, ctx, amp)
         with torch.autocast(dev.type, enabled=False):
             ev = zero_sum(ev.float(), r, m) * valid[:, None, :]
         if out is not None:
@@ -555,6 +562,13 @@ class ValueNetPredictor:
         self.cache = cache if cache is not None else BoardFeatureCache(self.device)
         self.buckets = net.cfg.buckets
         self.head_chunk = head_chunk
+        if net.head is not None and self.device.type == "cuda" and head_kernel.triton is None:
+            warnings.warn(
+                "a value net with a residual head on CUDA without Triton runs the PyTorch head, "
+                "about 4x slower per call (11.0 against 2.7 ms for 1,440 rows); install "
+                "triton (triton-windows on Windows)",
+                stacklevel=2,
+            )
 
     @classmethod
     def from_path(cls, path: str | Path, device: torch.device | str = "cpu") -> ValueNetPredictor:

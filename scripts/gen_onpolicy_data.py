@@ -3,14 +3,18 @@
 
 1. **Record.** A value-net search agent (``--search-config``, leaf model
    ``--leaf-net``) plays duplicate deals against the blueprint. In its flop
-   searches a :class:`~pokerbot.search.leaf_recorder.RecordingLeafProvider`
-   stores turn-end leaf states (both current reaches, normalised, (OOP, IP)) on
-   every ``--every``-th regret update, ``--per-call`` leaves at a time. The
-   turn-end states are saved to ``<out>/turn_states.pt`` (for the turn-end net).
+   searches, and in its depth-0 turn searches (``tree.depth_streets_turn: 0``),
+   a :class:`~pokerbot.search.leaf_recorder.RecordingLeafProvider` stores
+   turn-end leaf states (both current reaches, normalised, (OOP, IP), and the
+   search's street) on every ``--every``-th regret update, ``--per-call`` leaves
+   at a time. The turn-end states are saved to ``<out>/turn_states.pt`` (for
+   the turn-end net).
 2. **River states.** ``--rivers-per-state`` random river cards per turn-end
    state (:func:`~pokerbot.search.leaf_recorder.river_states`).
 3. **Solve.** Exactly, with ``BatchRiverSolver`` (``value_data.solve_states``),
-   into river shards of the usual format with ``source`` 3 (on-policy).
+   into river shards of the usual format with ``source`` 3 (on-policy: a flop
+   search's leaves) or 4 (on-policy turn: a depth-0 turn search's leaves, where
+   the river net is the leaf model itself).
 
 python scripts/gen_onpolicy_data.py --blueprint runs/dcfr4_distilled_v2 \
     --leaf-net runs/value_net/turn_v1.pt --deals 150 --out runs/value_net/river_onpolicy
@@ -41,7 +45,8 @@ from pokerbot.search.leaf_recorder import (  # noqa: E402
 )
 from pokerbot.search.value_data import shard_name, solve_states, write_atomic  # noqa: E402
 
-SOURCE_ONPOLICY = 3
+SOURCE_ONPOLICY = 3  # turn-end leaves of flop searches
+SOURCE_ONPOLICY_TURN = 4  # turn-end leaves of depth-0 turn searches
 
 
 def log(msg: str) -> None:
@@ -67,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--blueprint", required=True)
     ap.add_argument("--leaf-net", required=True, help="leaf model of the recording searches")
+    ap.add_argument("--turn-net", help="leaf.turn_net override (turn searches' leaf model)")
     ap.add_argument("--search-config", default="configs/search_value_net.yaml")
     ap.add_argument("--deals", type=int, default=150, help="duplicate deals (2 hands each)")
     ap.add_argument("--chunk", type=int, default=25)
@@ -91,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
     bp = make_blueprint(bp_spec, device=str(dev))
     store = LeafStateStore()
     record = {"every": args.every, "per_call": args.per_call, "min_mass": args.min_mass}
-    sc = search_config(args.search_config, leaf={"net": args.leaf_net}, device=str(dev))
+    leaf = {"net": args.leaf_net, **({"turn_net": args.turn_net} if args.turn_net else {})}
+    sc = search_config(args.search_config, leaf=leaf, device=str(dev))
     agent = RecordingSearchAgent(bp, sc, name="search_rec", store=store, record=record)
     opp = make_agent(bp_spec, device=str(dev))
     turn_path = out / "turn_states.pt"
@@ -103,10 +110,14 @@ def main(argv: list[str] | None = None) -> int:
         deals = min(args.chunk, args.deals - k * args.chunk)
         run_duplicate_match(agent, opp, cfg, deals, seed=args.seed * 1000 + k, engine=engine)
         flop = sum(1 for s in agent.stats if s.get("street") == 1 and not s.get("fallback"))
-        write_atomic(turn_path, store.tensors())
+        turn_n = sum(1 for s in agent.stats if s.get("street") == 2 and not s.get("fallback"))
+        rec = store.tensors()
+        write_atomic(turn_path, rec)
         log(
-            f"# record chunk {k + 1}/{n_chunks}: {len(store)} turn-end states from {flop} "
-            f"flop searches, {time.time() - t0:.0f}s"
+            f"# record chunk {k + 1}/{n_chunks}: {len(store)} turn-end states "
+            f"({int((rec['street'] == 1).sum())} from {flop} flop searches, "
+            f"{int((rec['street'] == 2).sum())} from {turn_n} turn searches), "
+            f"{time.time() - t0:.0f}s"
         )
     turn = store.tensors()
 
@@ -116,14 +127,21 @@ def main(argv: list[str] | None = None) -> int:
     n = int(states["c"].shape[0])
     perm = torch.randperm(n, generator=g)
     states = {k: v[perm] for k, v in states.items()}
-    states["source"] = torch.full((n,), SOURCE_ONPOLICY, dtype=torch.uint8)
-    log(f"# {n} river states from {len(turn['c'])} turn-end states")
+    street = states.pop("street")
+    states["source"] = torch.where(street == 2, SOURCE_ONPOLICY_TURN, SOURCE_ONPOLICY).to(
+        torch.uint8
+    )
+    log(
+        f"# {n} river states from {len(turn['c'])} turn-end states "
+        f"({int((street == 2).sum())} below turn searches)"
+    )
 
     # 3. solve, one shard at a time
     t1 = time.time()
     meta = {
         "kind": "river",
-        "source": "on-policy: turn-end leaves of value-net flop searches (source 3)",
+        "source": "on-policy: turn-end leaves of value-net flop searches (source 3) and "
+        "depth-0 turn searches (source 4)",
         "blueprint": args.blueprint,
         "leaf_net": args.leaf_net,
         "search_config": args.search_config,

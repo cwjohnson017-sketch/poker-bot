@@ -45,7 +45,7 @@ from pokerbot.search.value_leaf import river_average  # noqa: E402
 from pokerbot.search.value_ranges import reachable_c  # noqa: E402
 
 C = NUM_COMBOS
-SOURCES = {0: "self-play", 1: "perturbed", 2: "random", 3: "on-policy"}
+SOURCES = {0: "self-play", 1: "perturbed", 2: "random", 3: "on-policy", 4: "on-policy turn"}
 POT_BINS = (100, 250, 500, 1000, 2000, 4000, 10001)
 
 
@@ -124,7 +124,9 @@ def summarise(st: dict, sel: torch.Tensor) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--river-net", required=True)
+    ap.add_argument(
+        "--river-net", action="append", required=True, help="river net (repeat to compare)"
+    )
     ap.add_argument(
         "--turn-net", action="append", default=[], help="turn-end net (repeat to compare)"
     )
@@ -133,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
         "--states-file",
         help="turn-end states to check instead of fresh ones (e.g. the on-policy "
         "turn_states.pt of scripts/gen_onpolicy_data.py; source 3)",
+    )
+    ap.add_argument(
+        "--street",
+        type=int,
+        choices=(1, 2),
+        help="with --states-file: only the leaves of flop (1) or depth-0 turn (2) searches",
     )
     ap.add_argument("--states", type=int, default=320)
     ap.add_argument("--mix", default="0.5,0.25,0.25")
@@ -154,14 +162,18 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [args.seed, args.seed + 1, args.seed + 2]
     if args.states_file:
         st = torch.load(args.states_file, weights_only=True)
+        street = st.get("street", torch.ones(int(st["c"].shape[0]), dtype=torch.uint8))
+        rows = torch.arange(int(st["c"].shape[0]))
+        if args.street:
+            rows = rows[street == args.street]
         g = torch.Generator().manual_seed(args.seed)
-        pick = torch.randperm(int(st["c"].shape[0]), generator=g)[: args.states]
+        pick = rows[torch.randperm(len(rows), generator=g)[: args.states]]
         states = {
             "boards": st["boards"][pick].long(),
             "c": st["c"][pick].long(),
             "stack": st["stack"][pick].long(),
             "ranges": st["ranges"][pick].float(),
-            "source": torch.full((len(pick),), 3, dtype=torch.uint8),
+            "source": torch.where(street[pick] == 2, 4, 3).to(torch.uint8),
         }
     else:
         states = make_turn_states(bp, cfg, args.states, mix, seeds, dev)
@@ -181,9 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     mask = mask.float()
 
     preds = {}
-    river = load_leaf_predictor(args.river_net, dev)
-    rv = river_average(river, states["boards"], c_used, states["stack"], ranges.transpose(0, 1))
-    preds["river net x 44 rivers"] = to_ev(rv.transpose(0, 1), ranges, c_used)
+    for path in args.river_net:
+        river = load_leaf_predictor(path, dev)
+        rv = river_average(river, states["boards"], c_used, states["stack"], ranges.transpose(0, 1))
+        name = "river net" if len(args.river_net) == 1 else f"river net {Path(path).stem}"
+        preds[f"{name} x 44 rivers"] = to_ev(rv.transpose(0, 1), ranges, c_used)
+        del river
     for path in args.turn_net:
         turn = load_leaf_predictor(path, dev)
         name = "turn-end net" if len(args.turn_net) == 1 else f"turn-end net {Path(path).stem}"

@@ -87,6 +87,7 @@ from .combos import (
 )
 from .showdown import ShowdownTables
 from .tree import VALUE, SubgameTree
+from .value_net import ValueNetPredictor
 
 C = NUM_COMBOS
 TURN_LEN = 4
@@ -297,6 +298,15 @@ class RiverAverage:
     @property
     def num_rows(self) -> int:
         return self.num_leaves * self.cards_per_leaf
+
+    @property
+    def graph_safe(self) -> bool:
+        """Whether the solver may capture regret updates in a CUDA graph: the net
+        runs on every update (``every == 1``, no host-side call counting) and is a
+        :class:`~.value_net.ValueNetPredictor` (board-cache ids, then no host
+        syncs). The first call (warm-up, outside the graph) runs the
+        zero-output check."""
+        return self.every == 1 and isinstance(self.predictor, ValueNetPredictor)
 
     def reset_cache(self) -> None:
         self._calls = [0, 0]
@@ -734,6 +744,11 @@ class TurnEndLeafEvaluator:
     @property
     def num_rows(self) -> int:
         return self.num_leaves
+
+    @property
+    def graph_safe(self) -> bool:
+        """As :attr:`RiverAverage.graph_safe`."""
+        return self.every == 1 and isinstance(self.predictor, ValueNetPredictor)
 
     def reset_cache(self) -> None:
         self._calls = [0, 0]

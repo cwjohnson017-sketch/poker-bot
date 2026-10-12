@@ -34,6 +34,22 @@ def _flop_tree():
     return tree, ranges / ranges.sum(1, keepdim=True)
 
 
+def _turn_tree():
+    """A depth-0 turn tree: turn betting only, value leaves at the end of the turn."""
+    engine = get_engine()
+    cfg = engine.GameConfig(num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100)
+    s = make_state(engine, cfg, 0, BOARD, [])
+    s.apply(engine.Action.raise_to(250))
+    s.apply(engine.Action.check_call())
+    s.apply(engine.Action.check_call())  # the flop checks through
+    s.apply(engine.Action.check_call())
+    tc = TreeConfig(spec=SPEC, depth_streets=0, max_nodes=3000, leaf_mode="value_net")
+    tree = build_tree(cfg, s.button, s.board, s.history, tc)
+    g = torch.Generator().manual_seed(3)
+    ranges = torch.rand(2, NUM_COMBOS, generator=g) * valid_mask(s.board)
+    return tree, ranges / ranges.sum(1, keepdim=True)
+
+
 def test_recording_does_not_change_the_solve_and_stores_leaf_states():
     tree, ranges = _flop_tree()
     plain = RangeSolver(tree, ranges, value_leaves=ValueLeafEvaluator(tree, ShowdownOracle()))
@@ -50,6 +66,7 @@ def test_recording_does_not_change_the_solve_and_stores_leaf_states():
     assert rec.num_leaves == int((tree.kind == VALUE).sum())  # passes through
     t = store.tensors()
     assert t["boards"].shape[1] == 4 and t["ranges"].shape[1:] == (2, NUM_COMBOS)
+    assert bool((t["street"] == 1).all())  # a flop search's leaves
     sums = t["ranges"].float().sum(-1)
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-2)
     leaf_boards = {tuple(tree.boards[int(b)]) for b in tree.board_id[tree.kind == VALUE]}
@@ -60,6 +77,20 @@ def test_recording_does_not_change_the_solve_and_stores_leaf_states():
     # ranges never hold combos that hit the leaf board
     for b, r in zip(t["boards"].tolist(), t["ranges"].float(), strict=True):
         assert float((r * ~valid_mask(b)).abs().sum()) == 0
+
+
+def test_turn_search_leaves_are_tagged_street_2():
+    tree, ranges = _turn_tree()
+    assert tree.root_street == 2 and int((tree.kind == VALUE).sum()) > 0
+    store = LeafStateStore()
+    rec = RecordingLeafProvider(
+        ValueLeafEvaluator(tree, ShowdownOracle()), tree, store, every=1, per_call=4
+    )
+    RangeSolver(tree, ranges, value_leaves=rec).solve(3)
+    t = store.tensors()
+    assert len(store) > 0 and t["boards"].shape[1] == 4
+    assert bool((t["street"] == 2).all())
+    assert LeafStateStore().tensors()["street"].shape == (0,)
 
 
 def test_recorded_ranges_are_the_leaf_reaches_in_oop_ip_order():
@@ -90,7 +121,10 @@ def test_river_states_mask_and_renormalise():
         r[i] *= valid_mask(b4[i].tolist())
     turn = {"boards": b4, "c": torch.tensor([250, 750]), "stack": torch.tensor([9750, 9250])}
     turn["ranges"] = r / r.sum(-1, keepdim=True)
+    assert "street" not in river_states(turn, rivers_per_state=1)
+    turn["street"] = torch.tensor([1, 2], dtype=torch.uint8)
     out = river_states(turn, rivers_per_state=3, generator=g)
+    assert out["street"].tolist() == [1] * 3 + [2] * 3
     assert out["boards"].shape == (6, 5)
     for i, b in enumerate(out["boards"].tolist()):
         assert len(set(b)) == 5 and b[:4] == b4[i // 3].tolist()

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from pokerbot.search import head_kernel
 from pokerbot.search.combos import blocked_sum, combo_index
 from pokerbot.search.showdown import combo_strengths, naive_showdown
 from pokerbot.search.value_net import (
@@ -215,6 +216,48 @@ def test_checkpoint_round_trip(tmp_path):
         a = ValueNetPredictor(net, "cpu").predict(boards, r, c, stack)
         b = ValueNetPredictor.from_path(path, "cpu").predict(boards, r, c, stack)
         assert torch.equal(a, b)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or head_kernel.triton is None, reason="needs CUDA and Triton"
+)
+def test_fused_head_matches_pytorch_head():
+    dev = torch.device("cuda")
+    boards = _random_boards(12, 20)
+    f = {k: v.to(dev) for k, v in river_board_features(boards, 64).items()}
+    r = normalise_ranges(_random_ranges(boards, 21).to(dev), f["valid"])
+    c = torch.arange(1, 13, device=dev) * 300
+    stack = 10000 - c
+    args = (r, f["bucket"], f["onehot"], c, stack)
+    for act, H in (("gelu", 32), ("relu", 16)):
+        cfg = ValueNetConfig(
+            buckets=64, width=64, layers=2, residual_head=True, head_width=H, activation=act
+        )
+        net = _noisy_net(cfg).to(dev)
+        with torch.no_grad():
+            assert head_kernel.applies(net.head, dev)
+            fused = net(*args, pct=f["pct"])
+            head_kernel.ENABLED = False
+            try:
+                ref = net(*args, pct=f["pct"])
+            finally:
+                head_kernel.ENABLED = True
+        # fp32 throughout (the fused head's second layer in TF32)
+        d = (fused - ref).abs()
+        assert ref.abs().mean() > 0.01
+        assert float(d.max()) < 1e-3 * float(ref.abs().max()), (act, float(d.max()))
+        invalid = ~f["valid"][:, None, :].expand_as(fused)
+        assert bool((fused[invalid] == 0).all())
+        w = r * opponent_mass(r, f["valid"])
+        assert (w * fused).sum((1, 2)).abs().max() < 1e-5 * fused.abs().max()  # zero-sum
+    with torch.enable_grad():
+        assert not head_kernel.applies(net.head, dev)  # training: the PyTorch head
+    assert not head_kernel.applies(net.head, torch.device("cpu"))
+    narrow = ValueNetConfig(buckets=8, width=16, layers=2, residual_head=True, head_width=8)
+    small = _noisy_net(narrow)
+    with torch.no_grad():
+        assert not head_kernel.applies(small.head, dev)  # too narrow for tl.dot
 
 
 # --------------------------------------------------------------------------- learning

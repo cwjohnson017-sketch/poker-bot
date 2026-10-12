@@ -56,6 +56,7 @@ import itertools
 import math
 import random
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,6 +84,12 @@ class SolverConfig:
     chunk_rows: int = 4096
     dtype: str = "float32"
     seed: int = 0
+    # replay each DCFR iteration as a CUDA graph (RangeSolver.solve) when the tree's
+    # terminals allow it: one launch instead of hundreds of small kernels per iteration.
+    # Depth-0 turn searches (about 180 nodes) run 74% more iterations in 2 s; 20k-node
+    # flop searches, GPU-bound, 3% more in 4 s (docs/value_net_eval.md, Round 4)
+    cuda_graph: bool = True
+    graph_max_nodes: int = 32768  # larger trees solve eagerly
 
 
 def runouts_for(
@@ -310,6 +317,8 @@ class RangeSolver:
         self.t = 0
         self.iterations_done = 0
         self.solve_time = 0.0
+        self._dc: torch.Tensor | None = None  # DCFR factors (a, b, g) while capturing a graph
+        self.graph_iterations = 0  # iterations replayed from a CUDA graph
 
     def set_gadget(self, gadget: Any) -> None:
         """Attach the safe-resolving gadget (or ``None``) before solving, e.g. once
@@ -424,19 +433,27 @@ class RangeSolver:
 
     # -- CFR ----------------------------------------------------------------
 
+    def _dcfr_factors(self, t: int) -> tuple[float, float, float]:
+        """DCFR's positive-regret, negative-regret and strategy-sum factors after
+        iteration ``t - 1``."""
+        cfg = self.cfg
+        tp = t - 1
+        a = tp**cfg.alpha / (tp**cfg.alpha + 1)
+        b = tp**cfg.beta / (tp**cfg.beta + 1)
+        return a, b, (tp / t) ** cfg.gamma
+
     def _discount(self, i: int) -> None:
         t = self.t
         if t < 2:
             return
         sl = self._slice(i)
-        cfg = self.cfg
-        if cfg.algorithm == "dcfr":
-            tp = t - 1
-            a = tp**cfg.alpha / (tp**cfg.alpha + 1)
-            b = tp**cfg.beta / (tp**cfg.beta + 1)
+        if self.cfg.algorithm == "dcfr":
+            # inside a CUDA graph the factors are device scalars, set before each replay
+            dc = self._dc
+            a, b, g = (dc[0], dc[1], dc[2]) if dc is not None else self._dcfr_factors(t)
             R = self.regret[sl]
             R.mul_(torch.where(R > 0, a, b))
-            self.strat_sum[sl].mul_((tp / t) ** cfg.gamma)
+            self.strat_sum[sl].mul_(g)
             if self.gadget is not None and i == self.gadget.player:
                 self.g_regret.mul_(torch.where(self.g_regret > 0, a, b))
 
@@ -473,32 +490,123 @@ class RangeSolver:
             self.g_regret.clamp_(min=0)
         pos = self.g_regret.clamp(min=0)
         s = pos.sum(0)
-        self.g_enter = torch.where(s > 0, pos[1] / s.clamp(min=1e-30), torch.full_like(s, 0.5))
+        # in place: a CUDA graph reads g_enter's storage on every replay
+        self.g_enter.copy_(torch.where(s > 0, pos[1] / s.clamp(min=1e-30), torch.full_like(s, 0.5)))
 
     def _sync(self) -> None:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
+    # -- CUDA graphs ----------------------------------------------------------
+
+    def graph_ok(self) -> bool:
+        """Whether :meth:`solve` may replay iterations from a CUDA graph: CUDA,
+        ``cfg.cuda_graph``, at most ``cfg.graph_max_nodes`` nodes, DCFR (CFR+
+        weights the strategy sum by ``t`` on the host), no rollout leaves, and a
+        value-leaf provider, if the tree has ``VALUE`` nodes, that declares
+        ``graph_safe`` (no host syncs or host-side state in its regret-update
+        calls)."""
+        cfg = self.cfg
+        if not (cfg.cuda_graph and self.device.type == "cuda" and cfg.algorithm == "dcfr"):
+            return False
+        if self.tree.num_nodes > cfg.graph_max_nodes:
+            return False
+        term = self.terminals
+        if not isinstance(term, TerminalEvaluator) or len(term.cont_ids):
+            return False
+        return len(term.value_ids) == 0 or getattr(term.value_leaves, "graph_safe", False) is True
+
+    def _dcfr_factors_dev(self, t: torch.Tensor) -> torch.Tensor:
+        """:meth:`_dcfr_factors` on the device from a float64 scalar ``t``, rounded
+        as the eager path uses them: ``torch.where(R > 0, a, b)`` on two Python
+        floats makes the regret factors the default dtype (float32), while the
+        strategy-sum factor multiplies in the solver's dtype. A replay is then the
+        same computation as an eager iteration, in float64 solves too."""
+        cfg = self.cfg
+        tp = t - 1
+        pa, pb = tp**cfg.alpha, tp**cfg.beta
+        ab = torch.stack([pa / (pa + 1), pb / (pb + 1)]).to(torch.get_default_dtype())
+        return torch.cat([ab.to(self.dtype), ((tp / t) ** cfg.gamma).to(self.dtype)[None]])
+
+    def _capture(self) -> tuple[Any, dict]:
+        """Run the current iteration eagerly on a side stream (lazy library state
+        is set up off the capture), then capture one iteration (both players'
+        updates) as a CUDA graph on that stream. The graph reads ``t`` from
+        ``graph_t``, which :meth:`solve` sets before each replay. Returns the
+        graph (``None`` if capture failed: the solve continues eagerly) and the
+        value-leaf provider's counter increments per iteration."""
+        dev = self.device
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side):
+            self._update(0)
+            self._update(1)
+        torch.cuda.current_stream(dev).wait_stream(side)
+        vl = self.terminals.value_leaves
+        keys = [k for k in ("net_calls", "net_rows") if isinstance(getattr(vl, k, None), int)]
+        before = {k: getattr(vl, k) for k in keys}
+        # kept on the solver: the graph reads and writes these storages on every replay
+        self.graph_t = torch.zeros((), dtype=torch.float64, device=dev)
+        self.graph_dc = torch.zeros(3, dtype=self.dtype, device=dev)
+        graph = torch.cuda.CUDAGraph()
+        self._dc = self.graph_dc
+        try:
+            with torch.cuda.graph(graph, stream=side, capture_error_mode="thread_local"):
+                self.graph_dc.copy_(self._dcfr_factors_dev(self.graph_t))
+                self._update(0)
+                self._update(1)
+        except Exception as e:  # an op that cannot be captured: no graph for this solver
+            warnings.warn(f"CUDA graph capture failed, solving eagerly: {e!r}", stacklevel=3)
+            self._graph_failed = True
+            graph = None
+        finally:
+            self._dc = None
+        delta = {k: getattr(vl, k) - before[k] for k in keys}
+        for k in keys:  # capture runs no work; replays add it back in solve()
+            setattr(vl, k, before[k])
+        return graph, delta
+
     @torch.no_grad()
     def solve(self, iterations: int | None = None, time_budget: float | None = None) -> dict:
+        """Run DCFR / CFR+ for ``iterations`` (or until ``time_budget`` seconds).
+        On CUDA, when :meth:`graph_ok`, iterations from the third on are replayed
+        from a CUDA graph captured in this call (freed when it returns): the same
+        kernels, without launching hundreds of small ones per iteration."""
         iterations = self.cfg.iterations if iterations is None else iterations
         budget = self.cfg.time_budget if time_budget is None else time_budget
         start = time.perf_counter()
         n = 0
+        graph, delta, replays = None, {}, 0
+        use_graph = iterations >= 4 and not getattr(self, "_graph_failed", False)
+        use_graph = use_graph and self.graph_ok()
         while n < iterations:
             self.t += 1
-            self._update(0)
-            self._update(1)
+            if graph is not None:
+                self.graph_t.fill_(float(self.t))
+                graph.replay()
+                replays += 1
+            elif use_graph and self.t >= 3:
+                graph, delta = self._capture()  # runs this iteration eagerly
+                use_graph = False
+            else:
+                self._update(0)
+                self._update(1)
             n += 1
             if budget is not None:
                 self._sync()
                 if time.perf_counter() - start >= budget:
                     break
         self._sync()
+        if graph is not None:
+            vl = self.terminals.value_leaves
+            for k, d in delta.items():
+                setattr(vl, k, getattr(vl, k) + d * replays)
+            del graph
         dt = time.perf_counter() - start
         self.iterations_done += n
+        self.graph_iterations += replays
         self.solve_time += dt
-        return {"iterations": n, "seconds": dt}
+        return {"iterations": n, "seconds": dt, "graph_iterations": replays}
 
     # -- results ------------------------------------------------------------
 

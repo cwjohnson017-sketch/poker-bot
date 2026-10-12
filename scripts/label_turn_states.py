@@ -75,7 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--states", help="a torch.save of turn-end states")
     src.add_argument("--shards", help="a turn-end shard directory to relabel")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--source", type=int, default=3)
+    ap.add_argument(
+        "--source", type=int, default=3, help="source of --states (4 where they carry street 2)"
+    )
     ap.add_argument("--shard-size", type=int, default=4096)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args(argv)
@@ -85,12 +87,15 @@ def main(argv: list[str] | None = None) -> int:
         return relabel_shards(args, dev, t0)
     st = torch.load(args.states, weights_only=True)
     n = int(st["c"].shape[0])
+    source = torch.full((n,), args.source, dtype=torch.uint8)
+    if "street" in st:  # gen_onpolicy_data: leaves of depth-0 turn searches are source 4
+        source[st["street"] == 2] = 4
     states = {
         "boards": st["boards"].long(),
         "c": st["c"].long(),
         "stack": st["stack"].long(),
         "ranges": st["ranges"].float(),
-        "source": torch.full((n,), args.source, dtype=torch.uint8),
+        "source": source,
     }
     river = load_leaf_predictor(args.river_net, dev)
     out = Path(args.out)
