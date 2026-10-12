@@ -46,6 +46,7 @@ one fused Triton kernel (:mod:`.head_kernel`) when Triton is installed.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -561,6 +562,13 @@ class ValueNetPredictor:
         self.cache = cache if cache is not None else BoardFeatureCache(self.device)
         self.buckets = net.cfg.buckets
         self.head_chunk = head_chunk
+        if net.head is not None and self.device.type == "cuda" and head_kernel.triton is None:
+            warnings.warn(
+                "a value net with a residual head on CUDA without Triton runs the PyTorch head, "
+                "about 4x slower per call (11.0 against 2.7 ms for 1,440 rows); install "
+                "triton (triton-windows on Windows)",
+                stacklevel=2,
+            )
 
     @classmethod
     def from_path(cls, path: str | Path, device: torch.device | str = "cpu") -> ValueNetPredictor:

@@ -218,6 +218,7 @@ def test_checkpoint_round_trip(tmp_path):
         assert torch.equal(a, b)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(
     not torch.cuda.is_available() or head_kernel.triton is None, reason="needs CUDA and Triton"
 )
