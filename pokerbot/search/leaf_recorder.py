@@ -11,8 +11,9 @@ exactly these).
 (:class:`~.value_leaf.ValueLeafEvaluator`, :class:`~.value_leaf.TurnEndLeafEvaluator`)
 and, on every ``every``-th regret update, stores up to ``per_call`` randomly
 chosen turn-end leaves whose reach is non-negligible for both players: the
-4-card board, ``c``, the chips behind and both ranges, normalised, in
-``(OOP, IP)`` order. :func:`river_states` turns such turn-end states into
+4-card board, ``c``, the chips behind, both ranges, normalised, in ``(OOP,
+IP)`` order, and the street the search was rooted on (1: a flop search's
+leaves, 2: a depth-0 turn search's). :func:`river_states` turns such turn-end states into
 river-root states (one or more random river cards each) for exact solving.
 """
 
@@ -29,23 +30,34 @@ C = NUM_COMBOS
 
 
 class LeafStateStore:
-    """Turn-end leaf states on the CPU: ``boards [n, 4]``, ``c``, ``stack`` and
-    ``ranges [n, 2, 1326]`` (float16, normalised, ``(OOP, IP)``)."""
+    """Turn-end leaf states on the CPU: ``boards [n, 4]``, ``c``, ``stack``,
+    ``ranges [n, 2, 1326]`` (float16, normalised, ``(OOP, IP)``) and ``street``
+    (uint8: the root street of the search that queried the leaf)."""
+
+    KEYS = ("boards", "c", "stack", "ranges", "street")
 
     def __init__(self) -> None:
-        self._parts: dict[str, list[torch.Tensor]] = {k: [] for k in ("boards", "c", "stack")}
-        self._parts["ranges"] = []
+        self._parts: dict[str, list[torch.Tensor]] = {k: [] for k in self.KEYS}
         self.n = 0
 
     def __len__(self) -> int:
         return self.n
 
-    def add(self, boards: torch.Tensor, c: torch.Tensor, stack: torch.Tensor, ranges: torch.Tensor):
+    def add(
+        self,
+        boards: torch.Tensor,
+        c: torch.Tensor,
+        stack: torch.Tensor,
+        ranges: torch.Tensor,
+        street: int = 1,
+    ):
+        n = int(boards.shape[0])
         self._parts["boards"].append(boards.to("cpu", torch.uint8))
         self._parts["c"].append(c.to("cpu", torch.int32))
         self._parts["stack"].append(stack.to("cpu", torch.int32))
         self._parts["ranges"].append(ranges.to("cpu", torch.float16))
-        self.n += int(boards.shape[0])
+        self._parts["street"].append(torch.full((n,), int(street), dtype=torch.uint8))
+        self.n += n
 
     def tensors(self) -> dict[str, torch.Tensor]:
         if self.n == 0:
@@ -54,6 +66,7 @@ class LeafStateStore:
                 "c": torch.zeros(0, dtype=torch.int32),
                 "stack": torch.zeros(0, dtype=torch.int32),
                 "ranges": torch.zeros(0, 2, C, dtype=torch.float16),
+                "street": torch.zeros(0, dtype=torch.uint8),
             }
         return {k: torch.cat(v) for k, v in self._parts.items()}
 
@@ -94,6 +107,7 @@ class RecordingLeafProvider:
         if len(buttons) > 1:
             raise ValueError("value leaves of one tree must share the button")
         self.oop = 1 - buttons.pop() if buttons else 1
+        self.street = int(getattr(tree, "root_street", 1))
         self.calls = 0
         self.recorded = 0
 
@@ -119,7 +133,9 @@ class RecordingLeafProvider:
         pick = ok[torch.randperm(ok.numel(), generator=self.gen)[: self.per_call]]
         dev_pick = pick.to(r.device)
         sel = r[:, dev_pick] / mass[:, dev_pick, None]
-        self.store.add(self.boards4[pick], self.c[pick], self.stack[pick], sel.transpose(0, 1))
+        self.store.add(
+            self.boards4[pick], self.c[pick], self.stack[pick], sel.transpose(0, 1), self.street
+        )
         self.recorded += int(pick.numel())
 
 
@@ -132,7 +148,8 @@ def river_states(
     """River-root states from turn-end states: ``rivers_per_state`` distinct
     random river cards per state; ranges masked by the card and renormalised.
     States where a player's masked range is (nearly) empty are dropped. Returns
-    ``boards [m, 5]`` long, ``c``, ``stack`` long, ``ranges [m, 2, C]`` float."""
+    ``boards [m, 5]`` long, ``c``, ``stack`` long, ``ranges [m, 2, C]`` float,
+    and ``street`` (long) when ``turn`` has it."""
     b4 = turn["boards"].long()
     n = b4.shape[0]
     k = max(1, int(rivers_per_state))
@@ -156,12 +173,15 @@ def river_states(
     mass = r.sum(-1)  # [m, 2]
     keep = (mass > min_mass).all(1)
     r = r / mass.clamp(min=1e-30)[..., None]
-    return {
+    out = {
         "boards": boards[keep],
         "c": turn["c"].long()[rows][keep],
         "stack": turn["stack"].long()[rows][keep],
         "ranges": r[keep],
     }
+    if "street" in turn:
+        out["street"] = turn["street"].long()[rows][keep]
+    return out
 
 
 __all__ = ["LeafStateStore", "RecordingLeafProvider", "river_states"]

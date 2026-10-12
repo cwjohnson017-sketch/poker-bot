@@ -134,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
         help="turn-end states to check instead of fresh ones (e.g. the on-policy "
         "turn_states.pt of scripts/gen_onpolicy_data.py; source 3)",
     )
+    ap.add_argument(
+        "--street",
+        type=int,
+        choices=(1, 2),
+        help="with --states-file: only the leaves of flop (1) or depth-0 turn (2) searches",
+    )
     ap.add_argument("--states", type=int, default=320)
     ap.add_argument("--mix", default="0.5,0.25,0.25")
     ap.add_argument("--iterations", type=int, default=400)
@@ -154,14 +160,18 @@ def main(argv: list[str] | None = None) -> int:
     seeds = [args.seed, args.seed + 1, args.seed + 2]
     if args.states_file:
         st = torch.load(args.states_file, weights_only=True)
+        street = st.get("street", torch.ones(int(st["c"].shape[0]), dtype=torch.uint8))
+        rows = torch.arange(int(st["c"].shape[0]))
+        if args.street:
+            rows = rows[street == args.street]
         g = torch.Generator().manual_seed(args.seed)
-        pick = torch.randperm(int(st["c"].shape[0]), generator=g)[: args.states]
+        pick = rows[torch.randperm(len(rows), generator=g)[: args.states]]
         states = {
             "boards": st["boards"][pick].long(),
             "c": st["c"][pick].long(),
             "stack": st["stack"][pick].long(),
             "ranges": st["ranges"][pick].float(),
-            "source": torch.full((len(pick),), 3, dtype=torch.uint8),
+            "source": torch.where(street[pick] == 2, 4, 3).to(torch.uint8),
         }
     else:
         states = make_turn_states(bp, cfg, args.states, mix, seeds, dev)
