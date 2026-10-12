@@ -110,6 +110,23 @@ the whole flop abstraction in about 200 nodes, and about 3x the iterations.
     training ranges and the flop search's ranges.
   * A flop-root net trained on turn-start leaves would add another lossy step.
 
+### After stage 1 (2026-10-11/12): the turn and the flop instead
+
+Stage 3 lists a new Deep CFR blueprint first. But the reasoning above says a
+blueprint helps only through preflop, and dcfr3 -> dcfr4 did not win. The turn
+was the largest measured leak, so the work went there. Details are in
+`docs/value_net_eval.md`, Round 4.
+
+| | Round 3 production | Round 4 production |
+|---|---|---|
+| turn leaf model | `river_v3` | `river_v4rx` (residual head, fused Triton kernel, third on-policy round with the turn searches' leaves, 160k steps) |
+| flop leaf model | `turn_v4e` | `turn_v5x` (12 layers, 240k steps, `river_v4rx` targets) |
+| solver | eager | CUDA-graph replay (turn: 318 instead of 183 iterations in 2 s) |
+| 18 turn spots, two-sided | 189 | **148** |
+| 12 flop spots, two-sided | 95 | **91** |
+
+Stages 2 and 3 are unchanged as options. Preflop is still unmeasured.
+
 ## Stage 2: flop-root net and preflop (AWS-scale data)
 
 * **Flop-root data.** Flop-root subgames (both ranges at the start of the flop)

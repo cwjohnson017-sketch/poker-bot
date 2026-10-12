@@ -5,6 +5,39 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
 
 ## Summary
 
+**Round 4 (2026-10-10/12; details in "Round 4" below):**
+
+* **Stage 1 of `docs/plan_round4.md` failed its gate.**
+  * A turn-start net with 4x the data does not make depth-0 flop decisions
+    any better: about 100 mbb/hand behind depth-1 on 3 spots, as before.
+  * So the chain of value nets back to preflop stops there.
+* **The turn: two-sided exploitability 189 -> 148 mbb/hand (-22%)** on 18 turn
+  spots at 2 s, from three changes:
+  * **A fused Triton kernel for the residual head.**
+    * `river_v3r`'s per-combo head ran 11.0 -> 2.7 ms per call, in fp32
+      instead of bf16.
+    * The residual-head river net now runs about as many iterations as
+      `river_v3`.
+    * Triton on Windows: `triton-windows`, the `gpu` extra.
+  * **A third on-policy round that records the turn searches' leaves.**
+    * These are the hardest states the river net sees, and no earlier data
+      came from them.
+    * `river_v4rx` (160k steps on 1.38M samples) is 22% more accurate than
+      `river_v3` there, against exact solves.
+    * Production turn search: 645 / 189 -> 612 / 157 (one- / two-sided),
+      better in all 18 spots.
+  * **CUDA-graph replay of DCFR iterations.**
+    * Turn searches run 318 iterations in 2 s instead of 183: 157 -> 148.
+* **The flop: two-sided 95 -> 91 mbb/hand** on 12 spots.
+  * Production uses `turn_v5x`, a 12-layer turn-end net trained 240k steps
+    on `river_v4rx` targets: 6-11% lower exact leaf error than `turn_v4e`.
+  * The same 8-layer recipe on the better targets gained nothing: the
+    turn-end net's own fit is the limit.
+* **Production config:**
+  * `leaf.net: turn_v5x.pt`;
+  * `leaf.turn_net: river_v4rx.pt`;
+  * `solver.cuda_graph` on by default.
+
 **Round 3 (2026-10-08/09; details in "Round 3" below):**
 
 * **Production search changes:**
@@ -1712,6 +1745,26 @@ mbb/hand):
 `turn_v5x` is better in 11 of 12 spots on both measures. A 4% gain fits Round
 3's 2-3% for an 11% better leaf, and production now uses
 `leaf.net: runs/value_net/turn_v5x.pt`.
+
+### 7. Smoke match of the Round 4 production search
+
+The final config (`runs/r4/match_smoke_search_config_used.yaml`) played its
+blueprint: 500 duplicate deals (1,000 hands), new seeds 3000-3009, 1.1 h
+(`runs/r4/match_smoke.json`).
+
+| street | decisions | fallbacks | started from the cache | mean time | max | mean DCFR iterations (Round 3 smoke) |
+|---|---:|---:|---:|---:|---:|---:|
+| flop | 696 | 0 | - (unsafe first decisions) | 4.10 s | 4.19 s | 83 (79) |
+| turn | 428 | 0 | 428 | 2.01 s | 2.04 s | 376 (208) |
+| river | 309 | 0 | 309 | 0.84 s | 0.97 s | 1000, the cap (167) |
+
+* **The new pieces work in play:** no fallback; every turn and river decision
+  started from the cache; CUDA graphs on all three streets.
+* **The river now reaches `solver.iterations` (1000) in 0.84 s:** with graphs,
+  its 1 s budget is no longer the limit.
+* **Win rate:** +748 mbb/hand luck-adjusted, 95% CI [+220, +1246]; raw +1078,
+  CI [+461, +1696]. These seeds are new, and 1,000 hands cannot separate this
+  from Round 3's +255 over 10,000 hands.
 
 ### 6. CUDA-graph replay of DCFR iterations
 
