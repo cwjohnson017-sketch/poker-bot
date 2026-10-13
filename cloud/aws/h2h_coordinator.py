@@ -58,6 +58,9 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "LogLevel=ERROR",
 ]  # fmt: skip
 DEAD_STATES = {"shutting-down", "terminated", "stopping", "stopped"}
+# launch errors that hold for every zone of a region (others, such as no capacity or an
+# instance type a zone lacks, move on to the next zone)
+REGION_STOP_ERRORS = ("Limit", "MaxSpotInstanceCountExceeded", "Unauthorized", "Expired", "Auth")
 
 
 def msys_path(p: Path) -> str:
@@ -340,8 +343,8 @@ class Coordinator:
                 return
             reason = "no capacity" if "InsufficientInstanceCapacity" in out else out[-300:]
             log(f"{region}/{az}: spot launch failed: {reason}")
-            if "InsufficientInstanceCapacity" not in out:
-                return  # quota, price or a config error: no point trying other zones now
+            if any(x in out for x in REGION_STOP_ERRORS):
+                return  # quota or credentials: no point trying other zones now
 
     def refresh_instances(self) -> None:
         by_region: dict[str, list[Worker]] = {}
