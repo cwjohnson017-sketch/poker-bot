@@ -13,6 +13,10 @@ how long.
 python scripts/match_search.py --config configs/match_search_vn.yaml \
     --a search:neural:runs/dcfr4_distilled_v2 --b neural:runs/dcfr4_distilled_v2 \
     --deals 1000 --chunk 50 --out runs/vn_match/match.json
+
+Search against search: both agents ``search:...``, each with its own config, e.g.
+``--b search:neural:runs/dcfr4_distilled_v2 --b-search-config
+configs/search_value_net_r3.yaml``; B's per-decision stats go to ``b_search_stats``.
 """
 
 from __future__ import annotations
@@ -48,21 +52,22 @@ def summarise(data: dict, bb: int) -> list[str]:
     if all(a is not None for a in adj):
         a = np.concatenate([np.asarray(x, dtype=np.float64) for x in adj])
         lines.append(f"  luck-adjusted: {win_rate(a, bb, 2)}")
-    stats = [s for c in data["chunks"] for s in c["search_stats"]]
-    for st, name in STREETS.items():
-        xs = [s for s in stats if s.get("street") == st]
-        if not xs:
-            continue
-        fb = sum(1 for s in xs if s.get("fallback"))
-        t = np.array([s["total_seconds"] for s in xs if "total_seconds" in s])
-        it = np.array([s["iterations"] for s in xs if "iterations" in s])
-        lines.append(
-            f"  {name}: {len(xs)} decisions, {fb} fallbacks, "
-            f"time mean {t.mean() if len(t) else float('nan'):.2f}s "
-            f"p90 {np.quantile(t, 0.9) if len(t) else float('nan'):.2f}s "
-            f"max {t.max() if len(t) else float('nan'):.2f}s, "
-            f"iterations mean {it.mean() if len(it) else float('nan'):.0f}"
-        )
+    for key, who in (("search_stats", ""), ("b_search_stats", "B ")):
+        stats = [s for c in data["chunks"] for s in c.get(key, [])]
+        for st, name in STREETS.items():
+            xs = [s for s in stats if s.get("street") == st]
+            if not xs:
+                continue
+            fb = sum(1 for s in xs if s.get("fallback"))
+            t = np.array([s["total_seconds"] for s in xs if "total_seconds" in s])
+            it = np.array([s["iterations"] for s in xs if "iterations" in s])
+            lines.append(
+                f"  {who}{name}: {len(xs)} decisions, {fb} fallbacks, "
+                f"time mean {t.mean() if len(t) else float('nan'):.2f}s "
+                f"p90 {np.quantile(t, 0.9) if len(t) else float('nan'):.2f}s "
+                f"max {t.max() if len(t) else float('nan'):.2f}s, "
+                f"iterations mean {it.mean() if len(it) else float('nan'):.0f}"
+            )
     return lines
 
 
@@ -77,6 +82,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-adjust", action="store_true")
     ap.add_argument("--out", default="runs/vn_match/match.json")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument(
+        "--a-search-config",
+        help="search config YAML of --a (default: the match YAML's agents.search.config)",
+    )
+    ap.add_argument("--b-search-config", help="search config YAML of --b (search against search)")
     args = ap.parse_args(argv)
 
     cfg = load_yaml(args.config)
@@ -90,13 +100,28 @@ def main(argv: list[str] | None = None) -> int:
         big_blind=int(g.get("big_blind", 100)),
         ante=int(g.get("ante", 0)),
     )
-    a = make_agent(args.a, **(params.get(args.a.partition(":")[0]) or {}))
-    b = make_agent(args.b, **(params.get(args.b.partition(":")[0]) or {}))
+
+    def agent_params(spec: str, search_config: str | None) -> dict:
+        p = dict(params.get(spec.partition(":")[0]) or {})
+        if search_config:
+            p["config"] = search_config
+        return p
+
+    a = make_agent(args.a, **agent_params(args.a, args.a_search_config))
+    b = make_agent(args.b, **agent_params(args.b, args.b_search_config))
     if a.name == b.name:
         a.name, b.name = a.name + "_A", b.name + "_B"
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    data = {"a": args.a, "b": args.b, "config": args.config, "seed": args.seed, "chunks": []}
+    data = {
+        "a": args.a,
+        "b": args.b,
+        "config": args.config,
+        "a_search_config": args.a_search_config,
+        "b_search_config": args.b_search_config,
+        "seed": args.seed,
+        "chunks": [],
+    }
     if args.resume and out.exists():
         data = json.loads(out.read_text())
     done = len(data["chunks"])
@@ -106,22 +131,27 @@ def main(argv: list[str] | None = None) -> int:
         deals = min(args.chunk, args.deals - k * args.chunk)
         t0 = time.time()
         n0 = len(getattr(a, "stats", []))
+        nb0 = len(getattr(b, "stats", []))
         res = run_duplicate_match(
             a, b, config, deals, seed=args.seed + k, engine=engine, luck_adjust=not args.no_adjust
         )
-        stats = [
-            {key: v for key, v in s.items() if isinstance(v, int | float | bool | str | None)}
-            for s in getattr(a, "stats", [])[n0:]
-        ]
-        data["chunks"].append(
-            {
-                "seed": args.seed + k,
-                "a": res.samples.tolist(),
-                "adjusted": None if res.adjusted is None else res.adjusted.tolist(),
-                "search_stats": stats,
-                "seconds": time.time() - t0,
-            }
-        )
+
+        def new_stats(agent, start: int) -> list[dict]:
+            return [
+                {key: v for key, v in s.items() if isinstance(v, int | float | bool | str | None)}
+                for s in getattr(agent, "stats", [])[start:]
+            ]
+
+        chunk = {
+            "seed": args.seed + k,
+            "a": res.samples.tolist(),
+            "adjusted": None if res.adjusted is None else res.adjusted.tolist(),
+            "search_stats": new_stats(a, n0),
+            "seconds": time.time() - t0,
+        }
+        if hasattr(b, "stats"):  # search against search: B's decisions too
+            chunk["b_search_stats"] = new_stats(b, nb0)
+        data["chunks"].append(chunk)
         tmp = out.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
         tmp.replace(out)
