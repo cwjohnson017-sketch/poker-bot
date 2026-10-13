@@ -36,5 +36,7 @@ tar -C "$REPO" -rf "$OUT" \
 tar -C "$MAIN" -rf "$OUT" runs/dcfr4_distilled_v2
 ls -la "$OUT"
 echo "uploading to s3://$BUCKET/$KEY_S3"
-aws_ s3 cp "$OUT" "s3://$BUCKET/$KEY_S3" --only-show-errors
+SRC=$OUT   # aws_ turns Git Bash's path conversion off: give aws.exe a Windows path
+if command -v cygpath >/dev/null; then SRC=$(cygpath -m "$OUT"); fi
+aws_ s3 cp "$SRC" "s3://$BUCKET/$KEY_S3" --only-show-errors
 aws_ s3api head-object --bucket "$BUCKET" --key "$KEY_S3" --query ContentLength --output text
