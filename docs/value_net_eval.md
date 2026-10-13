@@ -37,6 +37,10 @@ Raw results: `runs/vn_eval/*.md|json` and `runs/value_net/*.json` (gitignored).
   * `leaf.net: turn_v5x.pt`;
   * `leaf.turn_net: river_v4rx.pt`;
   * `solver.cuda_graph` on by default.
+* **10,000 hands against the blueprint:**
+  * +198 mbb/hand luck-adjusted, CI [+29, +366]; 0 fallbacks.
+  * On the same deals Round 3 made +255. The paired difference, -57 [-183,
+    +69], is within noise; this match cannot resolve the exploitability gains.
 
 **Round 3 (2026-10-08/09; details in "Round 3" below):**
 
@@ -1765,6 +1769,41 @@ blueprint: 500 duplicate deals (1,000 hands), new seeds 3000-3009, 1.1 h
 * **Win rate:** +748 mbb/hand luck-adjusted, 95% CI [+220, +1246]; raw +1078,
   CI [+461, +1696]. These seeds are new, and 1,000 hands cannot separate this
   from Round 3's +255 over 10,000 hands.
+
+### 8. 10,000-hand match
+
+`runs/r4/match_r4.json`:
+* 5,000 duplicate deals on seeds 1000-1099, the deals of Round 2's and Round
+  3's matches, so the three pair deal by deal;
+* `main` at ac373fa;
+* 10.1 h.
+
+Play statistics:
+* 0 fallbacks in 12,983 search decisions;
+* all 3,890 turn and 2,707 river decisions started from the cache;
+* flop 4.10 s and 83 iterations; turn 2.01 s and 368; river 0.85 s at the
+  1000-iteration cap.
+
+| mbb/hand, 95% CI | raw | luck-adjusted |
+|---|---|---|
+| **Round 4 production** | **+156 [-27, +339]** | **+198 [+29, +366]** |
+| Round 3 production, same deals | +189 [+13, +365] | +255 [+92, +417] |
+| Round 2 production, same deals | +162 [-13, +338] | +199 [+39, +358] |
+| paired, Round 4 - Round 3 | -33 [-171, +105] | -57 [-183, +69] |
+| paired, Round 4 - Round 2 | -6 [-167, +154] | -1 [-156, +154] |
+
+* **It still beats its blueprint** significantly on the luck-adjusted measure.
+* **Against Round 3 it is 57 lower luck-adjusted**, but the paired CI is
+  [-183, +69]. The three rounds are within noise of each other against this
+  opponent.
+* **This match cannot see the exploitability gains.** The paired CI is about
+  +-125 mbb/hand. The gains are a best response's against the bot (32-41
+  two-sided on turn spots, 4 on flop spots), and only part of them show up
+  against one fixed opponent.
+* Winning more against the blueprint is not what equilibrium search aims at.
+  A head-to-head match of the Round 4 search against the Round 3 search would
+  compare them directly, but needs tens of thousands of hands at this effect
+  size.
 
 ### 6. CUDA-graph replay of DCFR iterations
 
