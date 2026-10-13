@@ -35,5 +35,6 @@ remote() { ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$HOST" "$@"; }
 # start a long job on the instance, detached from this SSH session (log in ~/<name>.log)
 remote_detached() {
     local name=$1; shift
-    ssh "${SSH_OPTS[@]}" -n "$REMOTE_USER@$HOST" \n        "nohup $* > ~/$name.log 2>&1 < /dev/null & echo started $name"
+    ssh "${SSH_OPTS[@]}" -n "$REMOTE_USER@$HOST" \
+        "nohup $* > ~/$name.log 2>&1 < /dev/null & echo started $name"
 }
