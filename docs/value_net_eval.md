@@ -1805,6 +1805,47 @@ Play statistics:
   compare them directly, but needs tens of thousands of hands at this effect
   size.
 
+### 9. Head-to-head against the Round 3 search
+
+Round 4's production search (A) against Round 3's (B, `configs/search_value_net_r3.yaml`)
+in a duplicate match, both searching every postflop decision
+(`match_search.py --b-search-config`). It ran 10,000 deals (20,000 hands) on new
+seeds 20000-20399: 40 blocks of 250 deals, out `runs/r4/h2h/` (summary in
+`summary.txt`).
+
+* **Where it ran.** The local RTX 4070 Ti played 15 blocks. Spot `g5.xlarge`
+  instances (A10G) played the other 25: five launches in us-east-2, two cut by
+  spot terminations and resumed per chunk (`cloud/aws/h2h_coordinator.py`).
+  us-east-1 never had capacity. 14.5 h wall clock, 40 GPU-hours, about $14.50
+  of spot.
+* **Cost per deal:** 14.3 s, both bots searching.
+
+| A - B, mbb/hand | 95% CI |
+|---|---|
+| raw | +33.0 [-56.8, +122.8] |
+| **luck-adjusted** | **+11.1 [-74.9, +97.0]** |
+
+| | flop decisions / mean iterations | turn | river |
+|---|---|---|---|
+| A, Round 4 | 13,151 / 68 | 6,065 / 278 | 5,307 / 842 |
+| B, Round 3 | 13,232 / 73 | 5,966 / 189 | 5,526 / 152 |
+
+0 fallbacks on either side.
+
+* **No measurable difference.** The spot evaluations put Round 4 32-41 mbb/hand
+  less exploitable on the turn and 4 on the flop. Against Round 3 itself it
+  wins +11 ± 86.
+* **Why so wide:** 81% of deals cancel exactly (the two bots play them
+  the same way), but the rest are heavy-tailed. The 20 largest deals contribute +30
+  mbb/hand, more than the whole mean. Halving the CI needs about 40,000 deals.
+* **Reading.** A less exploitable strategy need not win more against a
+  similar one. The match rules out a large regression (worse than -75) from
+  Round 4's changes; it cannot confirm the gains. Exploitability on fixed spots
+  remains the measure for search changes. Matches answer only the question
+  "is anything broken".
+* **Flop iterations.** A ran 68 flop iterations to B's 73 in the same 4 s:
+  `turn_v5x` is the bigger net.
+
 ### 6. CUDA-graph replay of DCFR iterations
 
 A depth-0 turn tree has about 180 nodes. An iteration launches hundreds of
