@@ -229,10 +229,17 @@ def _neural(arg: str, **kwargs: Any) -> Any:
     return neural_blueprint(arg, **kwargs)
 
 
+def _preflop(arg: str, **kwargs: Any) -> Any:
+    from .preflop_solve import load_table
+
+    return load_table(arg, **kwargs)
+
+
 BLUEPRINTS: dict[str, BlueprintFactory] = {
     "uniform": lambda arg, **kw: UniformBlueprint(),
     "blueprint": _tabular,  # search:blueprint:<strategy.bin>
     "neural": _neural,  # search:neural:<checkpoint dir>
+    "preflop": _preflop,  # search:preflop:<table.pt> (a solved preflop over a base blueprint)
 }
 
 

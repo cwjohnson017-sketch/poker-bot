@@ -68,9 +68,19 @@ class Node:
     policy: torch.Tensor | None = None  # [C, A] blueprint policy over the children
     children: list[int] = field(default_factory=list)
     flop_id: int = -1  # index among the flop starts
+    indices: list[int] = field(default_factory=list)  # spec index of each child's action
+
+    def key(self) -> tuple:
+        """The preflop history as ``((player, kind, amount), ...)``."""
+        return history_key(self.history)
 
     def line(self) -> str:
         return " ".join(f"{p}:{_act(a)}" for _s, p, a in self.history) or "root"
+
+
+def history_key(history: Sequence) -> tuple:
+    """``((player, kind, amount), ...)`` of the preflop actions in ``history``."""
+    return tuple((int(p), int(a.kind), int(a.amount)) for s, p, a in history if int(s) == 0)
 
 
 def _act(a: Any) -> str:
@@ -116,6 +126,7 @@ def preflop_tree(
             pol = torch.stack([pol[perms[k]] for k in range(perms.shape[0])]).mean(0)
         node = Node("dec", hist, reach, contrib, player=p, policy=pol)
         node.labels = [o.label if o.kind != 2 else f"r{o.amount}" for o in opts]
+        node.indices = [o.index for o in opts]
         nodes.append(node)
         for j, o in enumerate(opts):
             r = reach.clone()
