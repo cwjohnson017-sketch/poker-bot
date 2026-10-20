@@ -64,6 +64,16 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
+def free_gpu(agent) -> None:
+    """Drop the leaf nets' board-feature caches (up to 32k boards each) and cached
+    blocks: a 16-round run ran out of GPU memory after about 2,500 flop solves."""
+    for pred in (agent.value_predictor, agent.turn_value_predictor):
+        cache = getattr(pred, "cache", None)
+        if cache is not None:
+            cache.clear()
+    torch.cuda.empty_cache()
+
+
 def flop_round(args, rdir: Path, nodes, flops, agent, gcfg, engine, perms) -> tuple[dict, dict]:
     """Solve and linearise every flop start; ``({flop_id: FlopValues}, {flop_id: W mean})``."""
     starts = [n for n in nodes if n.kind == "flop"]
@@ -86,7 +96,7 @@ def flop_round(args, rdir: Path, nodes, flops, agent, gcfg, engine, perms) -> tu
             torch.save(d, path)
         if todo:
             log(f"  done, {r['seconds']:.1f} + {r['linear_seconds']:.1f} s per flop (last)")
-            torch.cuda.empty_cache()
+            free_gpu(agent)
         v = FlopValues(perms)
         for f in flops:
             v.add(flops.index(f) % 2, f, d["values"][f])
