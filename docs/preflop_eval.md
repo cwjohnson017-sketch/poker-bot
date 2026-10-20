@@ -109,3 +109,68 @@ for a flop-root net:
 2. **A flop-root net** (DeepStack's) remains the general route. It also allows
    preflop re-solving at decision time, but it adds a lossy step: stage 1's
    turn-start net was about 100 mbb/hand behind depth-1 on the flop.
+
+## Attempt 1: iterated linearised preflop solve (2026-10-19/20)
+
+`scripts/solve_preflop.py` (`pokerbot/search/preflop_solve.py`); run
+`runs/preflop/solve1.cmd`, results `runs/preflop/solve1/` (gitignored). 14.3 h
+locally.
+
+### Method
+
+Each round:
+
+1. **Flop solves.** At the 31 flop starts and 40 new flops (seeds 100-104),
+   the flop roots are solved for the current preflop's ranges, as in the
+   measurement.
+2. **Linearisation.** With the postflop strategy fixed, every solve is turned
+   into class values: the value of each hand against each of the 169 preflop
+   hand classes.
+   * The turn-end leaves are frozen as a zero-sum payoff,
+     `U(h, o) = ev_0(h) - ev_1(o) + kappa`.
+   * The flop average is a plain sample mean.
+   * Both are needed for an exactly zero-sum game. Freezing each hand's value
+     against the range was not zero-sum, and CFR stalled.
+3. **Evaluation.** The current preflop is scored on these flops. From round 1
+   on, they are new flops, so the score is out of sample.
+4. **Preflop CFR.** 2,000 iterations on the linearised game; the solutions
+   reach 0.01-0.08 mbb/hand.
+5. **Next preflop.** Half the current strategy, half the CFR solution.
+
+### Result
+
+| round | preflop | honest best response, cross-fit / in-sample | linearised, same point | next preflop, linearised (before re-solving) |
+|---:|---|---|---:|---:|
+| 0 | blueprint | 263 / 411 | 411 | 262 |
+| 1 | mix of 1 solve | 342 / 430 | 421 | 223 |
+| 2 | mix of 2 | 254 / 409 | 403 | 173 |
+| 3 | mix of 3 | 387 / 441 | 432 | 176 |
+| 4 | mix of 4 | 410 / 445 | 439 | 187 |
+
+mbb/hand, 40 flops per round. (The blueprint with 100 flops: 338 / 380.)
+
+* **No improvement.** The re-solved preflops are as exploitable as the
+  blueprint or more, within this run's noise.
+* **The linearisation is accurate where it is taken.** Its exploitability of
+  the current preflop matches the honest in-sample best response within 1-9
+  mbb/hand every round.
+* **The steps are too long.** The next preflop is 173-262 in the round that
+  made it. Once the flops are re-solved for its ranges, it is 409-445. Moving
+  the ranges moves the postflop solution's values by 200-270 mbb/hand, which
+  undoes the step.
+* **Oscillation.** For example, the big blind's best reply to a 2.5x open swings
+  to "3-bet everything" in rounds 3-4.
+  * The solutions fold 9-13% of the button's hands at the root, which the
+    blueprint never does (plausibly closer to equilibrium).
+  * But each half-step overshoots against the next round's postflop.
+* **Production keeps the blueprint's preflop.**
+
+### Next options
+
+1. **Shorter steps, more rounds** (fictitious-play style).
+   * For example, mix 0.1-0.2 over 15-20 rounds.
+   * Cheaper rounds: 20 flops at 60 iterations is about 1 h per round.
+   * The linearisation's local accuracy suggests this converges, but slowly.
+2. **Leaves that follow the ranges within a CFR run:** a flop-root value net
+   (DeepStack). This is the plan's original stage 2. It costs a large data run
+   and adds the fit error stage 1 hit.
