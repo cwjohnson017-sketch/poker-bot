@@ -29,6 +29,13 @@ At every postflop decision:
    children under our action, or, for a turn tree ending at turn-end leaves
    valued by a river net, the river roots below those leaves
    (:meth:`~pokerbot.search.gadget.ContinualCache.store`).
+
+With ``record=True`` every decision of the current hand is also kept in
+``decisions`` (reset by ``new_hand``): the strategy of all 1326 combos over the
+concrete actions available, both players' reach at the decision, the action
+taken and, for searched decisions, the expected chips of every action for
+every combo (:meth:`SearchAgent._search_record`). Recording costs one extra
+value pass per searched decision and never changes the action played.
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ import torch
 from ..agents.base import BaseAgent
 from .abstract import legal_options, map_concrete, to_action
 from .blueprint import make_blueprint, policy_matrix, policy_vector, range_reach
-from .combos import NUM_COMBOS, combo_index, valid_mask
+from .combos import NUM_COMBOS, blocked_sum, combo_index, valid_mask
 from .config import SearchConfig, search_config
 from .gadget import (
     ContinualCache,
@@ -112,10 +119,13 @@ class SearchAgent(BaseAgent):
         name: str | None = None,
         value_predictor: Any = None,
         turn_value_predictor: Any = None,
+        record: bool = False,
         **overrides: Any,
     ) -> None:
         super().__init__(name)
         self.blueprint = blueprint
+        self.record = bool(record)
+        self.decisions: list[dict] = []
         if isinstance(config, SearchConfig):
             self.cfg = config
         else:
@@ -148,6 +158,7 @@ class SearchAgent(BaseAgent):
         self.cache.clear()
         self._roots.clear()
         self._played.clear()
+        self.decisions = []  # a new list: a caller may still hold the last hand's
 
     def observe_end(self, state: Any) -> None:
         self.cache.clear()
@@ -238,16 +249,89 @@ class SearchAgent(BaseAgent):
                 raise
             self.last_stats = {"fallback": True, "street": int(state.street)}
             self.stats.append(self.last_stats)
-            return self._blueprint_action(state, seat, rng)
+            return self._blueprint_action(state, seat, rng, source="fallback")
 
     # -- helpers ------------------------------------------------------------
 
-    def _blueprint_action(self, state: Any, seat: int, rng: np.random.Generator) -> Any:
+    def _blueprint_action(
+        self, state: Any, seat: int, rng: np.random.Generator, source: str = "blueprint"
+    ) -> Any:
+        t0 = time.perf_counter()
         bp = self.blueprint
         probs = np.asarray(policy_vector(bp, state, seat), dtype=np.float64)
         idx = int(rng.choice(len(probs), p=probs / probs.sum()))
-        opt = next(o for o in legal_options(state, bp.spec) if o.index == idx)
+        opts = legal_options(state, bp.spec)
+        opt = next(o for o in opts if o.index == idx)
+        if self.record:
+            self.decisions.append(
+                self._blueprint_record(state, seat, opts, opt, source, time.perf_counter() - t0)
+            )
         return to_action(self._engine, opt.kind, opt.amount)
+
+    def _blueprint_record(
+        self, state: Any, seat: int, opts: list, taken: Any, source: str, seconds: float
+    ) -> dict:
+        """A decision played from the blueprint (preflop, or a search fallback): its
+        policy for every combo over the legal options, and both players' blueprint
+        reach along the observed history. No action values."""
+        t0 = time.perf_counter()
+        bp = self.blueprint
+        config = _engine_config(
+            self._engine, self.config if self.config is not None else state.config
+        )
+        P = policy_matrix(bp, state, seat).expand(NUM_COMBOS, -1)
+        strategy = P[:, [o.index for o in opts]].float().cpu().numpy()
+        board = list(state.board)
+        reach = range_reach(bp, config, state.button, board, list(state.history), self._engine)
+        return {
+            "street": int(state.street),
+            "source": source,
+            "actions": [(int(o.kind), int(o.amount)) for o in opts],
+            "taken": next(j for j, o in enumerate(opts) if o.index == taken.index),
+            "strategy": strategy,
+            "values": None,
+            "reach": reach.float().cpu().numpy(),
+            "seconds": seconds,
+            "record_seconds": time.perf_counter() - t0,
+            "stats": {},
+        }
+
+    def _search_record(
+        self,
+        solver: RangeSolver,
+        tree: Any,
+        seat: int,
+        strat: torch.Tensor,
+        acts: list,
+        slot: int,
+        seconds: float,
+    ) -> dict:
+        """A searched decision: the solved average strategy of every combo at the
+        current node, both players' reach there, and ``values[c, a]``, our
+        expected chips (net for the hand) for combo ``c`` after action ``a``
+        under the solved strategies: the counterfactual value of the child divided
+        by the opponent's reach disjoint from ``c``. NaN where that reach is 0."""
+        t0 = time.perf_counter()
+        node = tree.current_node
+        v, reach = solver.values(seat)
+        first, n = int(tree.first_child[node]), int(tree.num_children[node])
+        mass = blocked_sum(reach[1 - seat, node])  # [C]
+        ev = v[first : first + n].t() / mass[:, None].clamp(min=1e-30)
+        ev = torch.where(mass[:, None] > 0, ev, torch.full_like(ev, float("nan")))
+        rec = {
+            "street": int(tree.root_street),
+            "source": "search",
+            "actions": [(int(k), int(a)) for k, a in acts],
+            "taken": int(slot),
+            "strategy": strat.float().cpu().numpy(),
+            "values": ev.float().cpu().numpy(),
+            "reach": reach[:, node].float().cpu().numpy(),
+            "seconds": seconds,
+            "record_seconds": time.perf_counter() - t0,
+            "stats": dict(self.last_stats),
+        }
+        del v, reach
+        return rec
 
     def _root_info(self, key, config, state, seat, pre, board) -> dict:
         info = self._roots.get(key)
@@ -414,6 +498,10 @@ class SearchAgent(BaseAgent):
             "terminate_seconds": t_term,
         }
         self.stats.append(self.last_stats)
+        if self.record:
+            self.decisions.append(
+                self._search_record(solver, tree, seat, strat, acts, slot, t_end - t0)
+            )
         return to_action(engine, kind, amount)
 
 

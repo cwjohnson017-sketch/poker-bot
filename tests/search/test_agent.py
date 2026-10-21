@@ -90,3 +90,45 @@ def test_played_lock_keeps_the_taken_action_exact():
         torch.testing.assert_close(s[:, others], want)
     # nothing dropped: the played strategy as it was
     torch.testing.assert_close(played_lock(old_acts, 1, old_acts, old), old)
+
+
+def test_recording_keeps_the_play_and_logs_every_decision():
+    """``record=True`` changes no action (same deals, same RNG, fixed iteration
+    counts) and keeps one record per decision of the hand."""
+    from pokerbot.agents import AlwaysCallAgent
+    from pokerbot.eval.match import play_hand
+    from pokerbot.search.combos import combo_index
+
+    engine = get_engine()
+    config = engine.GameConfig(
+        num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100, ante=0
+    )
+    cfg = dict(TINY, time_budget=60.0)  # the iteration cap, not the clock, ends each solve
+    searched = 0
+    for seed in range(4):
+        deck = np.random.default_rng(seed).permutation(52).tolist()
+        runs = []
+        for record in (False, True):
+            agent = SearchAgent(UniformBlueprint(), cfg, record=record)
+            rng = np.random.default_rng(seed + 100)
+            state = play_hand(config, [agent, AlwaysCallAgent()], 0, deck, rng, engine)
+            runs.append([(s, p, int(a.kind), int(a.amount)) for s, p, a in state.history])
+        assert runs[0] == runs[1]
+        ours = [h for h in runs[1] if h[1] == 0]
+        assert len(agent.decisions) == len(ours)
+        c = combo_index(*state.hole_cards(0))
+        for d, (street, _, kind, amount) in zip(agent.decisions, ours, strict=True):
+            assert d["street"] == street
+            assert d["source"] == ("blueprint" if street == 0 else "search")
+            k, a = d["actions"][d["taken"]]
+            assert k == kind and (kind != 2 or a == amount)
+            assert d["strategy"].shape == (1326, len(d["actions"]))
+            assert np.allclose(d["strategy"][c].sum(), 1.0, atol=1e-5)
+            assert d["reach"].shape == (2, 1326)
+            if street:
+                searched += 1
+                assert d["values"].shape == d["strategy"].shape
+                assert np.isfinite(d["values"][c]).all()
+                # values are chips for the whole hand: within the stacks
+                assert np.abs(d["values"][c]).max() <= 1000 + 1e-3
+    assert searched, "no postflop decision in these deals"
