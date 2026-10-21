@@ -194,7 +194,7 @@ Same method, with steps of 0.15 instead of 0.5.
 * **Exploitability falls by about a quarter, then levels off.**
   * The linearisation keeps matching the honest in-sample best response
     within 1-17 mbb/hand.
-  * Each step's predicted gain (about 35-45 in the linearised game) mostly
+  * Each step's predicted gain (16-56 in the linearised game) mostly
     holds.
   * The plateau of about 250-300 in-sample is noisy at 20 flops a round.
 
