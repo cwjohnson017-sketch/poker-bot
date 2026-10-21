@@ -244,3 +244,7 @@ duplicate deals of Round 4's smoke match (seeds 3000-3009).
 * A less exploitable preflop need not win more against this blueprint. For
   instance, it no longer limps into a big blind that checks behind 69% of the
   time.
+
+**Adopted (2026-10-21).** `configs/match_search_vn.yaml` now plays
+`search:preflop:runs/preflop/preflop_r15.pt`. The table is gitignored, like the
+value nets; copies are in both checkouts' `runs/preflop/`.

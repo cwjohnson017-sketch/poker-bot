@@ -9,7 +9,7 @@ The production bot (`configs/search_value_net.yaml`, merged in b1a23c9):
 
 | street | who decides | measured |
 |---|---|---|
-| preflop | blueprint `dcfr4_distilled_v2` | not measured |
+| preflop | blueprint `dcfr4_distilled_v2` | not measured (2026-10-19: 338-380 local best response; replaced 2026-10-21 by the solved table `preflop_r15.pt`, 222-252, `docs/preflop_eval.md`) |
 | flop | search, flop + turn, `turn_v4e` leaves, 4 s | exploitability 95 two-sided / 216 one-sided (12 spots) |
 | turn | depth-0 search, `river_v3` x 48 leaves, 2 s | 190 / 648 (18 spots) |
 | river | search to showdown, 1 s | starts from the cached turn solve |
