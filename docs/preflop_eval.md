@@ -174,3 +174,60 @@ mbb/hand, 40 flops per round. (The blueprint with 100 flops: 338 / 380.)
 2. **Leaves that follow the ranges within a CFR run:** a flop-root value net
    (DeepStack). This is the plan's original stage 2. It costs a large data run
    and adds the fit error stage 1 hit.
+
+## Attempt 2: short steps (2026-10-20/21)
+
+Same method, with steps of 0.15 instead of 0.5.
+* **Run:** 16 rounds x 20 flops (seeds 200-215), 60 flop iterations;
+  `runs/preflop/solve2.cmd`, results `runs/preflop/solve2/`. 18.3 h locally.
+* **Crash:** the run ran out of GPU memory once, in round 4. The leaf nets'
+  board-feature caches now clear between flop starts, and the launcher
+  retries.
+
+| rounds | honest best response, cross-fit / in-sample (mbb/hand, 20 flops each) |
+|---|---|
+| 0-2 (blueprint, then 15% steps) | 259-287 / 368-395 |
+| 3-8 | 22-144 / 255-310 |
+| 9-11 | 188-258 / 309-364 |
+| 12-15 | 156-237 / 251-299 |
+
+* **Exploitability falls by about a quarter, then levels off.**
+  * The linearisation keeps matching the honest in-sample best response
+    within 1-17 mbb/hand.
+  * Each step's predicted gain (about 35-45 in the linearised game) mostly
+    holds.
+  * The plateau of about 250-300 in-sample is noisy at 20 flops a round.
+
+**Paired check on 100 flops.** Round 15's preflop
+(`runs/preflop/solve2/round_14/table.pt`, copied to
+`runs/preflop/preflop_r15.pt`) was measured on the same 100 flops and settings
+as the blueprint above (`runs/preflop/pf100_r15/`). The solve never saw these
+flops.
+
+| mbb/hand | button BR | big blind BR | exploitability |
+|---|---:|---:|---:|
+| blueprint, in-sample / cross-fit | +580 / +538 | +181 / +138 | 380 / 338 |
+| **round 15, in-sample / cross-fit** | +396 / +375 | +108 / +69 | **252 / 222** |
+
+**A third less exploitable:** -128 in-sample and -116 cross-fitted.
+
+**What changed:**
+
+| | blueprint | round 15 |
+|---|---:|---:|
+| button limps | 37% | 10% |
+| button folds | 0% | 15% |
+| button opens 2x | 25% | 36% |
+| big blind folds to 2x / 2.5x / 4x | 51 / 58 / 70% | 29 / 40 / 58% |
+| big blind checks behind a limp | 69% | 62% |
+
+**What is still exploitable** (largest one-step gains):
+* the button's open (104 mbb/hand): it would rather open 3x-4x than 2x;
+* the button's response to 3-bets (35 after a 2x open): it folds 46% and
+  4-bets 11%, where the best response 4-bets about 70%.
+
+**Using it.** `search:preflop:runs/preflop/preflop_r15.pt` in place of
+`search:neural:<blueprint>`:
+* the search plays from the table on the preflop tree;
+* it builds the postflop ranges from it;
+* it falls back to the blueprint for off-tree preflop histories.
