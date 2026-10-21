@@ -231,3 +231,16 @@ flops.
 * the search plays from the table on the preflop tree;
 * it builds the postflop ranges from it;
 * it falls back to the blueprint for off-tree preflop histories.
+
+**Smoke match** (`runs/preflop/match_smoke_pf.json`, 1.1 h): the Round 4
+production search with this preflop against the blueprint, on the 500
+duplicate deals of Round 4's smoke match (seeds 3000-3009).
+
+* **It plays cleanly:** 0 fallbacks on every street; flop 4.11 s and 78
+  iterations, turn 2.01 s and 365, river at the 1,000-iteration cap.
+* **Win rate:** +511 mbb/hand luck-adjusted, CI [-43, +1089]. Raw +686.
+* **Paired against Round 4 on the same deals:** -237 luck-adjusted,
+  CI [-857, +383], so no difference measurable at 1,000 hands.
+* A less exploitable preflop need not win more against this blueprint. For
+  instance, it no longer limps into a big blind that checks behind 69% of the
+  time.
