@@ -15,6 +15,7 @@ from pokerbot.config import REPO_ROOT, load_yaml
 from pokerbot.eval import run_duplicate_match
 
 DECK = list(range(52))
+BUCKETS_HUNL = REPO_ROOT / "data" / "abstraction" / "buckets_hunl"
 
 
 def exploitability(trainer, path, deals=12000):
@@ -143,6 +144,8 @@ def test_small_config_trains_via_driver(tmp_path):
 
 def test_configs_build_trainers():
     for name in ("mccfr_small.yaml", "mccfr_hunl.yaml"):
+        if name == "mccfr_hunl.yaml" and not (BUCKETS_HUNL / "flop.npy").exists():
+            pytest.skip("bucket build not present (mccfr_hunl.yaml loads its tables)")
         cfg = load_yaml(REPO_ROOT / "configs" / name)
         t = pe.Trainer(solver_config(cfg))
         info = json.loads(t.config_json)
