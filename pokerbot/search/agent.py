@@ -521,9 +521,10 @@ class SearchAgent(BaseAgent):
                 prior = prior * valid_mask(state.hole_cards(seat), self.device)
             solver.set_gadget(Gadget(1 - seat, prior, info["terminate"]))
         t_setup = time.perf_counter()
-        solver.solve(iterations=min(cfg.min_iterations, cfg.solver.iterations))
+        cap = cfg.max_iterations(street)
+        solver.solve(iterations=min(cfg.min_iterations, cap))
         left = cfg.budget(street) - (time.perf_counter() - t0)
-        remaining_iters = cfg.solver.iterations - solver.iterations_done
+        remaining_iters = cap - solver.iterations_done
         if left > 0 and remaining_iters > 0:
             solver.solve(iterations=remaining_iters, time_budget=left)
         node = tree.current_node

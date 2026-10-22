@@ -68,6 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--chunk", type=int, help="deals per saved chunk (default: --deals)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--config", help="match YAML: its game: and agents: sections are used")
+    ap.add_argument(
+        "--search-config",
+        help="search YAML replacing agents.search.config (e.g. search_value_net_fixed.yaml)",
+    )
     ap.add_argument("--stacks", type=int, default=100, help="stacks in big blinds (no --config)")
     ap.add_argument("--out", help="JSON results file")
     ap.add_argument("--resume", action="store_true", help="skip chunks already in --out")
@@ -174,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         torch.set_num_threads(args.threads)
     cfg = load_yaml(args.config) if args.config else {}
     params = dict(cfg.get("agents") or {})
+    if args.search_config:
+        params["search"] = {**(params.get("search") or {}), "config": args.search_config}
     engine = get_engine(cfg.get("engine", "auto"))
     game = cfg.get("game") or {"stacks": args.stacks * 100, "small_blind": 50, "big_blind": 100}
     config = game_config(game, engine)
@@ -186,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         "agent": args.agent,
         "reference": args.reference,
         "config": args.config,
+        "search_config": args.search_config,
         "game": game,
         "deals": args.deals,
         "chunk": chunk,

@@ -125,3 +125,19 @@ def test_frozen_leaves_zero_sum_for_any_reach():
         total = sum((reach[p] * fl.values(p, reach)).sum() for p in (0, 1))
         scale = (reach[0] * fl.values(0, reach)).abs().sum()
         assert float(total.abs()) < 1e-9 * float(scale)
+
+
+def test_local_base_maps_a_foreign_absolute_path_under_the_repo(tmp_path):
+    """Tables name their base by the solving machine's absolute path; elsewhere the
+    same runs/... path under the repository root stands in for it."""
+    from pokerbot.search.preflop_solve import local_base
+
+    (tmp_path / "runs" / "dcfr4_distilled_v2").mkdir(parents=True)
+    spec = "neural:C:/Users/someone/poker-bot/runs/dcfr4_distilled_v2"
+    assert (
+        local_base(spec, tmp_path) == f"neural:{(tmp_path / 'runs/dcfr4_distilled_v2').as_posix()}"
+    )
+    here = tmp_path / "runs" / "dcfr4_distilled_v2"
+    assert local_base(f"neural:{here.as_posix()}", tmp_path) == f"neural:{here.as_posix()}"
+    assert local_base("neural:/nowhere/at/all", tmp_path) == "neural:/nowhere/at/all"
+    assert local_base("uniform", tmp_path) == "uniform"

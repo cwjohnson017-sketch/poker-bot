@@ -477,12 +477,32 @@ class PreflopTable:
         return self._rows(key, "cpu")[combo_index(int(a), int(b))].numpy()
 
 
+def local_base(spec: str, root: Path | None = None) -> str:
+    """The table's base blueprint spec, usable on this machine. Tables name their base
+    by absolute path on the machine that solved them (a Windows path); where that path
+    does not exist (a cloud instance), the same ``runs/...`` path under the repository
+    root is used when it exists. Anything else comes back unchanged."""
+    prefix, sep, path = spec.partition(":")
+    if not sep or not path or Path(path).exists():
+        return spec
+    p = path.replace("\\", "/")
+    i = p.find("runs/")
+    if i < 0:
+        return spec
+    if root is None:
+        from ..config import REPO_ROOT
+
+        root = REPO_ROOT
+    local = Path(root) / p[i:]
+    return f"{prefix}:{local.as_posix()}" if local.exists() else spec
+
+
 def load_table(path: str | Path, **kwargs: Any) -> PreflopTable:
     """``preflop:<table.pt>``: the table's base blueprint with its preflop replaced."""
     from .blueprint import make_blueprint
 
     d = torch.load(path)
-    return PreflopTable(make_blueprint(d["base"], **kwargs), d["table"])
+    return PreflopTable(make_blueprint(local_base(d["base"]), **kwargs), d["table"])
 
 
 __all__ = [

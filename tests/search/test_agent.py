@@ -146,3 +146,25 @@ def test_recording_keeps_the_play_and_logs_every_decision():
             else:
                 assert d["values_vs"] is None
     assert searched, "no postflop decision in these deals"
+
+
+def test_street_iteration_caps_fix_the_solve():
+    """Per-street caps under a generous time budget: every search runs exactly its
+    street's cap, on any machine (configs/search_value_net_fixed.yaml)."""
+    from pokerbot.agents import AlwaysCallAgent
+    from pokerbot.eval.match import play_hand
+
+    engine = get_engine()
+    config = engine.GameConfig(
+        num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100, ante=0
+    )
+    caps = {1: 3, 2: 5, 3: 7}
+    cfg = dict(TINY, time_budget=60.0, street_iterations={"flop": 3, "turn": 5, "river": 7})
+    agent = SearchAgent(UniformBlueprint(), cfg)
+    for seed in range(4):
+        deck = np.random.default_rng(seed).permutation(52).tolist()
+        rng = np.random.default_rng(seed + 50)
+        play_hand(config, [agent, AlwaysCallAgent()], 0, deck, rng, engine)
+    searched = [s for s in agent.stats if "nodes" in s]
+    assert searched, "no postflop decision in these deals"
+    assert all(s["iterations"] == caps[s["street"]] for s in searched)

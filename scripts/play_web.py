@@ -34,6 +34,7 @@ from pokerbot.config import REPO_ROOT, game_config, git_hash, load_yaml  # noqa:
 from pokerbot.engine_select import engine_name, get_engine  # noqa: E402
 from pokerbot.eval.match import play_hand  # noqa: E402
 from pokerbot.play import PlayServer, PlaySession, SessionLog  # noqa: E402
+from pokerbot.search.config import load_search_yaml  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,7 +67,8 @@ def new_meta(args: argparse.Namespace, engine: Any) -> dict:
     search_file = None
     if spec.startswith("search:") and isinstance(params.get("config"), str):
         search_file = params["config"]
-        params["config"] = load_yaml(search_file)  # a resumed session keeps these settings
+        # resolved (base: chains included), so a resumed session keeps these settings
+        params["config"] = load_search_yaml(search_file)
     game = game_config(cfg.get("game"), engine)
     session_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     return {

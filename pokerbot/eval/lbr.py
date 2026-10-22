@@ -481,6 +481,12 @@ class LBRResult:
             "opponent_cost": self.opponent_cost,
             "seconds": self.seconds,
             "seed": self.seed,
+            # per hand, so runs split into blocks (cloud/aws/fleet.py) can be merged
+            "samples": {
+                "payoffs": [float(x) for x in self.payoffs],
+                "adjusted": [float(x) for x in self.adjusted],
+                "end_street": [int(x) for x in self.end_street],
+            },
         }
 
 
