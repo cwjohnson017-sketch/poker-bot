@@ -1,4 +1,5 @@
 import csv
+import importlib.util
 import math
 from pathlib import Path
 
@@ -54,7 +55,8 @@ def test_one_iteration_smoke_and_resume(tmp_path):
         ev = list(csv.DictReader(fh))
     assert [e["opponent"] for e in ev] == ["equity"]
     assert math.isfinite(float(ev[0]["mbb_adj"]))
-    assert any(p.name.startswith("events") for p in (tmp_path / "tb").iterdir())
+    if importlib.util.find_spec("tensorboard"):  # the train extra (CI installs it)
+        assert any(p.name.startswith("events") for p in (tmp_path / "tb").iterdir())
 
     # resume: memories, nets and iteration counter come back; iteration 2 runs
     # and evaluates against the previous average strategy too

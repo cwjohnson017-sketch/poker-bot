@@ -17,6 +17,7 @@ from pokerbot.agents import (
     ProfileAgent,
     RandomAgent,
     TranslationStressAgent,
+    archetypes,
     make_agent,
 )
 from pokerbot.agents.archetypes import preflop_percentiles, read_spot
@@ -102,22 +103,44 @@ def test_preflop_percentiles():
         assert abs((combos < x).mean() - x) < 0.02
 
 
-@pytest.mark.parametrize("name", SUITE)
-def test_archetypes_always_legal(name):
-    """2,000 hands per archetype at 100bb against a mix of opponents, plus
-    1,000 at short and uneven stacks."""
+def _play_legal(name, deep, short):
+    """``deep`` hands at 100bb against a mix of opponents, then ``short`` at
+    short and uneven stacks; every action legal, every street reached."""
     rng = np.random.default_rng(hash(name) % 2**32)
     agent = LegalityCheck(make_agent(name))
     opponents = [RandomAgent(), make_agent("translation_stress"), make_agent(name)]
     configs = [DEEP] * 4 + SHORT
-    for h in range(3000):
-        config = configs[h % len(configs)] if h >= 2000 else DEEP
+    for h in range(deep + short):
+        config = configs[h % len(configs)] if h >= deep else DEEP
         opp = LegalityCheck(opponents[h % len(opponents)])
         seats = [agent, opp] if h % 2 == 0 else [opp, agent]
         s = play_hand(config, seats, (h // 2) % 2, rng.permutation(52), rng, ENGINE)
         assert s.is_terminal
         assert sum(s.payoffs()) == 0
     assert all(d > 0 for d in agent.decisions), agent.decisions  # reached every street
+
+
+@pytest.fixture
+def coarse_cdf(monkeypatch):
+    """Strength percentiles from 200-deal tables in a cache of their own (the
+    2,000-deal tables dominate the run time with the reference engine)."""
+    monkeypatch.setattr(archetypes, "_POSTFLOP_CDF", {})
+    full = archetypes.postflop_cdf
+    monkeypatch.setattr(archetypes, "postflop_cdf", lambda street, top=1.0: full(street, top, 200))
+
+
+@pytest.mark.parametrize("name", SUITE)
+def test_archetypes_always_legal(name, coarse_cdf):
+    """500 hands at 100bb plus 250 at short and uneven stacks (the slow test
+    below plays 3,000 with the full strength tables)."""
+    _play_legal(name, 500, 250)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", SUITE)
+def test_archetypes_always_legal_long(name):
+    """2,000 hands per archetype at 100bb, plus 1,000 at short and uneven stacks."""
+    _play_legal(name, 2000, 1000)
 
 
 def test_hud_counts_one_hand():
