@@ -8,6 +8,8 @@ Everything that says whether a bot got better lives here (DESIGN.md 5.7).
 | Checkpoint ladder | `ladder.py`, `scripts/run_ladder.py` | Is each checkpoint better than the previous ones and the anchors? |
 | Local best response | `lbr.py`, `scripts/run_lbr.py` | Does the policy have gross holes? (cheap exploitability lower bound) |
 | Approximate best response | `abr.py`, `scripts/run_abr.py` | How much can a trained exploiter win? (stronger lower bound) |
+| Soak test | `soak.py`, `scripts/soak.py` | Does the bot run cleanly for 100k hands? (crashes, illegal actions, fallbacks, p99 time, memory) |
+| Preflop off-tree audit | `preflop_audit.py`, `scripts/audit_preflop.py` | How does the bot answer every preflop size, on its tree or not? |
 | Run logger | `logging.py` | CSV + TensorBoard scalars for all of the above and for training loops |
 | Agent registry | `pokerbot/agents/registry.py` | Build any agent from a string such as `blueprint:runs/x.pkl` |
 

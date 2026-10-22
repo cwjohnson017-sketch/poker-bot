@@ -446,6 +446,10 @@ class PreflopTable:
         key = tuple(((p - b) % 2, k, a) for p, k, a in history_key(state.history))
         return key if key in self.table else None
 
+    def on_table(self, state: Any) -> bool:
+        """Whether ``state``'s decision is played from the table (not ``base``)."""
+        return self._key(state) is not None
+
     def _rows(self, key: tuple, device: Any) -> torch.Tensor:
         d = (key, str(device))
         if d not in self._dev:

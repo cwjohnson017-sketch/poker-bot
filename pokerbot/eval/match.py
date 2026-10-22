@@ -41,11 +41,13 @@ def play_hand(
     rng: np.random.Generator,
     engine: ModuleType | None = None,
     on_illegal: str = "raise",
+    illegal: list | None = None,
 ) -> Any:
     """Play one hand and return the terminal (unmasked) ``GameState``.
 
     ``on_illegal``: ``"raise"`` raises :class:`IllegalActionError`; ``"fold"``
-    replaces an illegal action by fold (or check when checking is free).
+    replaces an illegal action by fold (or check when checking is free) and, if
+    ``illegal`` is a list, appends ``(seat, agent name, repr(action), error)`` to it.
     """
     engine = engine or get_engine()
     if len(agents) != config.num_players:
@@ -62,9 +64,11 @@ def play_hand(
             action = to_engine_action(engine, raw)
             state.apply(action)
         except (ValueError, AttributeError, TypeError) as e:
+            name = getattr(agents[p], "name", type(agents[p]).__name__)
             if on_illegal != "fold":
-                name = getattr(agents[p], "name", type(agents[p]).__name__)
                 raise IllegalActionError(f"agent {name} (seat {p}) sent {raw!r}: {e}") from e
+            if illegal is not None:
+                illegal.append((p, str(name), repr(raw), str(e)))
             legal = state.legal_actions()
             state.apply(engine.Action.check_call() if legal.can_check else engine.Action.fold())
     shown = showdown_seats(state)
