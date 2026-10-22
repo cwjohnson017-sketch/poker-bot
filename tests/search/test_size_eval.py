@@ -61,6 +61,8 @@ TINY = sz.SizeSettings(
         "tree": {"chance_cards": 2},
         "solver": {"max_runouts": 6},
         "gadget": {"rollouts": 8},
+        # no production turn net (gitignored): the test's own leaf model serves every tree
+        "leaf": {"turn_net": None},
     },
 )
 
