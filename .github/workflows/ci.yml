@@ -24,4 +24,4 @@ jobs:
       - name: Pytest (CPU, reference engine)
         env:
           POKERBOT_ENGINE: reference
-        run: python -m pytest -q -m "not slow"
+        run: python -m pytest -q -m "not slow" --durations=30
