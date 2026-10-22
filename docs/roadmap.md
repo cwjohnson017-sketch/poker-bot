@@ -13,9 +13,11 @@ and production changes only when a measurement says so. Each goal gets a
 definition that can be measured, the work that leads to it, and a gate. What the
 strongest poker AIs did, and what this plan takes from each, is in section 3.
 
-**Status (2026-10-21):** Phase 1 in progress. 1.1, the play app, is built in
-evaluation mode with full logging (`pokerbot/play/`, `scripts/play_web.py`);
-its review mode is not. Update this line as gates pass.
+**Status (2026-10-22):** Phase 1 in progress. The tools of 1.1-1.5 are built
+and on `main`: the play app (evaluation mode; review mode not yet), AIVAT
+action terms, archetype opponents, LBR against the search, the soak harness
+and the preflop audit. Gate 1's production runs (archetypes, LBR and soak,
+about 385 GPU hours) have not run. Update this line as gates pass.
 
 ## 1. Summary
 
@@ -479,6 +481,10 @@ archetype, next to the blueprint's margin against the same archetype.
   abstract line. Re-solve the preflop subtree below an off-tree action instead,
   with the flop-root values the pipeline already computes (Libratus-style
   nested solving).
+  * The audit of 1.5 (`docs/preflop_audit.md`) measured the leak: sizes off
+    the solved table fall back to the old blueprint and overfold, 63-70%
+    against 2.75bb and 3.5bb opens where table sizes get 40-58%. A first fix is
+    to mix the neighbouring table rows by their pseudo-harmonic weights.
 
 **2.3 200bb.** Slumbot plays 200bb, and this is also the first step of goal 3.
 
