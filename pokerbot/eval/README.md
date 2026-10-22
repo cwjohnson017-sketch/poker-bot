@@ -12,6 +12,7 @@ Everything that says whether a bot got better lives here (DESIGN.md 5.7).
 | Preflop off-tree audit | `preflop_audit.py`, `scripts/audit_preflop.py` | How does the bot answer every preflop size, on its tree or not? |
 | Run logger | `logging.py` | CSV + TensorBoard scalars for all of the above and for training loops |
 | Agent registry | `pokerbot/agents/registry.py` | Build any agent from a string such as `blueprint:runs/x.pkl` |
+| Archetype suite | `pokerbot/agents/archetypes.py`, `scripts/run_archetypes.py` | Does the bot beat scripted "average players"? (roadmap 1.3) |
 
 ## Units and statistics
 
@@ -225,6 +226,83 @@ worked. Compare opponents only under the same config and budget, since a
 bigger budget finds more. The train curve (`abr/train_mbb`, epsilon-greedy
 play) should rise and flatten. If it is still rising at the end, the budget
 is too small for the number to mean much.
+
+## Archetype suite
+
+Scripted opponents that stand in for "the average player" (roadmap 1.3,
+Gate 1), in `pokerbot/agents/archetypes.py`. They are ordinary agent
+specs (`population`, `nit:fold_to_bet=0.7`, ...), take about a millisecond
+per decision on CPU and are always legal (tested over 3,000 hands each,
+short and uneven stacks included).
+
+* `ProfileAgent` plays by frequencies: VPIP, PFR, 3-bet, 4-bet, fold to
+  3-bet, c-bet, fold to c-bet / to a bet, aggression, bluff share, sizes.
+  Hand strength is a percentile: preflop among the 1,326 combos by equity
+  against a random hand; postflop by Monte Carlo equity (the `equity`
+  baseline's helper), ranked within the agent's own preflop range.
+* Presets: `population` (the average losing player: 35/12, 3-bet 4%, c-bet
+  55%, fold to c-bet 50%, Agg 35%, from Poker Copilot's published ranges; the
+  module docstring cites each), `regular` (23/20), `calling_station`, `nit`,
+  `maniac`, `loose_passive` (limper), `fit_or_fold`, `min_raiser` (every raise
+  a min-raise), `overbet_bluffer` (polarised 1.5-2.5x pot).
+* `translation_stress` builds on `RandomAgent`: sizes from a min-raise to
+  all-in on every street (uniform, log-uniform and both ends), odd opens of
+  2-12bb, limps, limp-reraises and donk bets.
+* `equity`, the existing baseline, is in the suite too (`SUITE`).
+
+Each agent counts its own HUD statistics (`agent.hud`), and the runner reports
+them. Against the blueprint they come out near the targets, with drift where
+the ranges narrow: VPIP and PFR land within 3 points, c-bets within 10, folds
+to c-bets lower than the target because the blueprint bets small (folds scale
+with bet size, `size_sensitivity`).
+
+```
+python scripts/run_archetypes.py --agent neural:runs/dcfr4_distilled_v2,device=cpu \
+    --deals 3000 --chunk 500 --threads 2 --out runs/archetypes/blueprint_cpu.json
+python scripts/run_archetypes.py --config configs/match_search_vn.yaml \
+    --agent search:preflop:runs/preflop/preflop_r15.pt --reference neural:runs/dcfr4_distilled_v2 \
+    --deals 10000 --chunk 250 --out runs/archetypes/production.json --resume
+```
+
+Every archetype plays `--deals` duplicate deals, luck-adjusted. With
+`--reference` the second agent plays the same deals with the same seeds, and
+the table adds the paired difference per deal (Gate 1's regression check).
+`--out` is rewritten after each chunk; `--resume` continues it. Run it from
+the checkout that holds `runs/` and `data/` (relative blueprint paths). On a
+busy machine pass `--threads 2`: with torch's default thread count a CPU
+blueprint match ran 10-25x slower when other jobs held the cores.
+
+**Blueprint `dcfr4_distilled_v2` (CPU), 2026-10-21:** 3,000 duplicate deals
+(6,000 hands) per archetype, 100bb, luck-adjusted mbb/hand with 95% CI. 47 min
+on a shared machine.
+
+| Archetype | Blueprint margin | Archetype VPIP/PFR/3-bet/c-bet/fold-c-bet/Agg (measured) |
+|---|---|---|
+| population | +145 [-24, +308] | 31/9/3/62/38/29 |
+| regular | +303 [+163, +454] | 22/15/7/60/33/40 |
+| calling_station | +3,056 [+2,548, +3,604] | 54/3/1/28/10/12 |
+| nit | +477 [+367, +581] | 13/9/3/52/55/21 |
+| maniac | +1,114 [+665, +1,582] | 83/59/32/90/3/73 |
+| loose_passive | -86 [-325, +148] | 46/2/1/33/31/15 |
+| fit_or_fold | +386 [+196, +565] | 36/12/4/43/72/26 |
+| min_raiser | +158 [-15, +324] | 41/23/9/69/23/43 |
+| overbet_bluffer | +503 [+216, +767] | 37/19/6/62/23/46 |
+| translation_stress | +2,191 [+1,645, +2,800] | 91/60/50/48/28/68 |
+| equity | +1,428 [+1,072, +1,789] | - |
+
+The blueprint beats 8 of 11 with the CI above zero. It does not clearly
+beat `population` or `min_raiser`, and it is even with `loose_passive` (raw
+-310 [-631, +4]): limped pots and passive calling are the weak spots to watch.
+For Gate 1 the production bot must beat each one over 20,000 hands and not
+by significantly less than the blueprint.
+
+The bot makes 0.84 preflop, 0.48 flop, 0.29 turn and 0.19 river decisions per
+hand on average over these archetypes (from 0.23 / 0.10 / 0.06 postflop
+against `nit` to 0.70 / 0.60 / 0.54 against `calling_station`). At
+production's budgets (flop 4 s, turn 2 s, river 1 s) that is about 2.7 s per
+hand, so the Gate 1 run (10,000 deals = 20,000 hands for each of 11
+archetypes, 220,000 hands) is about 165 GPU hours, roughly a week; the
+blueprint reference adds under an hour.
 
 ## Logging
 
