@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 
 from ..engine_select import engine_name, get_engine, to_engine_action
+from ..eval.aivat import action_correction
 from ..eval.history import format_hand
 from ..eval.luck import luck_adjusted
 from ..eval.masking import MaskedState
@@ -197,7 +198,9 @@ class PlaySession:
         self.warmup = warmup
         self.stats = SessionStats(config.big_blind)
         for rec in log.hands():
-            self.stats.add(rec["human_net"], rec["human_adjusted"])
+            # hands logged before AIVAT was scored count with no action terms
+            aivat = rec.get("human_aivat", rec["human_adjusted"])
+            self.stats.add(rec["human_net"], rec["human_adjusted"], aivat)
         self.next_hand = len(log.dealt())
         self.abandoned = self.next_hand - self.stats.hands
         self._summary = self.stats.summary()
@@ -377,6 +380,8 @@ class PlaySession:
         self.bot.observe_end(MaskedState(state, bs, cfg, redeal, revealed=shown))
         payoffs = [int(x) for x in state.payoffs()]
         adjusted = luck_adjusted([(button, deck, state)], cfg, eng, self.luck_samples, seed=h)
+        decisions = list(getattr(self.bot, "decisions", None) or [])
+        bot_terms = action_correction(decisions, state.hole_cards(bs), state.hole_cards(hs))
         record = {
             "hand": h,
             "started": started,
@@ -391,14 +396,15 @@ class PlaySession:
             "payoffs": payoffs,
             "human_net": payoffs[hs],
             "human_adjusted": float(adjusted[0, hs]),
+            "bot_action_terms": bot_terms,
+            "human_aivat": float(adjusted[0, hs]) - bot_terms,
         }
-        decisions = list(getattr(self.bot, "decisions", None) or [])
         text = format_hand(state, cfg, h, self.seat_names, engine_name(eng))
         stars = format_pokerstars(
             state, cfg, self._hand_id(h), self.seat_names, hs, datetime.now(UTC)
         )
         self.log.write_hand(record, decisions, text, stars)
-        self.stats.add(record["human_net"], record["human_adjusted"])
+        self.stats.add(record["human_net"], record["human_adjusted"], record["human_aivat"])
         self._summary = self.stats.summary()
         result = self._result_view(state, payoffs, shown, 2 * min(contrib))
         self._last_hand = {

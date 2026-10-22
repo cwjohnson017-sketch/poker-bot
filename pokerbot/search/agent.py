@@ -34,8 +34,9 @@ With ``record=True`` every decision of the current hand is also kept in
 ``decisions`` (reset by ``new_hand``): the strategy of all 1326 combos over the
 concrete actions available, both players' reach at the decision, the action
 taken and, for searched decisions, the expected chips of every action for
-every combo (:meth:`SearchAgent._search_record`). Recording costs one extra
-value pass per searched decision and never changes the action played.
+every combo and, for our own combo, against every opponent combo
+(:meth:`SearchAgent._search_record`, :func:`pair_values`). Recording costs two
+extra value passes per searched decision and never changes the action played.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..agents.base import BaseAgent
 from .abstract import legal_options, map_concrete, to_action
@@ -66,7 +68,7 @@ from .leaf import build_leaf_rollouts
 from .solver import RangeSolver
 from .tree import LEAF, VALUE, TreeBuilder
 from .tree_policy import blueprint_profile
-from .value_leaf import make_leaf_evaluator, predictor_kind
+from .value_leaf import FixedLeafValues, make_leaf_evaluator, predictor_kind
 
 
 def _engine_config(engine: Any, config: Any) -> Any:
@@ -107,6 +109,56 @@ def played_lock(
     share = torch.where(tot > 0, rest / tot.clamp(min=1e-30), 1.0 / len(others))
     strat[:, others] = rest + missing[:, None] * share
     return strat
+
+
+@torch.no_grad()
+def pair_values(solver: RangeSolver, tree: Any, seat: int, combo: int) -> torch.Tensor:
+    """``[1326, n]``: our expected chips (net for the hand) holding ``combo``
+    after each of the ``n`` actions at the current node, against every opponent
+    combo, under the solved average strategies. NaN on opponent combos that
+    share a card with ``combo``.
+
+    The opponent's values are computed with our root reach one-hot at
+    ``combo`` (and our strategy at the current node set to 1 on every action,
+    so each child is reached): the opponent's counterfactual value of combo
+    ``o`` at child ``a`` is then ``pi(combo) * u_opp(o, combo | a)``, and ours
+    is its negative (terminal payoffs are zero-sum). Value-net leaves see only
+    ranges: their values come from the net on the real reaches (as in
+    :meth:`SearchAgent._search_record`), with the opponent's per-combo value
+    re-weighted from our real range to our one combo. With sampled chance cards
+    (``tree.chance_cards``) a pair's live cards carry the sample's weights, which
+    are exact only on average over pairs; with every card (production) the
+    values are exact."""
+    node = tree.current_node
+    first, n = int(tree.first_child[node]), int(tree.num_children[node])
+    opp = 1 - seat
+    sigma = solver.average_strategy()
+    root = solver.root_reach()
+    hot_root = root.clone()
+    hot_root[seat] = 0
+    hot_root[seat, combo] = 1
+    hot_sigma = sigma.clone()
+    hot_sigma[int(solver.dec_index[node]), :n, combo] = 1
+    hot = solver.forward(hot_sigma, hot_root)
+    term = solver.terminals
+    saved = term.value_leaves
+    if len(term.value_ids):
+        ids = term.value_ids
+        real = solver.forward(sigma, root)[:, ids]
+        v_real = saved.values(opp, real)  # [L, C]: ev_opp(o) * m_real(o)
+        m_real = blocked_sum(real[seat])
+        scale = torch.where(m_real > 0, blocked_sum(hot[seat, ids]) / m_real.clamp(min=1e-30), 0)
+        fixed = torch.zeros(2, *v_real.shape, dtype=v_real.dtype, device=v_real.device)
+        fixed[opp] = v_real * scale
+        term.value_leaves = FixedLeafValues(fixed)
+    try:
+        v = solver.backward(opp, hot_sigma, hot[seat], reach=hot)
+    finally:
+        term.value_leaves = saved
+    pi = hot[seat, node, combo]
+    out = -v[first : first + n].t() / pi.clamp(min=1e-30)  # [C, n]
+    ok = blocked_sum(F.one_hot(torch.tensor(combo), NUM_COMBOS).to(v))[:, None] > 0.5
+    return torch.where(ok & (pi > 0), out, torch.full_like(out, float("nan")))
 
 
 class SearchAgent(BaseAgent):
@@ -290,6 +342,7 @@ class SearchAgent(BaseAgent):
             "taken": next(j for j, o in enumerate(opts) if o.index == taken.index),
             "strategy": strategy,
             "values": None,
+            "values_vs": None,
             "reach": reach.float().cpu().numpy(),
             "seconds": seconds,
             "record_seconds": time.perf_counter() - t0,
@@ -305,12 +358,15 @@ class SearchAgent(BaseAgent):
         acts: list,
         slot: int,
         seconds: float,
+        combo: int,
     ) -> dict:
         """A searched decision: the solved average strategy of every combo at the
         current node, both players' reach there, and ``values[c, a]``, our
         expected chips (net for the hand) for combo ``c`` after action ``a``
         under the solved strategies: the counterfactual value of the child divided
-        by the opponent's reach disjoint from ``c``. NaN where that reach is 0."""
+        by the opponent's reach disjoint from ``c``. NaN where that reach is 0.
+        ``values_vs[o, a]``: the same for our own ``combo`` against opponent
+        combo ``o`` (:func:`pair_values`), for AIVAT's action terms."""
         t0 = time.perf_counter()
         node = tree.current_node
         v, reach = solver.values(seat)
@@ -325,6 +381,7 @@ class SearchAgent(BaseAgent):
             "taken": int(slot),
             "strategy": strat.float().cpu().numpy(),
             "values": ev.float().cpu().numpy(),
+            "values_vs": pair_values(solver, tree, seat, combo).float().cpu().numpy(),
             "reach": reach[:, node].float().cpu().numpy(),
             "seconds": seconds,
             "record_seconds": time.perf_counter() - t0,
@@ -500,7 +557,9 @@ class SearchAgent(BaseAgent):
         self.stats.append(self.last_stats)
         if self.record:
             self.decisions.append(
-                self._search_record(solver, tree, seat, strat, acts, slot, t_end - t0)
+                self._search_record(
+                    solver, tree, seat, strat, acts, slot, t_end - t0, combo_index(hole[0], hole[1])
+                )
             )
         return to_action(engine, kind, amount)
 

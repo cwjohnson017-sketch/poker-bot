@@ -42,10 +42,37 @@ reaches the page.
   panel keeps the last hand's result, with the bot's cards if they were shown.
 
 The session panel shows hands played, your net result, and your win rate in
-bb/100 with a 95% bootstrap CI, raw and luck-adjusted. The luck adjustment is
-AIVAT's chance terms (`pokerbot/eval/luck.py`: all-in equity and street equity
-changes, with both hands known). AIVAT's action terms come with roadmap item
-1.2.
+bb/100 with a 95% bootstrap CI three ways: raw, luck-adjusted and AIVAT. The
+luck adjustment is AIVAT's chance terms (`pokerbot/eval/luck.py`: all-in
+equity and street equity changes, with both hands known). AIVAT adds the bot's
+action terms (`pokerbot/eval/aivat.py`, roadmap item 1.2): at every searched
+bot decision, `sum_a sigma(a) v(a) - v(a_taken)` with `v` the solve's value of
+each action for the bot's hand against your actual hand. All three estimate
+the same win rate, with less variance in that order (see below). Preflop
+decisions come from the solved table, which has no values, and get no action
+term.
+
+### Scoring a session with AIVAT
+
+```bash
+python scripts/score_play_session.py runs/play/20261021-140509
+```
+
+prints your win rate and the bot's, raw / luck-adjusted / AIVAT, with 95% CIs
+and per-hand standard deviations. It recomputes the action terms from the
+logged arrays (`d<k>_strategy`, `d<k>_values_vs`). Sessions logged before
+`values_vs` was recorded are scored with the range values (`d<k>_values`),
+which remove almost nothing (the panel counts those hands with no action
+terms). `--values range` forces the range values.
+
+**Measured** (`scripts/eval_aivat.py`, a tiny CPU search bot at 32
+iterations per solve, 3000 hands against each of `equity`, `random` and
+`always_call`; details in `pokerbot/eval/README.md`): per-hand SD in bb/hand
+raw / luck-adjusted / AIVAT 51.3 / 28.3 / 27.3, 51.0 / 31.1 / 30.8 and
+74.1 / 45.7 / 44.0. The chance terms cut the hands needed for a given CI by
+about 3x. The action terms take off a further 2-8% here, and the AIVAT mean
+agreed with the raw mean in all three. The production bot against a person
+has not been measured yet: that needs a GPU and a person.
 
 ## The session directory
 
@@ -55,8 +82,8 @@ changes, with both hands known). AIVAT's action terms come with roadmap item
 |---|---|
 | `session.json` | the game, the bot spec with its full search config, the seed, the sample size, the git commit, start and resume times |
 | `dealt.jsonl` | one line per dealt hand, written before it is played |
-| `hands.jsonl` | one line per finished hand: deck, button, hole cards, board, every action with its decision time, payoffs, your raw and luck-adjusted result, and a summary of each bot decision (the actions it had, the one it took, timings, search stats) |
-| `solves/hand_<n>.npz` | the bot's arrays for hand `n`, decision `k`: `d<k>_strategy` `[1326, A]` (its strategy for every combo over the `A` actions it had), `d<k>_reach` `[2, 1326]` (both players' reach at the decision, seat order) and, for searched decisions, `d<k>_values` `[1326, A]` |
+| `hands.jsonl` | one line per finished hand: deck, button, hole cards, board, every action with its decision time, payoffs, your raw, luck-adjusted (`human_adjusted`) and AIVAT (`human_aivat`) result, the bot's summed action terms (`bot_action_terms`), and a summary of each bot decision (the actions it had, the one it took, timings, search stats) |
+| `solves/hand_<n>.npz` | the bot's arrays for hand `n`, decision `k`: `d<k>_strategy` `[1326, A]` (its strategy for every combo over the `A` actions it had), `d<k>_reach` `[2, 1326]` (both players' reach at the decision, seat order) and, for searched decisions, `d<k>_values` `[1326, A]` and `d<k>_values_vs` `[1326, A]` |
 | `hands.txt` | the repo's plain-text hand histories (`pokerbot/eval/history.py`) |
 | `pokerstars.txt` | PokerStars-format histories from your seat, for tracking software. Whether a given tracker imports them is untested. |
 | `errors.log` | the traceback if the session stopped on an error |
@@ -64,12 +91,15 @@ changes, with both hands known). AIVAT's action terms come with roadmap item
 `d<k>_values[c, a]` is the bot's expected chips for the whole hand with combo
 `c` after action `a`, under the solved strategies: the counterfactual value of
 that child divided by the opponent's reach disjoint from `c` (NaN where that is
-zero). AIVAT's action terms (1.2) and LBR against the search (1.4) read these
-arrays. Preflop decisions come from the solved table and have a strategy and
+zero). `d<k>_values_vs[o, a]` is the same for the bot's actual combo against
+opponent combo `o` (NaN where `o` shares a card with it; averaged by the
+opponent's reach it gives `d<k>_values[c, a]`). AIVAT's action terms read
+`values_vs`; LBR against the search (1.4) can read these arrays. Preflop decisions come from the solved table and have a strategy and
 reach but no values.
 
 Recording is `SearchAgent(record=True)` (`pokerbot/search/agent.py`). It costs
-one extra value pass per searched decision and never changes the action
+two extra value passes per searched decision (plus one value-net pass at the
+leaves for `values_vs`) and never changes the action
 played (`tests/search/test_agent.py`).
 
 ## Design notes

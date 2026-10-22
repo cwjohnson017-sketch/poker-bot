@@ -275,6 +275,7 @@ function renderStats(v) {
     rows.push(stat(`${ses.names.human}, net`, `${signed(s.net)} chips`, `${signed(bb, 1)} big blinds`));
     rows.push(stat("Win rate", ...rate(s.raw, s.hands)));
     rows.push(stat("Luck-adjusted", ...rate(s.adjusted, s.hands)));
+    if (s.aivat) rows.push(stat("AIVAT", ...rate(s.aivat, s.hands)));
   }
   el.replaceChildren(...rows);
 }

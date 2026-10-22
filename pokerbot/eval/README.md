@@ -36,9 +36,67 @@ Everything that says whether a bot got better lives here (DESIGN.md 5.7).
   check-down value (`c` chips in per player, `E` the equity against the other
   hand given the board so far). Both terms have zero mean, so the adjusted
   win rate estimates the same quantity with a narrower interval. These are
-  the chance terms of AIVAT; its action terms are not implemented. Equities
+  the chance terms of AIVAT; the bot's action terms are in `aivat.py` (below). Equities
   are shared by the two seatings of a duplicate deal, so mirror matches
   still cancel exactly.
+
+## AIVAT: action terms for a recording bot
+
+`aivat.py` (roadmap item 1.2) adds AIVAT's action terms for the bot's own
+decisions to the chance terms of `luck.py`. It is meant for results against a
+person (`pokerbot/play/`), where the opponent's strategy is unknown and
+duplicate dealing is impossible. At every searched decision of a
+`SearchAgent(record=True)` the bot's result gets `sum_a sigma(a) v(a) -
+v(a_taken)`: `sigma` is the strategy row the bot sampled its action from, and
+`v(a)` is the solve's expected chips for the bot's hand after `a` against the
+opponent's actual hand (`values_vs`, `pokerbot.search.agent.pair_values`).
+Each chance and action term has zero mean given everything before it, so the
+total is unbiased whatever the value functions are; the module docstring has
+the argument. The opponent's actions get no term. Preflop decisions (the
+solved table has no values) get none either.
+
+* `aivat_adjusted(hands, decisions, bot_seats, config)`: `(chance, aivat)`,
+  `[n, 2]` zero-sum results of in-memory hands plus the bot's decision records.
+* `score_session(dir)` / `scripts/score_play_session.py runs/play/<session>`:
+  a play session from its logs.
+* `values="range"` values actions against the modelled range (`values[c, a]`)
+  instead. A converged solve is indifferent between the actions it mixes, so
+  those terms are about zero by construction.
+
+**Validation** (`scripts/eval_aivat.py`, 2026-10-21, CPU): a recording
+`SearchAgent` (uniform blueprint, the tiny config of `tests/search/test_agent.py`
+at 32 DCFR iterations per solve) against three baselines, 3000 hands each, 100bb,
+button alternating, no duplicate dealing. Per-hand SD from the bot's seat, in
+bb/hand, and the bot's win rate in mbb/hand with 95% bootstrap CIs:
+
+| Opponent | raw SD | chance SD | chance + range-valued actions | AIVAT SD | raw win rate | AIVAT win rate |
+|---|---|---|---|---|---|---|
+| `equity` | 51.3 | 28.3 | 28.5 | **27.3** | -3925 [-5698, -2070] | -4360 [-5330, -3358] |
+| `random` | 51.0 | 31.1 | 31.4 | **30.8** | +7941 [+6123, +9826] | +7025 [+5947, +8142] |
+| `always_call` | 74.1 | 45.7 | 45.8 | **44.0** | +3027 [+492, +5838] | +1475 [-41, +3020] |
+
+* **Unbiased:** the AIVAT mean is inside the raw CI in all three. Paired
+  `raw - aivat` has z = +0.56 / +1.23 / +1.47, and the action terms alone
+  average to z = +0.20 / -0.40 / -1.91. At the clock-limited tiny config (2-4
+  iterations, `--iterations 0`) the six z scores are within ±1.3.
+* **Variance:** the chance terms do most of the work, removing 64-72% of the
+  raw variance. The action terms remove a further 2-8% of what is left
+  (variance ratio AIVAT / chance 0.93 / 0.98 / 0.93), so the same CI takes
+  about 7% fewer hands against `equity` and `always_call`. Valued against
+  the range instead, they add variance (ratio 1.01). With 2-4 iterations per
+  solve the bot's values are too rough to help: AIVAT SD 32.5 / 35.1 / 50.2
+  against chance-only 32.1 / 34.5 / 50.9.
+* **Why the action terms do little here.** The opponents' decisions are where
+  most of the remaining variance comes from, and they get no terms. The
+  action values assume the opponent plays the solved strategy, and these
+  baselines do not. The chance terms value states by check-down equity, the
+  action terms by the solve, so the two do not telescope as a single value
+  function would. The production bot (converged value-net solves on the GPU)
+  against a person may do better or worse. Its numbers need a GPU and a
+  person: score a real session with `scripts/score_play_session.py`.
+
+Time: 32-iteration CPU solves take about 1.3-2 s per decision. The table above
+took about 3.5 hours of 12 workers (sharing the CPU with a test run).
 
 ## Agent specs
 
@@ -281,4 +339,8 @@ CLI run. LBR tests check exact river equity, the Bayesian range update
 (normalized, card removal), and that LBR beats `always_call` with a CI far
 above zero. The ABR test checks that a 300-step CPU run beats a uniform
 random opponent by a clear margin over the untrained learner. The logger test
-checks the files it writes.
+checks the files it writes. `test_aivat.py` checks that an action term
+averages to zero over the bot's draws at a fixed decision (and exactly in
+expectation), the pair-to-range fallback, that zero-probability actions are
+ignored, and that a recording search bot's AIVAT is its luck-adjusted result
+plus its action terms, with no preflop terms.
