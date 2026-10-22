@@ -27,9 +27,7 @@ fleet = _load("fleet", ROOT / "cloud" / "aws" / "fleet.py")
 
 
 def args(*argv: str):
-    a = fleet.build_parser().parse_args(["--job", "calibrate", *argv])
-    a.dir = a.dir or f"runs/fleet/{a.job}"
-    return a
+    return fleet.parse_args(["--job", "calibrate", *argv])
 
 
 def test_blocks_of_every_job_are_disjoint_and_play_the_fixed_search():
@@ -61,6 +59,51 @@ def test_blocks_of_every_job_are_disjoint_and_play_the_fixed_search():
         "spec/fc",
         "spec/full",
     }
+
+
+def test_a_run_of_several_jobs_keeps_their_blocks_apart(tmp_path):
+    a = fleet.parse_args(
+        ["--job", "lbr", "soak", "lbr", "--lbr-configs", "fcpa/call", "--soak-hands", "4000"]
+    )
+    assert a.jobs == ["lbr", "soak"] and a.job == "lbr-soak" and a.dir == "runs/fleet/lbr-soak"
+    blocks = fleet.run_blocks(a)
+    assert [b.job for b in blocks] == ["lbr", "soak"] * 2 + ["lbr"] * 6  # the jobs take turns
+    assert [b.index for b in blocks if b.job == "lbr"] == list(range(8))
+    assert all(b.name.startswith(f"{b.job}-") for b in blocks)
+    assert all(b.out.startswith(f"runs/fleet/lbr-soak/blocks/{b.job}/") for b in blocks)
+    one = fleet.run_blocks(fleet.parse_args(["--job", "soak", "--soak-hands", "4000"]))
+    assert [b.name for b in one] == ["soak_000", "soak_001"]
+    assert one[0].out == "runs/fleet/soak/blocks/soak_000"
+    a.dir = str(tmp_path / "state")
+    status = fleet.Fleet(a, blocks).status()
+    assert "lbr: {'todo': 8}" in status and "soak: {'todo': 2}" in status
+    arch = fleet.run_blocks(
+        fleet.parse_args(
+            ["--job", "archetypes", "--archetypes", "nit,maniac", "--archetype-deals", "6000"]
+        )
+    )  # the first block of every archetype comes before the second of any
+    assert [b.name for b in arch] == [f"{n}_0{j}" for j in range(3) for n in ("nit", "maniac")]
+
+
+def test_blocks_that_cannot_resume_wait_for_a_worker_with_time_left(tmp_path):
+    a = fleet.parse_args(
+        ["--job", "lbr", "soak", "--lbr-configs", "fcpa/call", "--lbr-hands", "500"]
+        + ["--soak-hands", "2000", "--budget", "5"]
+    )
+    a.dir = str(tmp_path / "state")
+    blocks = fleet.run_blocks(a)
+    assert {b.hours for b in blocks if b.job == "lbr"} == {250 * 45 / 3600}
+    assert {b.hours for b in blocks if b.job == "soak"} == {0.0}
+    f = fleet.Fleet(a, blocks)
+    assert f.next_block("g5.xlarge", 4.0).name == "lbr-fcpa_call_00"
+    assert f.next_block("g5.xlarge", 2.0).name == "soak-soak_000"
+    f.st.blocks["soak-soak_000"] = "done"
+    assert f.next_block("g5.xlarge", 2.0) is None
+    # a finished block that took longer than the estimate raises what the others need
+    f.st.blocks["lbr-fcpa_call_00"] = "done"
+    f.st.meta["lbr-fcpa_call_00"] = {"type": "g5.xlarge", "hours": 5.0}
+    assert f.next_block("g5.xlarge", 4.0) is None
+    assert f.next_block("local").name == "lbr-fcpa_call_01"  # the local GPU has no deadline
 
 
 def test_calibration_has_one_typed_block_per_type():
@@ -134,6 +177,50 @@ def test_state_survives_a_restart_and_done_blocks_stay_done(tmp_path):
     assert g.st.blocks == {"b0": "todo", "b1": "running", "b2": "done"}
     assert g.workers["aws-1"].block == "b1" and g.st.meta["b1"]["type"] == "g5.xlarge"
     assert g.next_block("g5.xlarge").name == "b0"
+
+
+def test_a_local_block_left_by_an_earlier_runner_is_waited_for(tmp_path, monkeypatch):
+    blocks = [fleet.Block(f"b{i}", [], str(tmp_path / f"b{i}")) for i in range(2)]
+    f = _fleet(tmp_path, blocks, argv=["--local"])
+    f.assign(f.workers["local"], blocks[0])
+    (f.dir / "local.pid").write_text("4242")
+    f.save()
+    g = _fleet(tmp_path, blocks, argv=["--local"])
+    assert g.st.blocks["b0"] == "running" and g.workers["local"].block == "b0"
+    monkeypatch.setattr(fleet, "pid_alive", lambda pid: pid == 4242)
+    g.step_local()
+    assert g.workers["local"].state == "running"  # its process still runs
+    (tmp_path / "b0").mkdir()
+    (tmp_path / "b0" / ".done").write_text("x")
+    g.st.blocks["b1"] = "done"  # nothing left to start
+    monkeypatch.setattr(fleet, "pid_alive", lambda pid: False)
+    g.step_local()
+    assert g.st.blocks["b0"] == "done" and g.workers["local"].state == "ready"
+
+
+def test_a_block_failing_three_times_is_set_aside_until_a_rerun(tmp_path, monkeypatch):
+    class Exited:  # a local block that exits at once, unfinished
+        pid = 4242
+
+        def __init__(self, *args, stdout=None, **kw):
+            stdout.close()
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(fleet.subprocess, "Popen", Exited)
+    blocks = [fleet.Block(f"b{i}", [], str(tmp_path / f"b{i}")) for i in range(2)]
+    f = _fleet(tmp_path, blocks, argv=["--local"])
+    f.st.blocks["b1"] = "done"
+    for _ in range(4):  # start, then fail and restart twice, then fail a third time
+        f.step_local()
+    w = f.workers["local"]
+    assert f.st.blocks["b0"] == "failed" and w.state == "off" and w.block is None
+    f.st.blocks["b1"] = "todo"
+    assert f.next_block("local").name == "b1"
+    f.save()
+    g = _fleet(tmp_path, blocks, argv=["--local"])
+    assert g.st.blocks["b0"] == "todo" and g.workers["local"].state == "ready"
 
 
 def test_run_block_runs_in_order_and_marks_done(tmp_path):

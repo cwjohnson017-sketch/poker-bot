@@ -8,7 +8,8 @@ root, ``PYTHONPATH=.``) that ``cloud/aws/run_block.py`` runs in order, writing
 ``.done`` in the block's directory when all succeed. The scripts resume from what
 their directory already holds, so a block cut short continues on its next worker.
 
-Jobs (``--job``):
+Jobs (``--job``, one or more: several jobs share one queue and one set of workers, under
+``runs/fleet/<job>-<job>.../blocks/<job>/``):
 
 * ``calibrate``: ``scripts/calibrate_search.py`` with production's time budgets and
   with fixed iterations, one block per instance type in ``--types`` (and one for the
@@ -41,15 +42,19 @@ Fleet API legacy; EC2 Fleet replaces it.) A region whose launch failed is retrie
 * only instances this runner launched (in its state file) are touched.
 
 **Restart.** State is saved every poll (``<dir>/state.json``); rerunning the same command
-adopts the recorded instances and blocks. ``--dry-run`` prints the blocks and exits;
-``--merge-only`` merges what has finished into ``<dir>/summary.md`` and ``summary.json``
-(done automatically at the end).
+adopts the recorded instances and blocks, and waits for a local block an earlier runner
+left running. The runner keeps Windows awake while it runs. ``--dry-run`` prints the
+blocks and exits; ``--merge-only`` merges what has finished into ``<dir>/summary.md``
+and ``summary.json`` (done automatically at the end); ``--status`` prints the blocks per
+job, the workers and the spend; ``--terminate`` stops the runner and its local block and
+terminates every instance tagged with the run.
 
 The instances fetch ``s3://<bucket>/<bundle-key>`` (``cloud/aws/fleet_bundle.sh``)
 through a pre-signed URL and set up with ``cloud/aws/remote_setup.sh``.
 
-python cloud/aws/fleet.py --job calibrate --types g5.xlarge g6.xlarge --budget 3 \
-    --bucket pokerbot-402616727959
+python cloud/aws/fleet.py --job calibrate --types g5.xlarge g6.xlarge --budget 3
+python cloud/aws/fleet.py --job archetypes lbr soak --soak-hands 20000 --types g5.xlarge \
+    --local --budget 200
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from __future__ import annotations
 import argparse
 import base64
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -107,6 +113,39 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
 
 
+def read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a running Python process (Windows reuses PIDs)."""
+    if os.name == "nt":  # os.kill(pid, 0) would terminate it there
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        return f'"{pid}"' in out and "python" in out.lower()
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def keep_awake() -> None:
+    """Keep Windows from sleeping while this process lives: the runner and the local
+    GPU work for days."""
+    if os.name == "nt":
+        import ctypes
+
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+
+
 # -- jobs ---------------------------------------------------------------------------------
 
 
@@ -118,6 +157,8 @@ class Block:
     type: str | None = None  # an instance type it must run on; "local": the local GPU only
     group: str = ""  # what it adds up with when merged (an archetype, an LBR config)
     index: int = 0  # its place in the group
+    job: str = ""  # the job it belongs to (a run can hold several)
+    hours: float = 0.0  # a block that cannot resume: about how long it takes on a spot GPU
 
 
 def calibrate_blocks(args: argparse.Namespace, base: str) -> list[Block]:
@@ -170,6 +211,7 @@ def archetype_blocks(args: argparse.Namespace, base: str) -> list[Block]:
 
 def lbr_blocks(args: argparse.Namespace, base: str) -> list[Block]:
     per = math.ceil(args.lbr_hands / args.block_hands)
+    hours = args.block_hands * args.lbr_hand_seconds / 3600
     blocks = []
     for config in args.lbr_configs:
         raises, preflop = config.split("/")
@@ -183,7 +225,7 @@ def lbr_blocks(args: argparse.Namespace, base: str) -> list[Block]:
                 "--raises", raises, "--preflop", preflop, "--hands", str(hands),
                 "--seed", str(seed), "--out", f"{out}/lbr.json", "--log-dir", f"{out}/log",
             ]  # fmt: skip
-            blocks.append(Block(name, [cmd], out, group=config, index=j))
+            blocks.append(Block(name, [cmd], out, group=config, index=j, hours=hours))
     return blocks
 
 
@@ -275,6 +317,7 @@ def merge_calibrate(root: Path, blocks: list[Block], meta: dict) -> dict:
 def merge_archetypes(root: Path, blocks: list[Block], meta: dict) -> dict:
     mod = _load_script("run_archetypes")
     merged: dict[str, Any] | None = None
+    deals: dict[str, int] = {}
     for b in sorted(blocks, key=lambda b: (b.group, b.index)):
         data = _read(root / b.out / "result.json")
         if not data:
@@ -282,16 +325,16 @@ def merge_archetypes(root: Path, blocks: list[Block], meta: dict) -> dict:
         if merged is None:
             merged = {k: v for k, v in data.items() if k != "archetypes"}
             merged["archetypes"] = {}
-            merged["deals"] = 0
         for name, entry in data["archetypes"].items():
             out = merged["archetypes"].setdefault(name, {})
             for role, part in entry.items():
                 chunks = out.setdefault(role, {"chunks": []})["chunks"]
                 for c in part.get("chunks", []):
                     chunks.append({**c, "k": 1_000 * b.index + int(c["k"])})
-        merged["deals"] += int(data.get("deals", 0))
+        deals[b.group] = deals.get(b.group, 0) + int(data.get("deals", 0))
     if merged is None:
         return {"lines": ["no archetype results yet"], "merged": None}
+    merged["deals"] = max(deals.values())  # per archetype, as in run_archetypes
     bb = int((merged.get("game") or {}).get("big_blind", 100))
     summary = mod.summarise(merged, bb, 2000)
     return {"lines": mod.table(summary, merged), "merged": merged, "summary": summary}
@@ -472,12 +515,15 @@ class Fleet:
         self.templates: dict[str, tuple[str, str]] = {}
         self.local_proc: subprocess.Popen | None = None
         self.stopped_launching = False
+        self.fails: dict[str, int] = {}  # per block, this runner's
         self._load()
         for b in blocks:  # a finished block stays finished across restarts
             if self.done(b):
                 self.st.blocks[b.name] = "done"
-        if args.local and "local" not in self.workers:
-            self.workers["local"] = Worker("local", "local")
+        if args.local:
+            w = self.workers.setdefault("local", Worker("local", "local"))
+            if w.state == "off":
+                w.state, w.fails = "ready", 0
 
     # -- state ----------------------------------------------------------------------------
 
@@ -487,14 +533,12 @@ class Fleet:
             return
         for name, status in st["blocks"].items():
             if name in self.st.blocks:
-                self.st.blocks[name] = "todo" if status == "running" else status
+                self.st.blocks[name] = "todo" if status in ("running", "failed") else status
         self.st.meta = st.get("meta", {})
         self.st.n_launched = st.get("n_launched", 0)
         self.workers = {k: Worker(**w) for k, w in st["workers"].items()}
         for w in self.workers.values():
-            if w.kind == "local" and w.state == "running":
-                w.state, w.block = "ready", None  # died with the old process
-            elif w.block is not None and w.state != "dead":
+            if w.block is not None and w.state != "dead":
                 self.st.blocks[w.block] = "running"
         log(f"# resumed: {self.counts()}, workers {[w.name for w in self.alive()]}")
 
@@ -537,11 +581,27 @@ class Fleet:
         d = ROOT / b.out
         return sum(p.stat().st_size for p in d.rglob("*") if p.is_file()) if d.exists() else 0
 
-    def next_block(self, worker_type: str) -> Block | None:
+    def needed_hours(self, b: Block) -> float:
+        """How long a block that cannot resume needs on a spot GPU: its estimate, or
+        the longest a finished block of its job took there, if longer."""
+        if not b.hours:
+            return 0.0
+        took = [
+            m.get("hours") or 0.0
+            for n, m in self.st.meta.items()
+            if n in self.by_name and self.by_name[n].job == b.job and m.get("type") != "local"
+        ]
+        return max([b.hours, *took])
+
+    def next_block(self, worker_type: str, hours_left: float = math.inf) -> Block | None:
+        """The next block for a worker: partial blocks first, and none that cannot
+        resume and would outlast the worker."""
         todo = [
             self.by_name[n]
             for n, s in self.st.blocks.items()
-            if s == "todo" and self.by_name[n].type in (None, worker_type)
+            if s == "todo"
+            and self.by_name[n].type in (None, worker_type)
+            and self.needed_hours(self.by_name[n]) <= hours_left
         ]
         todo.sort(key=lambda b: -self.progress(b))
         return todo[0] if todo else None
@@ -553,6 +613,13 @@ class Fleet:
         path = d / "block.json"
         path.write_text(json.dumps({"name": b.name, "out": b.out, "commands": b.commands}))
         return path
+
+    def block_failed(self, b: Block, why: str) -> None:
+        """Back to the queue, or out of it at its third failure: a broken block must not
+        take one worker after another down with it. A rerun of the runner retries it."""
+        n = self.fails[b.name] = self.fails.get(b.name, 0) + 1
+        self.st.blocks[b.name] = "failed" if n >= 3 else "todo"
+        log(f"{b.name} exited unfinished ({why}){'; given up' if n >= 3 else ''}")
 
     def assign(self, w: Worker, b: Block) -> None:
         self.st.blocks[b.name] = "running"
@@ -589,38 +656,41 @@ class Fleet:
         w = self.workers.get("local")
         if w is None or w.state == "off":
             return
-        if w.state == "running" and self.local_proc is not None:
-            rc = self.local_proc.poll()
+        if w.state == "running":
+            if self.local_proc is not None:
+                rc = self.local_proc.poll()
+            else:  # started by an earlier runner: it runs while its process does
+                pid = read_pid(self.dir / "local.pid")
+                rc = None if pid is not None and pid_alive(pid) else -1
             if rc is None:
                 return
             b = self.by_name[w.block]
+            w.state, w.block, self.local_proc = "ready", None, None
+            (self.dir / "local.pid").unlink(missing_ok=True)
             if self.done(b):
                 self.st.blocks[b.name] = "done"
                 log(f"local: {b.name} done")
             else:
-                self.st.blocks[b.name] = "todo"
                 w.fails += 1
-                log(f"local: {b.name} exited with {rc} unfinished (failure {w.fails})")
+                self.block_failed(b, f"local, exit {rc}, its failure {w.fails}")
                 if w.fails >= 3:
                     w.state = "off"
-                    log("local: 3 failures, local worker off")
+                    log("local: 3 failures, local worker off (a rerun turns it back on)")
                     return
-            w.state, w.block, self.local_proc = "ready", None, None
         if w.state == "ready":
             b = self.next_block("local")
             if b is None:
                 return
             spec = self.write_spec(b)
-            awake = ROOT / "runs" / "value_net" / "keepawake.py"
-            wrap = [PY, str(awake)] if awake.exists() else [PY]
             logf = open(ROOT / b.out / "local.log", "a")  # noqa: SIM115
             self.local_proc = subprocess.Popen(
-                [*wrap, "cloud/aws/run_block.py", spec.relative_to(ROOT).as_posix()],
+                [PY, "cloud/aws/run_block.py", str(spec)],
                 cwd=ROOT,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "PYTHONPATH": "."},
             )
+            (self.dir / "local.pid").write_text(str(self.local_proc.pid))
             self.assign(w, b)
             log(f"local: {b.name} started")
 
@@ -798,9 +868,11 @@ class Fleet:
         log(f"{w.name}: {w.instance_id} ended: {why}")
 
     def terminate(self, w: Worker, why: str) -> None:
-        """Shut the instance down over SSH (it terminates on shutdown), then ask EC2 to
-        terminate it too."""
+        """Pull its block, shut the instance down over SSH (it terminates on shutdown),
+        then ask EC2 to terminate it too."""
         if w.host:
+            if w.block is not None:
+                self.pull(w)
             self.ssh(w, "sudo shutdown -h now", timeout=30)
         rc, out = self.aws(w.region, "ec2", "terminate-instances", "--instance-ids", w.instance_id)
         if rc:
@@ -873,34 +945,36 @@ class Fleet:
             return
         if w.state == "running":
             b = self.by_name[w.block]
+            pid = shlex.quote(f"{b.out}/.pid")
+            # is it running, then what it wrote (.done comes before its process exits)
+            rc, out = self.ssh(
+                w, f"cd ~/poker-bot && kill -0 $(cat {pid}) 2>/dev/null && echo up || echo down"
+            )
+            if rc != 0:  # unreachable: an interruption the API has not shown yet?
+                w.unreachable = w.unreachable or now
+                if now - w.unreachable > 600:
+                    self.terminate(w, "no SSH for 10 min")
+                return
+            w.unreachable = 0.0
             if self.pull(w):
                 self.st.blocks[b.name] = "done"
+                self.st.meta[b.name]["hours"] = (now - w.since) / 3600
                 log(f"{w.name}: {b.name} done")
                 w.state, w.block, w.since = "ready", None, now
-            else:
-                pid = f"{b.out}/.pid"
-                rc, out = self.ssh(
-                    w, f"cd ~/poker-bot && kill -0 $(cat {pid}) 2>/dev/null && echo up || echo down"
-                )
-                if rc != 0:  # unreachable: an interruption the API has not shown yet?
-                    w.unreachable = w.unreachable or now
-                    if now - w.unreachable > 600:
-                        self.terminate(w, "no SSH for 10 min")
-                    return
-                w.unreachable = 0.0
-                if out.strip().endswith("down"):
-                    _, tail = self.ssh(w, f"tail -3 ~/block_{b.name}.log")
-                    w.fails += 1
-                    self.st.blocks[b.name] = "todo"
-                    w.state, w.block = "ready", None
-                    log(f"{w.name}: {b.name} exited unfinished, failure {w.fails}: {tail[-300:]}")
-                    if w.fails >= 3:
-                        self.terminate(w, "3 block failures")
-                    return
+            elif out.strip().endswith("down"):
+                _, tail = self.ssh(w, f"tail -3 ~/block_{b.name}.log")
+                w.fails += 1
+                w.state, w.block = "ready", None
+                self.block_failed(b, f"{w.name}, its failure {w.fails}: {tail[-300:]}")
+                if w.fails >= 3:
+                    self.terminate(w, "3 block failures")
+                return
         if w.state == "ready":
-            b = self.next_block(w.type)
+            # it shuts itself down --max-hours after boot; keep a quarter hour spare
+            left = self.args.max_hours - (now - w.launched) / 3600 - 0.25
+            b = self.next_block(w.type, left)
             if b is None:
-                self.terminate(w, "nothing left for it")
+                self.terminate(w, f"nothing left for it in its last {left:.1f} h")
                 return
             self.write_spec(b)
             if not self.push(w, b):
@@ -964,25 +1038,96 @@ class Fleet:
             return  # one launch attempt per poll
 
     def merge(self) -> None:
-        blocks = [b for b in self.by_name.values() if self.done(b)]
-        res = MERGES[self.args.job](ROOT, blocks, self.st.meta)
+        done = [b for b in self.by_name.values() if self.done(b)]
         n = len(self.by_name)
         head = [
-            f"# fleet job {self.args.job}: {len(blocks)} of {n} blocks done",
+            f"# fleet run {self.args.job}: {len(done)} of {n} blocks done",
             "",
             f"AWS spend about ${self.spent():.2f} over {self.st.n_launched} launches.",
             "",
         ]
-        (self.dir / "summary.md").write_text(
-            "\n".join(head + res["lines"]) + "\n", encoding="utf-8"
-        )
-        data = {k: v for k, v in res.items() if k != "lines"}
-        data.update(job=self.args.job, done=len(blocks), blocks=n, spent=self.spent())
+        lines: list[str] = []
+        data: dict[str, Any] = {"run": self.args.job, "done": len(done), "blocks": n}
+        for job in self.args.jobs:
+            blocks = [b for b in done if b.job == job]
+            total = sum(1 for b in self.by_name.values() if b.job == job)
+            if job == "soak":
+                res = merge_soak(ROOT, blocks, self.st.meta, dest=self.dir / "soak_merged")
+            else:
+                res = MERGES[job](ROOT, blocks, self.st.meta)
+            if len(self.args.jobs) > 1:
+                lines += [f"## {job}: {len(blocks)} of {total} blocks", ""]
+            lines += [*res["lines"], ""]
+            data[job] = {k: v for k, v in res.items() if k != "lines"}
+        data["spent"] = self.spent()
+        (self.dir / "summary.md").write_text("\n".join(head + lines) + "\n", encoding="utf-8")
         (self.dir / "summary.json").write_text(json.dumps(data, indent=1, default=str))
-        for line in head + res["lines"]:
+        for line in head + lines:
             log(f"# {line}")
 
+    def status(self) -> str:
+        """Blocks per job and state, the workers alive, and the spend so far."""
+        out = [f"run {self.args.job}: spent ${self.spent():.2f} over {self.st.n_launched} launches"]
+        for job in self.args.jobs:
+            counts: dict[str, int] = {}
+            for b in self.by_name.values():
+                if b.job == job:
+                    s = self.st.blocks[b.name]
+                    counts[s] = counts.get(s, 0) + 1
+            out.append(f"  {job}: {counts}")
+        now = time.time()
+        for w in self.workers.values():
+            if w.kind == "local" or w.state != "dead":
+                age = f"{(now - w.launched) / 3600:.1f} h, ${w.price:.3f}/h" if w.launched else ""
+                out.append(f"  {w.name} {w.type} {w.region} {w.state} {w.block or ''} {age}")
+        return "\n".join(out)
+
+    def stop_everything(self) -> None:
+        """Stop the runner process and the local block it started (their PIDs are in
+        the state directory), then terminate every instance tagged with this run, recorded
+        or not (a runner killed mid-launch can leave one unrecorded)."""
+        for f in ("runner.pid", "local.pid"):
+            path = self.dir / f
+            if not path.exists():
+                continue
+            pid = path.read_text().strip()
+            if os.name == "nt":
+                self.run(["taskkill", "/T", "/F", "/PID", pid], timeout=60)
+            else:
+                self.run(["kill", pid], timeout=30)
+            path.unlink(missing_ok=True)
+            log(f"stopped {f} {pid}")
+        self._load()  # what the runner saved last
+        for region in self.args.regions:
+            rc, out = self.aws(
+                region, "ec2", "describe-instances", "--filters",
+                f"Name=tag:purpose,Values=fleet-{self.args.job}",
+                "Name=instance-state-name,Values=pending,running,stopping",
+                "--query", "Reservations[].Instances[].InstanceId", "--output", "text",
+            )  # fmt: skip
+            ids = out.split() if rc == 0 else []
+            if ids:
+                self.aws(region, "ec2", "terminate-instances", "--instance-ids", *ids)
+                log(f"{region}: terminated {' '.join(ids)}")
+        for w in self.alive():
+            w.state, w.ended = "dead", w.ended or time.time()
+            if w.block is not None and self.st.blocks.get(w.block) == "running":
+                self.st.blocks[w.block] = "todo"
+            w.block = None
+        local = self.workers.get("local")
+        if local is not None and local.state == "running":
+            if local.block is not None:
+                self.st.blocks[local.block] = "todo"
+            local.state, local.block = "ready", None
+        self.save()
+
     def loop(self) -> None:
+        pid_file = self.dir / "runner.pid"
+        pid = read_pid(pid_file)
+        if pid is not None and pid != os.getpid() and pid_alive(pid):
+            raise SystemExit(f"a runner (pid {pid}, {pid_file}) is already running this job")
+        pid_file.write_text(str(os.getpid()))
+        keep_awake()
         log(f"# {self.args.job}: {len(self.by_name)} blocks, {self.counts()}")
         while True:
             try:
@@ -998,27 +1143,40 @@ class Fleet:
             except Exception as e:  # a failed AWS or SSH call is retried next poll
                 log(f"! {e!r}")
             self.save()
-            if all(s == "done" for s in self.st.blocks.values()):
+            if all(s in ("done", "failed") for s in self.st.blocks.values()):
+                failed = [n for n, s in self.st.blocks.items() if s == "failed"]
+                if failed:
+                    log(f"# given up after 3 failures each (rerun to retry): {failed}")
                 for w in self.alive():
                     self.terminate(w, "job complete")
                 self.save()
                 self.merge()
+                (self.dir / "runner.pid").unlink(missing_ok=True)
                 return
             local = self.workers.get("local")
             no_local = local is None or local.state == "off"
             if not self.alive() and no_local and self.stopped_launching:
                 log("# no workers left and no more launches; stopping (rerun to resume)")
                 self.merge()
+                (self.dir / "runner.pid").unlink(missing_ok=True)
                 return
             time.sleep(self.args.poll)
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--job", required=True, choices=sorted(JOBS))
-    ap.add_argument("--dir", help="state and block results (default runs/fleet/<job>)")
+    ap.add_argument(
+        "--job", required=True, nargs="+", choices=sorted(JOBS), help="one or more jobs, one queue"
+    )
+    ap.add_argument("--dir", help="state and block results (default runs/fleet/<job>[-<job>...])")
     ap.add_argument("--dry-run", action="store_true", help="print the blocks and exit")
     ap.add_argument("--merge-only", action="store_true", help="merge finished blocks and exit")
+    ap.add_argument("--status", action="store_true", help="print blocks, workers, spend; exit")
+    ap.add_argument(
+        "--terminate",
+        action="store_true",
+        help="stop the runner and its local block, terminate the run's instances, exit",
+    )
     jobs = ap.add_argument_group("jobs")
     jobs.add_argument("--seed", type=int, default=50_000)
     jobs.add_argument("--calibrate-hands", type=int, default=24)
@@ -1034,6 +1192,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=["fcpa/call", "fcpa/fc", "fcpa/full", "spec/call", "spec/fc", "spec/full"],
     )
     jobs.add_argument("--lbr-hands", type=int, default=2_000)
+    jobs.add_argument(
+        "--lbr-hand-seconds",
+        type=float,
+        default=45.0,
+        help="lbr: seconds per hand on a spot GPU (LBR cannot resume: no block starts on an "
+        "instance with less time left than its blocks take)",
+    )
     jobs.add_argument("--soak-hands", type=int, default=100_000)
     jobs.add_argument("--block-hands", type=int, default=250, help="lbr: hands per block")
     jobs.add_argument(
@@ -1056,11 +1221,35 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: list[str] | None = None) -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = build_parser().parse_args(argv)
+    args.jobs = list(dict.fromkeys(args.job))
+    args.job = "-".join(args.jobs)  # the run's label: its directory, launch template, tags
     args.dir = args.dir or f"runs/fleet/{args.job}"
+    return args
+
+
+def run_blocks(args: argparse.Namespace) -> list[Block]:
+    """Every job's blocks in one queue: the first block of every group (archetype, LBR
+    configuration) before the second of any, and the jobs taking turns, so every
+    result starts early. With several jobs, a block's name and directory start with its
+    job."""
+    many = len(args.jobs) > 1
+    queues = []
+    for job in args.jobs:
+        blocks = JOBS[job](args, f"{args.dir}/blocks/{job}" if many else f"{args.dir}/blocks")
+        for b in blocks:
+            b.job = job
+            if many:
+                b.name = f"{job}-{b.name}"
+        queues.append(sorted(blocks, key=lambda b: b.index))
+    return [b for turn in itertools.zip_longest(*queues) for b in turn if b is not None]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     sys.path.insert(0, str(ROOT))
-    blocks = JOBS[args.job](args, f"{args.dir}/blocks")
+    blocks = run_blocks(args)
     if args.dry_run:
         for b in blocks:
             where = b.type or "any worker"
@@ -1070,6 +1259,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(blocks)} blocks")
         return 0
     fleet = Fleet(args, blocks)
+    if args.status:
+        print(fleet.status())
+        return 0
+    if args.terminate:
+        fleet.stop_everything()
+        print(fleet.status())
+        return 0
     if args.merge_only:
         fleet.merge()
         return 0

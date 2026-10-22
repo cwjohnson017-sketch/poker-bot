@@ -36,22 +36,31 @@ counts, or re-time first.
 # Fleet runner (`fleet.py`)
 
 Runs the long Phase 1 jobs of `docs/roadmap.md` on spot GPU instances (and the local
-GPU with `--local`): `calibrate`, `archetypes`, `lbr` and `soak`. A job is split into
-resumable blocks, each a directory `runs/fleet/<job>/blocks/<block>/` that the same
-command fills here or on an instance (`run_block.py`). Launches are EC2 Fleet `instant`
-requests over several instance types and every zone, with the `price-capacity-optimized`
-allocation; AWS calls the older Spot Fleet API legacy. The guards of `h2h_coordinator.py`
-carry over: a spend budget, self-termination after `--max-hours`, idle instances
-terminated, restart from `state.json`. See the docstring for every option.
+GPU with `--local`): `calibrate`, `archetypes`, `lbr` and `soak`, one or several in one
+queue. A job is split into blocks, each a directory `runs/fleet/<run>/blocks/<block>/`
+that the same command fills here or on an instance (`run_block.py`); the runner pulls
+it every poll, so a block cut short resumes on its next worker (LBR cannot resume, so
+its blocks only start on an instance with time left for them). Launches are EC2 Fleet
+`instant` requests over several instance types and every zone, with the
+`price-capacity-optimized` allocation; AWS calls the older Spot Fleet API legacy. The
+guards of `h2h_coordinator.py` carry over: a spend budget, self-termination after
+`--max-hours`, idle instances terminated, restart from `state.json`. See the docstring
+for every option.
 
 ```bash
 git switch -c <branch> && git commit ...    # the instances run the bundle's commit
 REF=<branch> bash cloud/aws/fleet_bundle.sh # code at REF + nets, table, blueprint (~1 GB)
 python cloud/aws/fleet.py --job calibrate --types g5.xlarge g6.xlarge --budget 3
-python cloud/aws/fleet.py --job archetypes --dry-run      # the blocks, nothing launched
-python cloud/aws/fleet.py --job archetypes --budget 150 --slots 2 --local
-python cloud/aws/fleet.py --job archetypes --merge-only   # summary.md of what finished
+python cloud/aws/fleet.py --job archetypes lbr soak --soak-hands 20000 --dry-run
+python cloud/aws/fleet.py --job archetypes lbr soak --soak-hands 20000 --types g5.xlarge \
+    --local --budget 200                                 # Phase 1's runs, ~4-6 days
+python cloud/aws/fleet.py --job archetypes lbr soak --status     # blocks, workers, spend
+python cloud/aws/fleet.py --job archetypes lbr soak --merge-only # summary.md so far
+python cloud/aws/fleet.py --job archetypes lbr soak --terminate  # stop it all
 ```
+
+`--status`, `--merge-only` and `--terminate` find the run by its jobs (or `--dir`).
+Rerunning the launch command resumes a stopped run.
 
 **Same strength on every GPU.** The search stops on a time budget, so a slower GPU
 would play a weaker bot. Every job but `calibrate` plays
