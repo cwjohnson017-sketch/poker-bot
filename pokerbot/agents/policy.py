@@ -409,11 +409,15 @@ class SampledPolicyAgent(PolicyAgentBase):
         return counts / counts.sum()
 
 
-def as_policy_agent(agent: Any, samples: int = 16, spec: Any = None) -> Any:
-    """Return ``agent`` itself when it has ``policy``; an exact policy for the
+def as_policy_agent(agent: Any, samples: int = 16, spec: Any = None, **kwargs: Any) -> Any:
+    """Return ``agent`` itself when it has ``policy``; the agent's own adapter
+    when it has ``policy_agent(**kwargs)`` (the search,
+    :class:`~pokerbot.search.policy.SearchPolicyAgent`); an exact policy for the
     always-call baseline; otherwise a :class:`SampledPolicyAgent` (warns)."""
     if hasattr(agent, "policy"):
         return agent
+    if callable(getattr(agent, "policy_agent", None)):
+        return agent.policy_agent(**kwargs)
     from .baselines import AlwaysCallAgent
 
     if isinstance(agent, AlwaysCallAgent):

@@ -173,6 +173,74 @@ checkpoints. `range reset` counts hands where the observed action had
 essentially zero probability under the reported policy (likelihoods are
 floored at `1e-4`). That points to a policy/act mismatch in the opponent.
 
+### LBR against the search (roadmap 1.4)
+
+```
+python scripts/run_lbr.py --config configs/lbr_search_vn.yaml --raises fcpa --preflop call \
+    --hands 2000 --out results/lbr_search_fcpa_call.json --log-dir runs/lbr/search_fcpa_call
+```
+
+`--opponent search:...` works like any other spec (its search YAML from
+`agents.search.config`, or `--search-config`). `as_policy_agent` turns the
+`SearchAgent` into a `SearchPolicyAgent` (`pokerbot/search/policy.py`), which
+plays through the agent with `record=True` and answers LBR's range queries
+with `range_strategy(state, seat) -> (actions, [1326, n])` over the concrete
+`(kind, amount)` actions. LBR uses that interface directly: the range update
+takes the exact probability of the action the bot played, and `fp` is the
+range-weighted fold column, with no mapping onto the action spec.
+
+* **Real decisions**: the strategy the agent recorded there, the one it played.
+* **After LBR's candidate raises**: a search at that hypothetical state, run on
+  a fork of the agent (its own copies of the continual-resolving cache, the
+  street roots and the played strategies; nets, blueprint and config shared).
+  The fork resolves exactly as the real agent would on reaching that state, and
+  the real hand's caches are untouched (`tests/search/test_policy.py` checks
+  both, and that a hypothetical search equals the real one when LBR then
+  plays that raise). Cached by public state for the hand. Off-tree sizes are
+  added at the root as in real play; preflop goes through the solved table
+  and its base blueprint off it, so preflop queries are lookups.
+* The fork uses the bot's real hole cards (never LBR's). With
+  `remove_own_blockers` the solve removes them from its model of LBR's range,
+  so the rows of other hands are what this solve computed, not what the bot
+  would compute holding them: a few blocker combos of difference.
+* `--hypothetical-budget 0.5` halves the time of the hypothetical searches
+  (cheaper, slightly less faithful fold probabilities). Default 1.
+* The summary adds `opponent decisions per hand`: real and hypothetical
+  searches by street with their mean seconds, and `*/fallback` if any search
+  failed and played the blueprint.
+
+**Cost.** CPU, `TINY` search config (`tests/search/test_agent.py`, uniform
+blueprint, 100bb), 40 hands, 1 thread: a plain match costs 0.77 s per hand;
+LBR `fcpa` 1.0-2.1 s per hand with 1.3 hypothetical searches per hand next to
+1.0 real ones, and `spec` 2.3-4.7 s with 2.3-2.4 hypothetical ones (the
+uniform blueprint's default spec). `full` is cheaper per hand because LBR
+ends many hands preflop.
+
+Production, GPU (RTX 4070 Ti, `configs/lbr_search_vn.yaml`, 2026-10-21), 6
+hands of `fcpa`/`fc`: 22.2 s per hand. A real flop search took 5.0 s (4 s
+budget plus recording and cache store), a turn search 2.3 s, a hypothetical
+flop search 4.6 s and turn 2.5 s; per hand, 2.2 real postflop searches and 2.8
+hypothetical ones. A normal hand of the bot is about 9 s, so LBR is about 2.5x
+a match. `spec` raises use the blueprint's sizes: 7 open sizes plus all-in in
+an unopened pot (8 searches per LBR decision, against 2 for `fcpa`), and the
+same 2 facing a bet; a 3-hand `spec`/`fc` smoke ran 8 hypothetical flop
+searches at its one flop decision. Facing bets are common, so expect `spec`
+at roughly 2-3x the hypothetical cost of `fcpa`, about 40-50 s per hand.
+
+| configuration | s per hand (est.) | 2,000 hands | 5,000 hands |
+|---|---|---|---|
+| `fcpa` / `call`, `fc` | ~22 (measured on `fc`) | ~12 h | ~31 h |
+| `fcpa` / `full` | below that (hands end preflop) | < 12 h | < 31 h |
+| `spec` / `call`, `fc` | ~40-50 | ~22-28 h | ~55-70 h |
+| `spec` / `full` | below that | < 28 h | < 70 h |
+
+The six configurations at 2,000 hands are about 4-5 GPU days on one card;
+`--hypothetical-budget 0.5` cuts about a quarter (`fcpa`) to a third
+(`spec`). One process per GPU (`workers: 1`); spot GPUs can run
+configurations in parallel. Gate 1 wants every configuration under +1,000
+mbb/hand; the published search bots made LBR lose (DeepStack -383 to -775,
+ReBeL -881, Supremus -951), ACPC-era abstraction bots gave it 3,300-4,700.
+
 ## Approximate best response (ABR)
 
 ```
@@ -325,6 +393,7 @@ GPU, torch limited to 1 thread per process.
 | Ladder, 4 baselines, 2,000 hands per pair, 4 workers | about 1-3 s per pair (Monte Carlo equity in `equity` dominates) |
 | LBR vs `always_call` / `uniform` | ~20-40 ms per hand per process (flop equity with 64 runouts dominates) |
 | LBR vs an act-only agent (`SampledPolicyAgent`) | seconds per hand (1,326 hands x samples `act` calls per opponent action) |
+| LBR vs the search, `TINY` config on CPU | 1-5 s per hand (see "LBR against the search"; production on the GPU about 22 s per hand with `fcpa`) |
 | ABR `abr_tiny.yaml` (256 envs, 400 steps, 2 x 4,096 eval hands) | ~20 s on 1 thread. With all threads on a busy box it can be 10x slower. Set `threads: 1` |
 | `pytest tests/eval` | ~20 s |
 
