@@ -117,19 +117,17 @@ def summary(session: PlaySession, log: SessionLog) -> str:
     s = session.stats.summary()
     lines = [f"Session {log.meta['session']}: {s['hands']} hands, {session.abandoned} abandoned"]
     if s["hands"]:
-        raw, adj = s["raw"], s["adjusted"]
         lines.append(f"  {log.meta['names'][0]}: {s['net']:+,.0f} chips ({s['net_bb']:+,.1f} bb)")
-        if s["hands"] < 30:  # a bootstrap CI over a handful of hands means little
-            lines.append(
-                f"  bot win rate: {-raw['mbb']:+.0f} mbb/hand, luck-adjusted "
-                f"{-adj['mbb']:+.0f} (CIs after 30 hands)"
-            )
-        else:
-            lines.append(
-                f"  bot win rate: {-raw['mbb']:+.0f} mbb/hand, 95% CI [{-raw['hi']:+.0f}, "
-                f"{-raw['lo']:+.0f}]; luck-adjusted {-adj['mbb']:+.0f} [{-adj['hi']:+.0f}, "
-                f"{-adj['lo']:+.0f}]"
-            )
+        ci = s["hands"] >= 30  # a bootstrap CI over a handful of hands means little
+        parts = []
+        for label, key in (("raw", "raw"), ("luck-adjusted", "adjusted"), ("AIVAT", "aivat")):
+            r = s[key]
+            text = f"{label} {-r['mbb']:+.0f}"
+            if ci:
+                text += f" [{-r['hi']:+.0f}, {-r['lo']:+.0f}]"
+            parts.append(text)
+        tail = "95% CIs" if ci else "CIs after 30 hands"
+        lines.append(f"  bot win rate, mbb/hand ({tail}): " + "; ".join(parts))
     lines.append(f"  logs: {log.dir}")
     return "\n".join(lines)
 

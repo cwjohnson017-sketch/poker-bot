@@ -1,9 +1,10 @@
 """Running results of a play session, from the person's point of view.
 
-Raw chips and the luck-adjusted chips of :mod:`pokerbot.eval.luck` (AIVAT's
-chance terms: all-in EV and street equity changes, both hands known), each as
-mbb/hand with a percentile-bootstrap CI (:func:`pokerbot.eval.stats.win_rate`).
-The bot's numbers are the negatives.
+Raw chips, the luck-adjusted chips of :mod:`pokerbot.eval.luck` (AIVAT's
+chance terms: all-in EV and street equity changes, both hands known) and AIVAT
+(:mod:`pokerbot.eval.aivat`: the chance terms plus the bot's action terms),
+each as mbb/hand with a percentile-bootstrap CI
+(:func:`pokerbot.eval.stats.win_rate`). The bot's numbers are the negatives.
 """
 
 from __future__ import annotations
@@ -18,14 +19,17 @@ class SessionStats:
         self.n_boot = n_boot
         self.raw: list[float] = []
         self.adjusted: list[float] = []
+        self.aivat: list[float] = []
 
     @property
     def hands(self) -> int:
         return len(self.raw)
 
-    def add(self, raw: float, adjusted: float) -> None:
+    def add(self, raw: float, adjusted: float, aivat: float | None = None) -> None:
+        """One hand. ``aivat`` defaults to ``adjusted`` (no action terms)."""
         self.raw.append(float(raw))
         self.adjusted.append(float(adjusted))
+        self.aivat.append(float(adjusted if aivat is None else aivat))
 
     def _rate(self, samples: list[float]) -> dict:
         wr = win_rate(samples, self.big_blind, 1, self.confidence, self.n_boot, rng=0)
@@ -41,6 +45,7 @@ class SessionStats:
             net_bb=net / self.big_blind,
             raw=self._rate(self.raw),
             adjusted=self._rate(self.adjusted),
+            aivat=self._rate(self.aivat),
             confidence=self.confidence,
         )
         return out

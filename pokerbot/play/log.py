@@ -9,7 +9,9 @@
   bot's decisions (actions, the one taken, timings, search stats).
 * ``solves/hand_<n>.npz``: the bot's arrays for hand ``n``, per decision ``k``:
   ``d<k>_strategy`` ``[1326, A]``, ``d<k>_reach`` ``[2, 1326]`` and, for
-  searched decisions, ``d<k>_values`` ``[1326, A]`` (expected chips per action).
+  searched decisions, ``d<k>_values`` ``[1326, A]`` (expected chips per action)
+  and ``d<k>_values_vs`` ``[1326, A]`` (the bot's own combo's expected chips
+  per action against each opponent combo, for AIVAT).
 * ``hands.txt``: the hands in the repo's plain-text history format
   (:mod:`pokerbot.eval.history`).
 * ``pokerstars.txt``: the hands in PokerStars' text format, from the person's
@@ -64,6 +66,8 @@ def decision_arrays(decisions: Sequence[dict]) -> dict[str, np.ndarray]:
         out[f"d{k}_reach"] = np.asarray(d["reach"], dtype=np.float32)
         if d.get("values") is not None:
             out[f"d{k}_values"] = np.asarray(d["values"], dtype=np.float32)
+        if d.get("values_vs") is not None:
+            out[f"d{k}_values_vs"] = np.asarray(d["values_vs"], dtype=np.float32)
     return out
 
 

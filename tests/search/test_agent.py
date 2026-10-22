@@ -97,8 +97,9 @@ def test_recording_keeps_the_play_and_logs_every_decision():
     counts) and keeps one record per decision of the hand."""
     from pokerbot.agents import AlwaysCallAgent
     from pokerbot.eval.match import play_hand
-    from pokerbot.search.combos import combo_index
+    from pokerbot.search.combos import combo_index, combo_table
 
+    cards = combo_table().numpy()
     engine = get_engine()
     config = engine.GameConfig(
         num_players=2, stacks=[1000, 1000], small_blind=50, big_blind=100, ante=0
@@ -131,4 +132,17 @@ def test_recording_keeps_the_play_and_logs_every_decision():
                 assert np.isfinite(d["values"][c]).all()
                 # values are chips for the whole hand: within the stacks
                 assert np.abs(d["values"][c]).max() <= 1000 + 1e-3
+                # values_vs: our combo against each opponent combo; NaN on blocked
+                # combos, and averaged by the opponent's reach it is values[c]
+                vs = d["values_vs"]
+                assert vs.shape == d["strategy"].shape
+                blocked = np.isin(cards, cards[c]).any(1)
+                assert np.isnan(vs[blocked]).all() and np.isfinite(vs[~blocked]).all()
+                w = d["reach"][1].astype(np.float64) * ~blocked
+                avg = (w[:, None] * np.nan_to_num(vs)).sum(0) / w.sum()
+                np.testing.assert_allclose(avg, d["values"][c], atol=0.05)
+                # (no stack bound per pair: sampled chance cards and rollouts weight a
+                # pair's runouts exactly only on average over pairs)
+            else:
+                assert d["values_vs"] is None
     assert searched, "no postflop decision in these deals"

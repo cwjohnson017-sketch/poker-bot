@@ -223,3 +223,20 @@ def test_search_bot_decisions_are_logged(tmp_path, engine):
             if kind == 2:
                 assert played["amount"] == amount
             assert (f"d{k}_values" in arrays) == d["has_values"] == (d["source"] == "search")
+            assert (f"d{k}_values_vs" in arrays) == d["has_values"]
+    # AIVAT: logged per hand, shown in the stats, and rebuilt from the logs alone
+    from pokerbot.eval.aivat import score_session
+
+    for h in hands:
+        assert h["human_aivat"] == pytest.approx(h["human_adjusted"] - h["bot_action_terms"])
+    assert any(h["bot_action_terms"] != 0 for h in hands)
+    score = score_session(log.dir)
+    np.testing.assert_allclose(score.aivat, [h["human_aivat"] for h in hands], atol=1e-6)
+    np.testing.assert_allclose(score.chance, [h["human_adjusted"] for h in hands])
+    np.testing.assert_allclose(score.raw, [h["human_net"] for h in hands])
+    assert score.action_terms == sum(d["has_values"] for h in hands for d in h["bot_decisions"])
+    assert "aivat" in score.summary()
+    stats = session.snapshot()["stats"]
+    assert stats["aivat"]["mbb"] == pytest.approx(
+        1000 * np.mean([h["human_aivat"] for h in hands]) / 100
+    )

@@ -3,7 +3,7 @@
 * :mod:`.session`: :class:`PlaySession`, the hand loop (heads-up, evaluation mode)
 * :mod:`.server`: :class:`PlayServer`, the HTTP server and its JSON API
 * :mod:`.log`: :class:`SessionLog`, the session directory
-* :mod:`.stats`: running win rates, raw and luck-adjusted
+* :mod:`.stats`: running win rates: raw, luck-adjusted and AIVAT
 * :mod:`.pokerstars`: PokerStars-format hand histories
 
 Entry point: ``scripts/play_web.py``. See ``pokerbot/play/README.md``.
