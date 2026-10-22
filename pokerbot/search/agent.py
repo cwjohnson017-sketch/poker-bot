@@ -165,6 +165,15 @@ class SearchAgent(BaseAgent):
         self._roots.clear()
         self._played.clear()
 
+    def policy_agent(self, **kwargs: Any) -> Any:
+        """This agent as a range policy for evaluation tools (local best response):
+        a :class:`~pokerbot.search.policy.SearchPolicyAgent` that plays through it
+        and answers what it plays with every hand, re-searching at decisions it
+        never reached. ``kwargs`` go to its constructor."""
+        from .policy import SearchPolicyAgent
+
+        return SearchPolicyAgent(self, **kwargs)
+
     @property
     def value_net(self) -> bool:
         return self.cfg.leaf.mode == "value_net"
