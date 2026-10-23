@@ -28,6 +28,11 @@ or pot and all-in only (``raises="fcpa"``).
 
 The opponent must be a :class:`~pokerbot.agents.policy.PolicyAgent`; agents
 that only ``act`` are wrapped by sampling (``SampledPolicyAgent``, warns).
+An opponent with ``range_strategy(state, seat) -> (actions, [1326, n])``
+over concrete ``(kind, amount)`` actions (the search,
+:class:`~pokerbot.search.policy.SearchPolicyAgent`) is queried through that
+instead: the range update uses the exact probability of the action it took,
+and ``fp`` its fold column, with no mapping onto ``spec``.
 
 Reported: LBR's win rate in mbb/h with a bootstrap CI, the same with
 all-in adjustment (when the money went in before the river, the realized
@@ -200,6 +205,7 @@ class LBRAgent(BaseAgent):
         self.device = torch.device(device)
         self.generator = make_generator(seed, self.device)
         self.engine = engine or get_engine()
+        self._concrete = callable(getattr(opponent, "range_strategy", None))
         self.range: np.ndarray | None = None
         self.decisions: dict[str, dict[str, int]] = {s: {} for s in STREETS}
         self.range_resets = 0
@@ -239,20 +245,26 @@ class LBRAgent(BaseAgent):
             live = np.nonzero(self.range > 0)[0]
             if live.size == 0:
                 break
-            probs = range_policy(
-                self.opponent,
-                state,
-                opp,
-                COMBOS[live],
-                config,
-                known,
-                self.engine,
-                self.spec,
-                upto=k,
-            )
             pre = hypothetical_state(state, opp, COMBOS[live[0]], config, known, self.engine, k)
-            idx = nearest_abstract_index(pre, action, self.spec)
-            self.range[live] *= np.maximum(probs[:, idx], self.floor)
+            if self._concrete:
+                from ..search.policy import action_probs
+
+                acts, strat = self.opponent.range_strategy(pre, opp)
+                lik = action_probs(acts, strat, int(action.kind), int(action.amount))[live]
+            else:
+                probs = range_policy(
+                    self.opponent,
+                    state,
+                    opp,
+                    COMBOS[live],
+                    config,
+                    known,
+                    self.engine,
+                    self.spec,
+                    upto=k,
+                )
+                lik = probs[:, nearest_abstract_index(pre, action, self.spec)]
+            self.range[live] *= np.maximum(lik, self.floor)
             self.range /= self.range.sum()
         self._processed = len(hist)
         self.range[blocked_mask(hole + list(state.board))] = 0.0
@@ -326,7 +338,12 @@ class LBRAgent(BaseAgent):
                     )
                 child = base.child(c.action(self.engine))
                 fp = 0.0
-                if not child.is_terminal and child.current_player == opp:
+                if not child.is_terminal and child.current_player == opp and self._concrete:
+                    acts, strat = self.opponent.range_strategy(child, opp)
+                    folds = [j for j, (kind, _a) in enumerate(acts) if kind == FOLD]
+                    if folds:
+                        fp = float((rng_range[live] * strat[live][:, folds].sum(1)).sum())
+                elif not child.is_terminal and child.current_player == opp:
                     probs = range_policy(
                         self.opponent,
                         child,
@@ -389,6 +406,8 @@ class LBRResult:
     actions: dict[str, dict[str, int]]
     seconds: float = 0.0
     range_resets: int = 0
+    # opponent decisions and their seconds by "<real|hypothetical>/<street>" (the search)
+    opponent_cost: dict[str, list[float]] = field(default_factory=dict)
     confidence: float = 0.95
     n_boot: int = 2000
     seed: int = 0
@@ -441,6 +460,11 @@ class LBRResult:
             )
         if self.range_resets:
             lines.append(f"  range reset {self.range_resets}x (observed action had ~0 probability)")
+        if self.opponent_cost:
+            n = max(1, self.hands)
+            lines.append("  opponent decisions per hand (seconds each):")
+            for k, (cnt, sec) in sorted(self.opponent_cost.items()):
+                lines.append(f"    {k:<20} {cnt / n:6.2f}  ({sec / max(1, cnt):.3f} s)")
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -454,8 +478,15 @@ class LBRResult:
             "raw": wr(self.raw),
             "by_street": self.by_street(),
             "range_resets": self.range_resets,
+            "opponent_cost": self.opponent_cost,
             "seconds": self.seconds,
             "seed": self.seed,
+            # per hand, so runs split into blocks (cloud/aws/fleet.py) can be merged
+            "samples": {
+                "payoffs": [float(x) for x in self.payoffs],
+                "adjusted": [float(x) for x in self.adjusted],
+                "end_street": [int(x) for x in self.end_street],
+            },
         }
 
 
@@ -468,10 +499,11 @@ def _play_lbr_hands(
     engine: ModuleType,
     lbr_kwargs: dict[str, Any],
     samples: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, dict[str, int]], int]:
+    policy_kwargs: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, dict[str, int]], int, dict]:
     from .match import play_hand
 
-    opp = as_policy_agent(opponent, samples=samples)
+    opp = as_policy_agent(opponent, samples=samples, **(policy_kwargs or {}))
     lbr = LBRAgent(opp, engine=engine, seed=seed * 1_000_003 + chunk, **lbr_kwargs)
     deck_rng = np.random.default_rng((seed, chunk))
     gen = make_generator(seed * 7919 + chunk, "cpu")
@@ -485,7 +517,8 @@ def _play_lbr_hands(
         pay[h] = state.payoffs()[0]
         adj[h] = allin_adjusted(state, 0, config, gen)
         end[h] = state.history[-1][0] if state.history else 0
-    return pay, adj, end, lbr.decisions, lbr.range_resets
+    cost = opp.cost() if callable(getattr(opp, "cost", None)) else {}
+    return pay, adj, end, lbr.decisions, lbr.range_resets, cost
 
 
 def _lbr_chunk(task: dict[str, Any]) -> tuple:
@@ -507,6 +540,7 @@ def _lbr_chunk(task: dict[str, Any]) -> tuple:
         engine,
         task["lbr_kwargs"],
         task["samples"],
+        task.get("policy_kwargs"),
     )
 
 
@@ -523,10 +557,15 @@ def run_lbr(
     agent_params: dict[str, Any] | None = None,
     confidence: float = 0.95,
     n_boot: int = 2000,
+    policy_kwargs: dict[str, Any] | None = None,
     **lbr_kwargs: Any,
 ) -> LBRResult:
     """Play ``hands`` hands of LBR (seat 0, button alternating) against
     ``opponent`` (an agent object, or a registry spec string).
+
+    ``policy_kwargs`` go to the opponent's range-policy adapter
+    (:func:`~pokerbot.agents.policy.as_policy_agent`; for the search,
+    ``hypothetical_budget``).
 
     ``workers > 1`` needs a spec string: hands are split into chunks played
     in separate processes, each with its own opponent instance."""
@@ -554,6 +593,7 @@ def run_lbr(
                 "agent_params": agent_params or {},
                 "lbr_kwargs": lbr_kwargs,
                 "samples": samples,
+                "policy_kwargs": policy_kwargs or {},
             }
             for i, n in enumerate(sizes)
         ]
@@ -563,15 +603,24 @@ def run_lbr(
         if isinstance(opponent, str):
             params = (agent_params or {}).get(parse_spec(opponent).name) or {}
             opponent = make_agent(opponent, **params)
-        parts = [_play_lbr_hands(opponent, config, hands, seed, 0, eng, lbr_kwargs, samples)]
+        parts = [
+            _play_lbr_hands(
+                opponent, config, hands, seed, 0, eng, lbr_kwargs, samples, policy_kwargs
+            )
+        ]
     pay = np.concatenate([p[0] for p in parts])
     adj = np.concatenate([p[1] for p in parts])
     end = np.concatenate([p[2] for p in parts])
     actions: dict[str, dict[str, int]] = {s: {} for s in STREETS}
+    cost: dict[str, list[float]] = {}
     for p in parts:
         for s, d in p[3].items():
             for k, v in d.items():
                 actions[s][k] = actions[s].get(k, 0) + v
+        for k, (n, sec) in p[5].items():
+            c = cost.setdefault(k, [0, 0.0])
+            c[0] += n
+            c[1] += sec
     res = LBRResult(
         opponent=name,
         big_blind=int(config.big_blind),
@@ -581,6 +630,7 @@ def run_lbr(
         actions=actions,
         seconds=time.time() - t0,
         range_resets=sum(p[4] for p in parts),
+        opponent_cost=cost,
         confidence=confidence,
         n_boot=n_boot,
         seed=seed,
@@ -617,6 +667,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--samples", type=int, help="act() samples per policy query for act-only agents"
     )
+    ap.add_argument(
+        "--search-config",
+        help="search YAML for a search:... opponent (sets agents.search.config)",
+    )
+    ap.add_argument(
+        "--hypothetical-budget",
+        type=float,
+        help="search opponent: time budget scale of the searches after LBR's candidate "
+        "raises (default 1: the bot's own budget)",
+    )
     ap.add_argument("--engine", choices=["auto", "reference", "rust"])
     ap.add_argument("--device", help="torch device for the equity kernels")
     ap.add_argument("--threads", type=int, help="torch CPU threads per process (default 1)")
@@ -646,6 +706,14 @@ def main(argv: list[str] | None = None) -> int:
     info = run_info(args.config, get_engine(engine))
     print(f"# git {info['git']} | engine {info['engine']} | opponent {opponent}")
     logger = RunLogger(args.log_dir, config={"argv": argv or sys.argv[1:], **cfg})
+    agent_params = dict(cfg.get("agents") or {})
+    if args.search_config:
+        search = dict(agent_params.get("search") or {})
+        agent_params["search"] = {**search, "config": args.search_config}
+    policy_kwargs = {}
+    budget = opt("hypothetical_budget", None)
+    if budget is not None:
+        policy_kwargs["hypothetical_budget"] = float(budget)
     res = run_lbr(
         opponent,
         hands=int(opt("hands", 1000)),
@@ -655,7 +723,8 @@ def main(argv: list[str] | None = None) -> int:
         samples=int(opt("samples", 16)),
         logger=logger,
         game=cfg.get("game") or {},
-        agent_params=cfg.get("agents") or {},
+        agent_params=agent_params,
+        policy_kwargs=policy_kwargs,
         preflop=opt("preflop", "call"),
         raises=opt("raises", "spec"),
         max_runouts=int(opt("runouts", 64)),

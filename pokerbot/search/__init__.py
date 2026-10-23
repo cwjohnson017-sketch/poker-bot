@@ -1,5 +1,6 @@
 """Real-time depth-limited search: public subgame trees, range-vs-range CFR,
-blueprint rollouts at depth-limit leaves, and the safe resolving gadget.
+blueprint rollouts or a river value net at depth-limit leaves, and the safe
+resolving gadget.
 
 See ``pokerbot/search/README.md``.
 """
@@ -21,16 +22,19 @@ from .leaf import LeafConfig
 from .showdown import ShowdownTables, naive_showdown
 from .solver import RangeSolver, SolverConfig
 from .tree import SubgameTree, TreeBuilder, TreeConfig, build_tree
+from .value_leaf import FixedLeafValues, ShowdownOracle, ValueLeafEvaluator
 
 __all__ = [
     "NUM_COMBOS",
     "Blueprint",
     "ContinualCache",
+    "FixedLeafValues",
     "Gadget",
     "LeafConfig",
     "RangeSolver",
     "SearchAgent",
     "SearchConfig",
+    "ShowdownOracle",
     "ShowdownTables",
     "SolverConfig",
     "SubgameTree",
@@ -38,6 +42,7 @@ __all__ = [
     "TreeBuilder",
     "TreeConfig",
     "UniformBlueprint",
+    "ValueLeafEvaluator",
     "build_tree",
     "combo_cards",
     "combo_index",

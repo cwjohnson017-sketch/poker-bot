@@ -49,8 +49,9 @@ measurements, and the first real run happens on the target machine.
 | `pokerbot/agents/` | The `Agent` protocol, baselines, the `PolicyAgent` protocol, and the spec registry (`equity:samples=100`, `blueprint:<file>`, `neural:<dir>`, `search:<blueprint>`). |
 | `pokerbot/eval/` | Match runner, duplicate matches, bootstrap CIs, checkpoint ladder, LBR, approximate best response, logging. See [`pokerbot/eval/README.md`](pokerbot/eval/README.md). |
 | `pokerbot/protocol/` | ACPC-style line protocol over TCP: codec, match server, client. |
+| `pokerbot/play/` | The play app: a person against the bot at a local web table, every hand logged. See [`pokerbot/play/README.md`](pokerbot/play/README.md). |
 | `configs/` | YAML run configs, one per experiment. See [`configs/README.md`](configs/README.md). |
-| `scripts/` | Entry points: `build_buckets.py`, `train_mccfr.py`, `train_deepcfr.py`, `play_match.py`, `run_ladder.py`, `run_lbr.py`, `run_abr.py`, `serve_match.py`, `play_client.py`. |
+| `scripts/` | Entry points: `build_buckets.py`, `train_mccfr.py`, `train_deepcfr.py`, `play_match.py`, `run_ladder.py`, `run_lbr.py`, `run_abr.py`, `serve_match.py`, `play_client.py`, `play_web.py`. |
 | `tests/` | CPU pytest suite (about 260 tests). |
 
 ## Training on the RTX 4070 Ti
@@ -138,6 +139,13 @@ Agent specs are parsed by `pokerbot/agents/registry.py`: `always_call`,
 `search:blueprint:<strategy.bin>`. A duplicate match plays
 every deal twice with the same cards, once from each seat. Results are in milli-big-blinds per hand. The confidence
 interval comes from bootstrapping over deals.
+
+To play the production bot in your browser, with every hand logged to
+`runs/play/<session>/` (see [`pokerbot/play/README.md`](pokerbot/play/README.md)):
+
+```bash
+python scripts/play_web.py --hands 300
+```
 
 To play against a bot yourself over the socket protocol:
 

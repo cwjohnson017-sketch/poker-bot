@@ -123,16 +123,22 @@ def abstract_actions(state: Any, spec: Any = None) -> list[AbstractChoice]:
     bets = list(state.street_bets)
     to_call = max(bets) - bets[seat]
     hi = int(legal.max_raise_to)
-    can_raise = legal.min_raise_to > 0 and raises_this_street(state) < spec.max_raises
+    n_raises = raises_this_street(state)
+    can_raise = legal.min_raise_to > 0 and n_raises < spec.max_raises
     targets = abstract_targets(state, spec)
     acts = spec.streets[street]
+
+    def offered(a: tuple) -> bool:  # open / reraise conditions (see env.actions.legal_mask)
+        return len(a) < 3 or (a[2] == "open") == (n_raises == 0)
+
     sized_ok = [
-        a[0] in ("raise", "raise_x") and can_raise and targets[i] < hi for i, a in enumerate(acts)
+        a[0] in ("raise", "raise_x") and offered(a) and can_raise and targets[i] < hi
+        for i, a in enumerate(acts)
     ]
     out: list[AbstractChoice] = []
     for i, a in enumerate(acts):
         kind = a[0]
-        label = kind if len(a) == 1 else f"{kind} {a[1]:g}"
+        label = spec.describe(street, i)
         if kind == "fold":
             if to_call > 0:
                 out.append(AbstractChoice(i, FOLD, 0, label))
@@ -403,11 +409,15 @@ class SampledPolicyAgent(PolicyAgentBase):
         return counts / counts.sum()
 
 
-def as_policy_agent(agent: Any, samples: int = 16, spec: Any = None) -> Any:
-    """Return ``agent`` itself when it has ``policy``; an exact policy for the
+def as_policy_agent(agent: Any, samples: int = 16, spec: Any = None, **kwargs: Any) -> Any:
+    """Return ``agent`` itself when it has ``policy``; the agent's own adapter
+    when it has ``policy_agent(**kwargs)`` (the search,
+    :class:`~pokerbot.search.policy.SearchPolicyAgent`); an exact policy for the
     always-call baseline; otherwise a :class:`SampledPolicyAgent` (warns)."""
     if hasattr(agent, "policy"):
         return agent
+    if callable(getattr(agent, "policy_agent", None)):
+        return agent.policy_agent(**kwargs)
     from .baselines import AlwaysCallAgent
 
     if isinstance(agent, AlwaysCallAgent):

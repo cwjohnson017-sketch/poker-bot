@@ -65,7 +65,10 @@ def spec_from_solver_config(cfg: dict[str, Any]) -> Any:
         row = []
         for a in st:
             a = [a] if isinstance(a, str) else list(a)
-            row.append((str(a[0]), float(a[1])) if len(a) == 2 else (str(a[0]),))
+            if len(a) == 1:
+                row.append((str(a[0]),))
+            else:
+                row.append((str(a[0]), float(a[1]), *(str(x) for x in a[2:])))
         streets.append(row)
     return spec_from_lists(streets, max_raises=int(acts.get("max_raises", 4)), dedupe=True)
 

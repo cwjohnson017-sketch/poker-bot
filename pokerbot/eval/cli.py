@@ -4,6 +4,7 @@ Example::
 
     python scripts/play_match.py --a always_call --b equity --hands 2000 --duplicate --seed 0
     python scripts/play_match.py --config configs/match.yaml --hands 500
+    python scripts/play_match.py --a neural:runs/deepcfr --b equity --duplicate --adjust
 """
 
 from __future__ import annotations
@@ -34,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="duplicate match (each deal played from both seats)",
     )
+    ap.add_argument(
+        "--adjust",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="also report the luck-adjusted win rate (heads-up): all-in EV + chance corrections",
+    )
     ap.add_argument("--seed", type=int)
     ap.add_argument("--engine", choices=["auto", "reference", "rust"])
     ap.add_argument("--history", help="write hand histories to this file")
@@ -51,6 +58,9 @@ def resolve(args: argparse.Namespace) -> dict[str, Any]:
         "hands": args.hands if args.hands is not None else int(match.get("hands", 2000)),
         "duplicate": (
             args.duplicate if args.duplicate is not None else bool(match.get("duplicate", False))
+        ),
+        "luck_adjust": (
+            args.adjust if args.adjust is not None else bool(match.get("luck_adjust", False))
         ),
         "seed": args.seed if args.seed is not None else int(match.get("seed", 0)),
         "engine": args.engine or cfg.get("engine", "auto"),
@@ -76,17 +86,25 @@ def main(argv: list[str] | None = None) -> int:
         a.name, b.name = a.name + "_A", b.name + "_B"
     info = run_info(args.config, engine)
     print(f"# git {info['git']} | engine {info['engine']} | config {info['config']}")
+    luck = bool(opts["luck_adjust"]) and config.num_players == 2
     t0 = time.time()
     with contextlib.ExitStack() as stack:
         hist = stack.enter_context(open(opts["history"], "w")) if opts["history"] else None
         if opts["duplicate"]:
             deals = max(1, opts["hands"] // 2)
             res = run_duplicate_match(
-                a, b, config, deals, opts["seed"], engine, hist, n_boot=args.boot
+                a, b, config, deals, opts["seed"], engine, hist, n_boot=args.boot, luck_adjust=luck
             )
         else:
             res = run_match(
-                [a, b], config, opts["hands"], opts["seed"], engine, hist, n_boot=args.boot
+                [a, b],
+                config,
+                opts["hands"],
+                opts["seed"],
+                engine,
+                hist,
+                n_boot=args.boot,
+                luck_adjust=luck,
             )
     dt = time.time() - t0
     print(res.summary())

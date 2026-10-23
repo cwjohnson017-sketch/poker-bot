@@ -160,11 +160,16 @@ class ReservoirMemory:
         idx = np.sort(rng.integers(0, self.size, size=int(batch_size)))
         return self.gather(idx, device)
 
+    def gather_compact(self, idx: np.ndarray) -> dict[str, torch.Tensor]:
+        """Rows ``idx`` as host tensors in the compact storage dtypes (see
+        :func:`decode`)."""
+        return {k: torch.from_numpy(np.ascontiguousarray(a[idx])) for k, a in self.arrays.items()}
+
     def gather(
         self, idx: np.ndarray, device: torch.device | str = "cpu"
     ) -> dict[str, torch.Tensor]:
         device = torch.device(device)
-        host = {k: torch.from_numpy(np.ascontiguousarray(a[idx])) for k, a in self.arrays.items()}
+        host = self.gather_compact(idx)
         if device.type == "cuda":
             moved = {}
             for k, t in host.items():
@@ -175,17 +180,7 @@ class ReservoirMemory:
                 buf.copy_(t)
                 moved[k] = buf.to(device, non_blocking=True)
             host = moved
-        cards = host["cards"].long()
-        return {
-            "cards": cards,
-            "card_mask": cards < 52,
-            "hist": host["hist"].long(),
-            "hist_amt": host["hist_amt"].float(),
-            "scalars": host["scalars"].float(),
-            "legal": host["legal"].bool(),
-            "target": host["target"].float(),
-            "iteration": host["iteration"].float(),
-        }
+        return decode(host)
 
     # ------------------------------------------------------------------ persistence
     def save(self, path: str | Path) -> None:
@@ -248,6 +243,23 @@ class ReservoirMemory:
         if "rng" in meta:
             mem.rng.bit_generator.state = meta["rng"]
         return mem
+
+
+def decode(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Compact rows (storage dtypes, any device) -> training tensors: ``cards``
+    and ``hist`` long, ``card_mask`` bool, ``hist_amt``, ``scalars``, ``target``
+    and ``iteration`` float32, ``legal`` bool."""
+    cards = batch["cards"].long()
+    return {
+        "cards": cards,
+        "card_mask": cards < 52,
+        "hist": batch["hist"].long(),
+        "hist_amt": batch["hist_amt"].float(),
+        "scalars": batch["scalars"].float(),
+        "legal": batch["legal"].bool(),
+        "target": batch["target"].float(),
+        "iteration": batch["iteration"].float(),
+    }
 
 
 def _to_numpy(v: Any) -> np.ndarray:

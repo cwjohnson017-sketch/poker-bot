@@ -16,7 +16,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]"
+          pip install -e ".[dev,train]"
       - name: Ruff
         run: |
           ruff check .
@@ -24,4 +24,4 @@ jobs:
       - name: Pytest (CPU, reference engine)
         env:
           POKERBOT_ENGINE: reference
-        run: python -m pytest -q -m "not slow"
+        run: python -m pytest -q -m "not slow" --durations=30

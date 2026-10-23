@@ -155,6 +155,161 @@ class ScalarVecPolicy:
         return out
 
 
+def learner_spec_from(d: dict[str, Any] | None) -> Any:
+    """``ActionSpec`` from an ``abr.learner_actions`` mapping (``streets``: four
+    lists of actions such as ``[raise, 0.33]``, optional ``max_raises`` and
+    ``dedupe``), or None for the opponent's own abstraction."""
+    if not d:
+        return None
+    from ..env.actions import spec_from_lists
+
+    streets = [[tuple(a) for a in st] for st in d["streets"]]
+    return spec_from_lists(streets, int(d.get("max_raises", 4)), bool(d.get("dedupe", True)))
+
+
+class LearnerView:
+    """How the ABR learner observes and acts in an env built on the opponent's
+    action abstraction.
+
+    Without ``spec`` the learner shares the opponent's abstraction: it sees the
+    env's observations and plays the env's abstract actions (the default).
+
+    With a richer ``spec`` the learner chooses among ``spec``'s actions, which
+    are applied as concrete chip amounts. The env, and so the opponent, records
+    each learner action as the opponent would translate it in real play
+    (``offtree="harmonic"``: the randomized pseudo-harmonic mapping of the
+    scalar agents; ``"nearest"``: the nearest abstract size). The learner's
+    observation keeps its own history of the real actions in ``spec`` tokens
+    (opponent actions by their nearest ``spec`` size) and ``spec``'s legal mask.
+    """
+
+    def __init__(
+        self,
+        env_spec: Any,
+        spec: Any = None,
+        offtree: str = "harmonic",
+        device: torch.device | str = "cpu",
+        seed: int = 0,
+    ) -> None:
+        if offtree not in ("harmonic", "nearest"):
+            raise ValueError(f"offtree must be 'harmonic' or 'nearest', got {offtree!r}")
+        self.rich = spec is not None
+        self.spec = spec if spec is not None else env_spec
+        self.num_actions = self.spec.num_actions
+        self.vocab_size = 1 + 8 * self.num_actions
+        self.offtree = offtree
+        self.device = torch.device(device)
+        self.tab = self.spec.tables(self.device) if self.rich else None
+        self.gen = make_generator(seed, self.device)
+        self.tok: torch.Tensor | None = None
+        self.len: torch.Tensor | None = None
+
+    def _sync(self, env: VecNLHE) -> None:
+        if self.tok is None or self.tok.shape != env.hist_tok.shape:
+            self.tok = torch.zeros_like(env.hist_tok)
+            self.len = torch.zeros_like(env.hist_len)
+        fresh = env.hist_len == 0  # a new hand in the slot
+        self.tok[fresh] = 0
+        self.len = torch.where(fresh, torch.zeros_like(self.len), self.len)
+
+    def _rich_info(self, env: VecNLHE, info: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        from ..env import actions as am
+
+        tr = am.raise_targets(
+            self.tab,
+            info.street,
+            info.pot,
+            info.max_bet,
+            info.to_call,
+            info.min_raise_to,
+            info.max_raise_to,
+        )
+        mr = am.legal_mask(
+            self.tab,
+            info.street,
+            info.active,
+            info.to_call,
+            info.raise_ok,
+            env.n_raises,
+            tr,
+            info.max_raise_to,
+        )
+        return tr, mr
+
+    @torch.no_grad()
+    def obs(self, env: VecNLHE, obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The learner's view of ``obs`` (``env.obs()``)."""
+        if not self.rich:
+            return obs
+        self._sync(env)
+        _, mr = self._rich_info(env, env.legal_info())
+        return {**obs, "hist": self.tok.clone(), "legal": mr}
+
+    @torch.no_grad()
+    def step(
+        self, env: VecNLHE, br_turn: torch.Tensor, a_br: torch.Tensor, a_opp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Step ``env`` with the learner's actions where ``br_turn`` and the
+        opponent's elsewhere."""
+        if not self.rich:
+            return env.step(torch.where(br_turn, a_br, a_opp))
+        from ..env import actions as am
+        from ..env.actions import RAISE
+
+        self._sync(env)
+        info = env.legal_info()
+        st = info.street
+        te = env._targets(info)
+        me = env._mask(info, te)
+        tr, mr = self._rich_info(env, info)
+        # learner: spec index -> concrete (illegal -> check/call)
+        a_l = a_br.to(env.device).long().clamp(0, self.num_actions - 1)
+        ok_l = mr.gather(1, a_l[:, None]).squeeze(1)
+        a_l = torch.where(ok_l, a_l, self.tab.call_index[st])
+        kind_l = self.tab.concrete[st].gather(1, a_l[:, None]).squeeze(1)
+        amt_l = torch.where(kind_l == RAISE, tr.gather(1, a_l[:, None]).squeeze(1), 0)
+        # opponent: env index -> concrete
+        a_o = a_opp.to(env.device).long().clamp(0, env.num_actions - 1)
+        kind_o = env.tab.concrete[st].gather(1, a_o[:, None]).squeeze(1)
+        amt_o = torch.where(kind_o == RAISE, te.gather(1, a_o[:, None]).squeeze(1), 0)
+        kind = torch.where(br_turn, kind_l, kind_o)
+        amount = torch.where(br_turn, amt_l, amt_o)
+        # what the env (the opponent) records for learner actions
+        if self.offtree == "harmonic":
+            u = torch.rand(env.n, device=env.device, generator=self.gen)
+            env_idx = am.harmonic_abstract(
+                env.tab,
+                st,
+                kind,
+                amount,
+                te,
+                me,
+                info.pot,
+                info.max_bet,
+                info.to_call,
+                info.max_raise_to,
+                u,
+            )
+        else:
+            env_idx = am.nearest_abstract(
+                env.tab, st, kind, amount, te, legal=me, max_raise_to=info.max_raise_to
+            )
+        record = torch.where(br_turn, env_idx, a_o)
+        # the learner's own history: real actions in spec tokens
+        opp_idx = am.nearest_abstract(
+            self.tab, st, kind_o, amt_o, tr, legal=mr, max_raise_to=info.max_raise_to
+        )
+        idx = torch.where(br_turn, a_l, opp_idx)
+        pos = (env.actor == env.button).long()
+        tok = 1 + (st * 2 + pos) * self.num_actions + idx
+        T = self.tok.shape[1]
+        write = info.active & (self.len < T)
+        at = (torch.arange(T, device=env.device)[None, :] == self.len[:, None]) & write[:, None]
+        self.tok = torch.where(at, tok[:, None], self.tok)
+        self.len = self.len + write.long()
+        return env.step_concrete(kind, amount, record=record)
+
+
 def opponent_spec(opponent: Any, spec: Any = None) -> Any:
     """The action spec for envs that ``opponent`` plays in: ``spec`` when given,
     else the opponent's ``spec`` attribute, else ``DEFAULT_SPEC``."""
@@ -215,6 +370,9 @@ class ABRConfig:
     eval_every: int = 0
     log_every: int = 50
     seed: int = 0
+    # the learner's own action set (None = the opponent's abstraction); see LearnerView
+    learner_actions: dict[str, Any] | None = None
+    offtree: str = "harmonic"  # how the opponent records learner actions off its tree
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> ABRConfig:
@@ -390,14 +548,19 @@ def evaluate_br(
     seed: int = 12345,
     equity_samples: int = 0,
     spec: Any = None,
+    learner_spec: Any = None,
+    offtree: str = "harmonic",
 ) -> BREval:
     """Play ``policy_fn(obs) -> actions`` (in seat ``slot % 2``) against
     ``opponent`` for ``hands`` hands in rounds of ``n_envs`` hands. With the
     same ``seed`` two evaluations see the same deals (common random numbers).
-    ``spec`` defaults to the opponent's ``spec`` (else ``DEFAULT_SPEC``)."""
+    ``spec`` defaults to the opponent's ``spec`` (else ``DEFAULT_SPEC``).
+    ``learner_spec`` / ``offtree``: the learner's own action set (see
+    :class:`LearnerView`); ``policy_fn`` then sees the learner's view."""
     n = max(2, min(int(n_envs), int(hands)))
     env = VecNLHE(n, game, device, seed=seed, validate=False, spec=opponent_spec(opponent, spec))
     gen = make_generator(seed + 1, env.device)
+    view = LearnerView(env.spec, learner_spec, offtree, env.device, seed + 3)
     if hasattr(opponent, "reseed"):
         opponent.reseed(seed + 2)
     br_seat = torch.arange(n, device=env.device) % 2
@@ -407,12 +570,12 @@ def evaluate_br(
         if r:
             env.reset()
         while not bool(env.done.all()):
-            obs = env.obs(equity_samples=equity_samples, generator=gen)
+            obs = view.obs(env, env.obs(equity_samples=equity_samples, generator=gen))
             live = ~env.done
             br_turn = live & (obs["actor"] == br_seat)
             a_br = policy_fn(obs)
             a_opp = opponent.act(env, live & ~br_turn)
-            env.step(torch.where(br_turn, a_br, a_opp))
+            view.step(env, br_turn, a_br, a_opp)
         pay.append(env.payoffs.gather(1, br_seat[:, None]).squeeze(1).cpu())
         pos.append((env.button == br_seat).cpu())
     x = torch.cat(pay)[:hands].double().numpy()
@@ -508,14 +671,21 @@ def train_abr(
     spec = opponent_spec(opponent)
     env = VecNLHE(cfg.n_envs, game, dev, seed=cfg.seed, validate=False, spec=spec)
     gen = make_generator(cfg.seed + 1, dev)
+    lspec = learner_spec_from(cfg.learner_actions)
+    if lspec is not None and isinstance(opponent, ScalarVecPolicy):
+        raise ValueError(
+            "learner_actions needs a vectorized opponent: ScalarVecPolicy rebuilds each "
+            "slot from its abstract history, which off-tree learner raises make inexact"
+        )
+    view = LearnerView(env.spec, lspec, cfg.offtree, dev, cfg.seed + 3)
     n = env.n
     br_seat = torch.arange(n, device=dev) % 2
     if hasattr(opponent, "reseed"):
         opponent.reseed(cfg.seed + 2)
     n_extra = 1 if cfg.equity_samples > 0 else 0
     net = DuelingQNet(
-        env.num_actions,
-        env.vocab_size,
+        view.num_actions,
+        view.vocab_size,
         NUM_SCALARS,
         n_extra,
         cfg.card_dim,
@@ -533,6 +703,8 @@ def train_abr(
         seed=cfg.seed + 777,
         equity_samples=cfg.equity_samples,
         spec=spec,
+        learner_spec=lspec,
+        offtree=cfg.offtree,
     )
     initial = None
     if cfg.eval_initial:
@@ -545,7 +717,7 @@ def train_abr(
         if progress:
             progress(f"[0] untrained: {initial.stats}")
 
-    obs0 = features(env.obs(equity_samples=cfg.equity_samples, generator=gen))
+    obs0 = features(view.obs(env, env.obs(equity_samples=cfg.equity_samples, generator=gen)))
     buf = ReplayBuffer(cfg.buffer_size, obs0, dev)
     pend = {k: torch.zeros_like(v) for k, v in obs0.items()}
     pend_a = torch.zeros(n, dtype=torch.long, device=dev)
@@ -560,7 +732,7 @@ def train_abr(
         eps = cfg.eps_start + frac * (cfg.eps_end - cfg.eps_start)
         net.eval()
         with torch.no_grad():
-            f = features(env.obs(equity_samples=cfg.equity_samples, generator=gen))
+            f = features(view.obs(env, env.obs(equity_samples=cfg.equity_samples, generator=gen)))
             live = ~env.done
             br_turn = live & (env.actor == br_seat)
             comp = br_turn & has_pend
@@ -583,7 +755,7 @@ def train_abr(
                 pend[k][br_turn] = f[k][br_turn]
             pend_a = torch.where(br_turn, a_br, pend_a)
             has_pend = has_pend | br_turn
-            payoffs, done = env.step(torch.where(br_turn, a_br, a_opp))
+            payoffs, done = view.step(env, br_turn, a_br, a_opp)
             fin = done & live
             chips = payoffs.gather(1, br_seat[:, None]).squeeze(1)
             term = fin & has_pend

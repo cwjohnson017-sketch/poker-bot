@@ -90,11 +90,19 @@ def valid_mask(board: Iterable[int], device: torch.device | str = "cpu") -> torc
 def valid_masks(
     boards: Sequence[Sequence[int]], device: torch.device | str = "cpu"
 ) -> torch.Tensor:
-    """``[len(boards), 1326]`` bool, one :func:`valid_mask` per board."""
-    onehot = torch.zeros(len(boards), NUM_CARDS, device=device)
-    for i, b in enumerate(boards):
-        if len(b):
-            onehot[i, list(b)] = 1.0
+    """``[len(boards), 1326]`` bool, one :func:`valid_mask` per board (a list of
+    card sequences, or an ``[n, k]`` integer tensor of equal-length boards)."""
+    if isinstance(boards, torch.Tensor):
+        b = boards.to(device).long()
+        onehot = torch.zeros(b.shape[0], NUM_CARDS, device=device)
+        if b.numel():
+            onehot.scatter_(1, b, 1.0)
+    else:
+        rows = [i for i, b in enumerate(boards) for _ in b]
+        cols = [int(c) for b in boards for c in b]
+        onehot = torch.zeros(len(boards), NUM_CARDS, device=device)
+        if cols:
+            onehot[torch.tensor(rows, device=device), torch.tensor(cols, device=device)] = 1.0
     hit = onehot @ incidence(device, torch.float32).t()
     return hit == 0
 

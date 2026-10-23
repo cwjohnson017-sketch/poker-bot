@@ -1,0 +1,121 @@
+# v4: the v3 network and training setup on a much richer action abstraction:
+# many opening sizes per street, one re-raise size, at most 3 raises per street
+# (open/reraise conditions on sized raises). Sizing (runs/sizing in the
+# claude/spec-open-raise worktree): betting tree 221k decision nodes (3.0x the
+# default spec), est. ~11M regret samples and ~45 s of traversal per iteration
+# with trained nets.
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti_v4.yaml --out runs/dcfr4
+#   python scripts/train_deepcfr.py --config configs/deepcfr_4070ti_v4.yaml --resume runs/dcfr4
+# Changes from v3, from the dcfr3 evaluation (runs/dcfr3_eval/ASSESSMENT.md):
+#   * 8000 SGD steps (the only fit lever that helped offline: +0.008 R^2 over 4000).
+#   * roots_per_batch 2048: no frontier cuts (dcfr3 lost 24% of its decisions to cuts).
+#   * 350 iterations: dcfr3 stopped improving head to head around iteration 300.
+#   * evaluation on the full SD-CFR average (every 10th net) against the previous
+#     evaluation and against dcfr3's full average as a fixed anchor; the equity
+#     bot is dropped (it ranked dcfr3's checkpoints backwards).
+# Budget: ~45 s traversal + ~140 s training per iteration, ~19 h for 350 iterations
+# plus ~1 h of evaluation.
+
+seed: 0
+device: auto
+threads: null
+iterations: 350
+out_dir: runs/dcfr4
+
+game:
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+actions:
+  max_raises: 3            # voluntary raises per street
+  dedupe: true
+  streets:
+    # preflop: opens of 2-4x (and raises over a limp), one 3-bet+ size (pot), all-in
+    - [[fold], [check_call], [raise_x, 2.0, open], [raise_x, 2.25, open], [raise_x, 2.5, open],
+       [raise_x, 3.0, open], [raise_x, 4.0, open], [raise, 1.0, reraise], [allin]]
+    # flop: bets of 0.25-2x pot, one raise size (pot), all-in
+    - [[fold], [check_call], [raise, 0.25, open], [raise, 0.33, open], [raise, 0.5, open],
+       [raise, 0.75, open], [raise, 1.0, open], [raise, 1.5, open], [raise, 2.0, open],
+       [raise, 1.0, reraise], [allin]]
+    # turn: bets of 0.33-2x pot
+    - [[fold], [check_call], [raise, 0.33, open], [raise, 0.5, open], [raise, 0.75, open],
+       [raise, 1.0, open], [raise, 1.5, open], [raise, 2.0, open], [raise, 1.0, reraise], [allin]]
+    # river: bets of 0.25-3x pot
+    - [[fold], [check_call], [raise, 0.25, open], [raise, 0.33, open], [raise, 0.5, open],
+       [raise, 0.75, open], [raise, 1.0, open], [raise, 1.5, open], [raise, 2.0, open],
+       [raise, 3.0, open], [raise, 1.0, reraise], [allin]]
+
+features:
+  equity_samples: 0
+  hist_runouts: 0
+  hist_bins: 10
+  hist_opp_samples: 0
+  strength_tables: data/abstraction/buckets_hunl
+
+network:
+  card_dim: 64
+  card_hidden: 768
+  hist_type: mlp
+  hist_dim: 64
+  hist_hidden: 256
+  hist_layers: 1
+  width: 512
+  trunk_layers: 3
+  card_embedding: true
+
+traversal:
+  traversals_per_iter: 65536
+  roots_per_batch: 2048        # measured peak frontier ~150k at 2048 under uniform play: no cuts
+  max_frontier_nodes: 262144
+  max_depth: 64
+  max_steps: 64
+  value_scale: 1000
+  record_strategy: false
+  infer_chunk: 32768
+  allin_equity: true
+  chance_cv: 1.0
+  preflop_equity_samples: 1024
+
+memory:
+  capacity: 40000000
+  save_every: 10
+  holdout: 0.01
+  holdout_capacity: 400000
+
+training:
+  sgd_steps: 8000
+  batch_size: 10000
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  reinit: true
+  bf16: true
+  prefetch: 3
+  chunk_rows: 1000000
+  ema_decay: 0.999
+  tabular_preflop: true
+  checkpoint_dtype: float16
+  fallback: argmax
+
+eval:
+  every: 25
+  deals: 5000              # 10k hands per match
+  last_n: null             # the full SD-CFR average ...
+  stride: 10               # ... thinned to every 10th net plus the newest
+  seed: 0
+  sample_net: true
+  luck_adjust: true
+  engine: auto
+  device: null
+  vs_equity: false
+  vs_previous: true
+  anchor: neural:runs/dcfr3_avg,sample_net=true,device=cuda   # dcfr3's full average (every 10th net)
+  equity:
+    samples: 200
+
+logging:
+  tensorboard: true
+  csv: true
+  print: true

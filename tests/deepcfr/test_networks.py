@@ -22,7 +22,7 @@ def _feats(n=32, seed=0, steps=3, **obs_kwargs):
     return features_from_obs(env.obs(**obs_kwargs))
 
 
-@pytest.mark.parametrize("hist_type", ["gru", "transformer"])
+@pytest.mark.parametrize("hist_type", ["gru", "transformer", "mlp"])
 def test_forward_shapes_small(hist_type):
     f = _feats()
     net = AdvantageNet(NetConfig(hist_type=hist_type, card_hidden=32, hist_dim=16, hist_hidden=32))
@@ -31,7 +31,7 @@ def test_forward_shapes_small(hist_type):
 
 
 def test_default_size_in_design_range():
-    for t in ("gru", "transformer"):
+    for t in ("gru", "transformer", "mlp"):
         n = num_params(AdvantageNet(NetConfig(hist_type=t)))
         assert 2_000_000 <= n <= 4_000_000, (t, n)
 
@@ -76,3 +76,37 @@ def test_regret_matching():
     pa = StrategyHead("argmax")(adv, legal)
     assert torch.equal(pa[1], torch.tensor([1.0, 0.0, 0.0, 0.0]))
     assert torch.allclose(StrategyHead()(adv, legal), p)
+
+
+@pytest.mark.parametrize("hist_type", ["gru", "mlp"])
+def test_card_embedding_tells_which_hole_card_carries_the_suit(hist_type):
+    # As5h and Ah5s on a spade board: the same ranks and suits per group, a
+    # nut flush draw vs a five-high one. Without the 52-card embedding the sum
+    # per group is identical, so the net cannot tell them apart.
+    f = _feats(n=2)
+    a_s, a_h, f_s, f_h = 51, 50, 15, 14  # As, Ah, 5s, 5h (rank * 4 + suit)
+    f["cards"][0, :2] = torch.tensor([a_s, f_h])
+    f["cards"][1, :2] = torch.tensor([a_h, f_s])
+    f["cards"][:, 2:5] = torch.tensor([47, 43, 27])  # Ks Qs 8s
+    f["cards"][:, 5:] = 52  # no turn or river
+    f["card_mask"][:, :5] = True
+    f["card_mask"][:, 5:] = False
+    for k in ("hist", "hist_amt", "scalars", "legal"):
+        f[k][1] = f[k][0]
+    for card_embedding, differ in ((False, False), (True, True)):
+        torch.manual_seed(0)
+        cfg = NetConfig(hist_type=hist_type, card_hidden=16, hist_dim=8, hist_hidden=16)
+        net = AdvantageNet(NetConfig(**{**cfg.to_dict(), "card_embedding": card_embedding}))
+        out = net(f)
+        assert (not torch.allclose(out[0], out[1], atol=1e-6)) == differ
+
+
+def test_mlp_history_branch_ignores_padding_and_other_rows():
+    torch.manual_seed(0)
+    net = AdvantageNet(NetConfig(hist_type="mlp", card_hidden=32, hist_dim=16, hist_hidden=32))
+    f = _feats(n=16)
+    base = net.eval()(f)
+    g = {k: v.clone() for k, v in f.items()}
+    g["hist_amt"][g["hist"] == 0] = 5.0
+    assert torch.allclose(net(g), base, atol=1e-5)
+    assert torch.allclose(net({k: v[3:4] for k, v in f.items()}), base[3:4], atol=1e-5)

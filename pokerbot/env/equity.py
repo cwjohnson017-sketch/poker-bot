@@ -8,6 +8,11 @@ of one batch may sit on different streets. Equity counts a tie as half a win.
 * :func:`equity_river` - exact on a complete board: all 990 opponent hands.
 * :func:`equity_histogram` - distribution of river equity over sampled
   runouts, as ``bins`` equal-width bins (the "equity histogram" feature).
+* :func:`equity_vs_hand` - against one known opponent hand over the rest of
+  the board: exact on the flop (990 runouts), turn (44) and river, Monte
+  Carlo otherwise.
+* :func:`street_equities` - :func:`equity_vs_hand` on each street of a
+  known deal (all-in values and chance control variates).
 
 Work is split into chunks of at most ``max_rows`` evaluated hands to bound
 memory; the chunk loop is over blocks, never over individual hands.
@@ -146,3 +151,102 @@ def equity_histogram(
     if return_equity:
         return hist, eq.view(n, R).mean(1)
     return hist
+
+
+def _score(hero: torch.Tensor, villain: torch.Tensor, full: torch.Tensor) -> torch.Tensor:
+    """Win (1), tie (0.5) or loss (0) of ``hero`` vs ``villain`` on 5-card
+    boards ``full [..., 5]`` (hands broadcast over the leading dims)."""
+    shape = full.shape[:-1]
+    rh = evaluate_batch(torch.cat([hero.expand(*shape, 2), full], -1))
+    rv = evaluate_batch(torch.cat([villain.expand(*shape, 2), full], -1))
+    return (rh > rv).float() + 0.5 * (rh == rv).float()
+
+
+@torch.no_grad()
+def equity_vs_hand(
+    hero: torch.Tensor,
+    villain: torch.Tensor,
+    board: torch.Tensor | None,
+    n_samples: int = 0,
+    generator: torch.Generator | None = None,
+    max_rows: int = 1 << 20,
+) -> torch.Tensor:
+    """Equity of ``hero [N, 2]`` against the known ``villain [N, 2]`` over the
+    rest of the board, ``[N]`` float (win + tie / 2).
+
+    ``board [N, k]`` holds the same number ``k`` of known cards in every row.
+    With ``n_samples == 0`` every runout is enumerated, which needs ``k >= 3``
+    (990 runouts on the flop, 44 on the turn, 1 on the river); otherwise
+    ``n_samples`` runouts are drawn uniformly from the unseen cards (an
+    unbiased estimate).
+    """
+    hero, villain = hero.long(), villain.long()
+    n, dev = hero.shape[0], hero.device
+    if board is None:
+        board = torch.zeros(n, 0, dtype=torch.long, device=dev)
+    board = board.long()
+    k = board.shape[1]
+    missing = 5 - k
+    out = torch.empty(n, dtype=torch.float32, device=dev)
+    if n == 0:
+        return out
+    if missing == 0:
+        return _score(hero, villain, board)
+    known = torch.cat([hero, villain, board], 1)
+    if n_samples <= 0:
+        if missing > 2:
+            raise ValueError("exact enumeration needs at least the flop; pass n_samples")
+        per_row = 44 if missing == 1 else 990
+        for s, e in _chunks(n, per_row, max_rows):
+            m = e - s
+            used = torch.zeros(m, 52, dtype=torch.long, device=dev).scatter_(1, known[s:e], 1)
+            rest = torch.argsort(used, dim=1, stable=True)[:, : 52 - known.shape[1]]
+            if missing == 1:
+                runouts = rest[:, :, None]  # [m, 44, 1]
+            else:
+                ii, jj = _pairs45(dev)
+                runouts = torch.stack([rest[:, ii], rest[:, jj]], 2)  # [m, 990, 2]
+            R = runouts.shape[1]
+            full = torch.cat([board[s:e, None, :].expand(m, R, k), runouts], 2)
+            win = _score(hero[s:e, None, :], villain[s:e, None, :], full)
+            out[s:e] = win.mean(1)
+        return out
+    S = int(n_samples)
+    for s, e in _chunks(n, S, max_rows):
+        m = e - s
+        samp = sample_unknown(known[s:e].repeat_interleave(S, 0), missing, generator)
+        b = board[s:e].repeat_interleave(S, 0)
+        full = torch.cat([b, samp], 1)
+        win = _score(hero[s:e].repeat_interleave(S, 0), villain[s:e].repeat_interleave(S, 0), full)
+        out[s:e] = win.view(m, S).mean(1)
+    return out
+
+
+@torch.no_grad()
+def street_equities(
+    hero: torch.Tensor,
+    villain: torch.Tensor,
+    board5: torch.Tensor,
+    preflop_samples: int = 1024,
+    generator: torch.Generator | None = None,
+    max_rows: int = 1 << 20,
+) -> torch.Tensor:
+    """``[N, 4]``: ``hero``'s equity against ``villain`` as known on each
+    street of a fully dealt board ``board5 [N, 5]`` (column ``s`` uses the
+    first 0 / 3 / 4 / 5 board cards). Flop, turn and river are exact; the
+    preflop column is Monte Carlo with ``preflop_samples`` runouts.
+
+    Each column is the exact (preflop: an unbiased) expectation of the next
+    one over the cards the next street deals, so ``E[:, s + 1] - E[:, s]`` has
+    mean zero given everything seen on street ``s``.
+    """
+    if preflop_samples <= 0:
+        raise ValueError("preflop_samples must be positive")
+    board5 = board5.long()
+    cols = [
+        equity_vs_hand(hero, villain, None, preflop_samples, generator, max_rows),
+        equity_vs_hand(hero, villain, board5[:, :3], 0, generator, max_rows),
+        equity_vs_hand(hero, villain, board5[:, :4], 0, generator, max_rows),
+        equity_vs_hand(hero, villain, board5, 0, generator, max_rows),
+    ]
+    return torch.stack(cols, 1)

@@ -1,11 +1,75 @@
 import itertools
 
+import numpy as np
+import pytest
 import torch
 
 from pokerbot.env.cards import NO_CARD, cards_from_str, make_generator, shuffled_decks
-from pokerbot.env.equity import equity_histogram, equity_river, equity_vs_random, sample_unknown
+from pokerbot.env.equity import (
+    equity_histogram,
+    equity_river,
+    equity_vs_hand,
+    equity_vs_random,
+    sample_unknown,
+    street_equities,
+)
 
 from .naive_eval import naive7
+
+
+def _brute_vs_hand(hero, villain, board):
+    used = set(hero) | set(villain) | set(board)
+    rest = [c for c in range(52) if c not in used]
+    score, n = 0.0, 0
+    for run in itertools.combinations(rest, 5 - len(board)):
+        full = list(board) + list(run)
+        a, b = naive7(list(hero) + full), naive7(list(villain) + full)
+        score += 1.0 if a > b else 0.5 if a == b else 0.0
+        n += 1
+    return score / n
+
+
+def test_equity_vs_hand_exact_matches_brute_force():
+    d = shuffled_decks(3, make_generator(5))
+    for k in (3, 4, 5):
+        fast = equity_vs_hand(d[:, :2], d[:, 2:4], d[:, 4 : 4 + k])
+        for i in range(3):
+            ref = _brute_vs_hand(d[i, :2].tolist(), d[i, 2:4].tolist(), d[i, 4 : 4 + k].tolist())
+            assert abs(float(fast[i]) - ref) < 1e-6
+        chunked = equity_vs_hand(d[:, :2], d[:, 2:4], d[:, 4 : 4 + k], max_rows=990)
+        assert torch.equal(chunked, fast)
+    with pytest.raises(ValueError):
+        equity_vs_hand(d[:, :2], d[:, 2:4], None)  # preflop needs n_samples
+
+
+def test_street_equities_are_expectations_of_the_next_street():
+    # the property the chance control variates rely on: E_s = mean of E_{s+1}
+    # over the cards street s + 1 deals (exact from the flop on)
+    d = shuffled_decks(2, make_generator(6))
+    hero, vill, board = d[:, :2], d[:, 2:4], d[:, 4:9]
+    E = street_equities(hero, vill, board, preflop_samples=64, generator=make_generator(0))
+    for i in range(2):
+        for s, k in ((1, 3), (2, 4)):
+            seen = set(d[i, : 4 + k].tolist())
+            nxt = torch.tensor([c for c in range(52) if c not in seen])
+            m = nxt.numel()
+            b = torch.cat([board[i, :k].expand(m, k), nxt[:, None]], 1)
+            e = equity_vs_hand(hero[i].expand(m, 2), vill[i].expand(m, 2), b)
+            assert abs(float(e.mean()) - float(E[i, s])) < 1e-6
+    assert torch.equal(E[:, 3], equity_vs_hand(hero, vill, board))
+
+
+def test_preflop_equity_vs_hand_monte_carlo():
+    from pokerbot.eval.lbr import NUM_COMBOS, combo_index, range_equity
+
+    hero = torch.tensor([cards_from_str("AsAh"), cards_from_str("7c2d")])
+    vill = torch.tensor([cards_from_str("KdKc"), cards_from_str("8h9h")])
+    eq = equity_vs_hand(hero, vill, None, n_samples=20000, generator=make_generator(0))
+    for i in range(2):
+        w = np.zeros(NUM_COMBOS)
+        w[combo_index(*vill[i].tolist())] = 1.0
+        ref = range_equity(hero[i].tolist(), [], w, max_runouts=20000, generator=make_generator(1))
+        assert abs(float(eq[i]) - ref) < 0.015
 
 
 def _brute_river(hole, board):

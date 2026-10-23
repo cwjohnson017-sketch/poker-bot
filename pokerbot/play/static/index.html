@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pokerbot table</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">pokerbot <span class="mode" id="mode">evaluation</span></div>
+    <div class="session-info" id="session-info"></div>
+  </header>
+
+  <main class="layout">
+    <section class="table-area">
+      <div class="table" id="table">
+        <div class="seat seat-top" id="seat-bot">
+          <div class="cards" id="bot-cards"></div>
+          <div class="plate">
+            <span class="dealer" id="bot-dealer" title="Button">D</span>
+            <span class="name" id="bot-name">Bot</span>
+            <span class="stack" id="bot-stack"></span>
+          </div>
+          <div class="thinking" id="bot-thinking">thinking<span class="dots"></span></div>
+          <div class="bet" id="bot-bet"></div>
+        </div>
+
+        <div class="center">
+          <div class="board" id="board"></div>
+          <div class="pot" id="pot"></div>
+          <div class="result" id="result" hidden></div>
+        </div>
+
+        <div class="seat seat-bottom" id="seat-human">
+          <div class="bet" id="human-bet"></div>
+          <div class="cards" id="human-cards"></div>
+          <div class="plate">
+            <span class="dealer" id="human-dealer" title="Button">D</span>
+            <span class="name" id="human-name">You</span>
+            <span class="stack" id="human-stack"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+
+      <div class="controls" id="controls">
+        <div class="presets" id="presets"></div>
+        <div class="sizing">
+          <input type="range" id="raise-slider" aria-label="Raise size">
+          <input type="number" id="raise-input" inputmode="numeric" aria-label="Raise to">
+        </div>
+        <div class="buttons">
+          <button type="button" id="btn-fold" class="act fold">Fold <kbd>F</kbd></button>
+          <button type="button" id="btn-call" class="act call">Check <kbd>C</kbd></button>
+          <button type="button" id="btn-raise" class="act raise">Raise <kbd>R</kbd></button>
+        </div>
+      </div>
+
+      <div class="between" id="between">
+        <button type="button" id="btn-next" class="next">Deal next hand <kbd>N</kbd></button>
+        <label class="toggle"><input type="checkbox" id="auto-deal"> Auto-deal</label>
+      </div>
+    </section>
+
+    <aside class="side">
+      <section class="panel">
+        <h2>This hand <span class="hand-no" id="hand-no"></span></h2>
+        <ul class="log" id="log"></ul>
+        <p class="last" id="last-hand" hidden></p>
+      </section>
+      <section class="panel">
+        <h2>Session <button type="button" class="link" id="toggle-stats">hide</button></h2>
+        <div id="stats"></div>
+      </section>
+      <section class="panel">
+        <button type="button" id="btn-stop" class="danger">End session</button>
+        <p class="hint">Keys: <kbd>F</kbd> fold, <kbd>C</kbd> check or call, <kbd>R</kbd> raise
+          size, <kbd>Enter</kbd> raise, <kbd>1</kbd>-<kbd>6</kbd> presets, <kbd>N</kbd> next hand.</p>
+        <p class="hint">Every hand is logged to the session directory. The bot's cards show only at
+          a showdown.</p>
+      </section>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

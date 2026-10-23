@@ -9,7 +9,9 @@
     <run>/trainer_state.pt               last completed iteration + RNG states
 
 Each ``iter{t}.pt`` is self-contained: ``state_dict``, ``net_config``,
-``iteration``, ``player`` and ``meta`` (the same dict as ``meta.json``).
+``iteration``, ``player`` and ``meta`` (the same dict as ``meta.json``), plus
+``preflop`` (the seat's preflop strategy table ``[nodes * 169, A]``) when the
+run keeps tabular preflop regrets.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ def save_net(
     net: AdvantageNet,
     meta: dict[str, Any],
     dtype: str = "float32",
+    preflop: torch.Tensor | None = None,
 ) -> Path:
     d = Path(root) / f"p{player}"
     d.mkdir(parents=True, exist_ok=True)
@@ -62,26 +65,35 @@ def save_net(
     }
     path = d / f"iter{iteration}.pt"
     tmp = path.with_suffix(".tmp")
-    torch.save(
-        {
-            "state_dict": sd,
-            "net_config": net.cfg.to_dict(),
-            "iteration": int(iteration),
-            "player": int(player),
-            "meta": meta,
-        },
-        tmp,
-    )
+    ck = {
+        "state_dict": sd,
+        "net_config": net.cfg.to_dict(),
+        "iteration": int(iteration),
+        "player": int(player),
+        "meta": meta,
+    }
+    if preflop is not None:
+        ck["preflop"] = preflop.detach().to("cpu", torch.float32)
+    torch.save(ck, tmp)
     tmp.replace(path)
     return path
 
 
-def load_net(path: str | Path, device: torch.device | str = "cpu") -> tuple[int, AdvantageNet]:
+def load_checkpoint(
+    path: str | Path, device: torch.device | str = "cpu"
+) -> tuple[int, AdvantageNet, torch.Tensor | None]:
+    """``(iteration, net, preflop table or None)`` of one checkpoint file."""
     ck = torch.load(path, map_location="cpu", weights_only=True)
     net = AdvantageNet(NetConfig.from_dict(ck["net_config"]))
     sd = {k: (v.float() if v.is_floating_point() else v) for k, v in ck["state_dict"].items()}
     net.load_state_dict(sd)
-    return int(ck["iteration"]), net.to(device).eval()
+    pre = ck.get("preflop")
+    return int(ck["iteration"]), net.to(device).eval(), pre
+
+
+def load_net(path: str | Path, device: torch.device | str = "cpu") -> tuple[int, AdvantageNet]:
+    t, net, _ = load_checkpoint(path, device)
+    return t, net
 
 
 def list_checkpoints(

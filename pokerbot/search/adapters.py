@@ -74,6 +74,17 @@ class NeuralBlueprint:
     def policy_combos(self, state: Any, player: int) -> torch.Tensor:
         return self.agent.policy_all(state, player)
 
+    # incremental own reach for rollouts (see leaf._rollout)
+    def log_reach_combos(self, state: Any, player: int) -> torch.Tensor | None:
+        rp = self.agent.range_policy
+        return rp.log_reach_all(state, player, self.agent._query_config(state))
+
+    def policy_combos_nets(
+        self, state: Any, player: int, log_reach: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rp = self.agent.range_policy
+        return rp.probs_all_nets(state, player, self.agent._query_config(state), log_reach)
+
 
 def tabular_blueprint(arg: str, **kwargs: Any) -> TabularBlueprint:
     if not arg:

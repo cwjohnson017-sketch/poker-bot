@@ -1,0 +1,32 @@
+# Head to head: value-net search against its own blueprint (100bb, 50/100).
+#   python scripts/play_match.py --config configs/match_search_vn.yaml
+# The search agent reads configs/search_value_net.yaml (leaf.net: the value net).
+# Production plays preflop from the solved preflop table preflop_r15.pt (docs/preflop_eval.md,
+# attempt 2: 222-252 mbb/hand preflop exploitability against the blueprint's 338-380) over the
+# blueprint dcfr4_distilled_v2, which plays everything off the table. The table is gitignored
+# like the nets; it names its base blueprint by absolute path. Blueprint preflop instead:
+#   --a search:neural:runs/dcfr4_distilled_v2
+
+engine: auto
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+match:
+  a: search:preflop:runs/preflop/preflop_r15.pt
+  b: neural:runs/dcfr4_distilled_v2
+  hands: 1000             # duplicate: 500 deals played from both seats
+  duplicate: true
+  luck_adjust: true
+  seed: 0
+
+agents:                   # constructor arguments by agent prefix
+  search:
+    config: configs/search_value_net.yaml
+    blueprint: {device: cuda}
+  neural:
+    device: cuda

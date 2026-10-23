@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from .archetypes import ARCHETYPES, SUITE, Hud, ProfileAgent, TranslationStressAgent
 from .base import Agent, BaseAgent, clamp_raise, current_bet, pot_raise_to
 from .baselines import AlwaysCallAgent, AlwaysRaiseAgent, RandomAgent
 from .equity import EquityThresholdAgent, monte_carlo_equity
@@ -26,6 +27,8 @@ AGENTS: dict[str, Callable[..., Any]] = {
     "random": RandomAgent,
     "equity": EquityThresholdAgent,
     "human": HumanCLIAgent,
+    # scripted archetypes: population, nit, maniac, ... (see archetypes.py)
+    **ARCHETYPES,
 }
 
 
@@ -39,16 +42,21 @@ def make_agent(name: str, **kwargs: Any) -> Agent:
 
 __all__ = [
     "AGENTS",
+    "ARCHETYPES",
     "Agent",
     "AlwaysCallAgent",
     "AlwaysRaiseAgent",
     "BaseAgent",
     "EquityThresholdAgent",
     "FixedPolicyAgent",
+    "Hud",
     "HumanCLIAgent",
     "PolicyAgent",
+    "ProfileAgent",
     "RandomAgent",
+    "SUITE",
     "SampledPolicyAgent",
+    "TranslationStressAgent",
     "UniformPolicyAgent",
     "as_policy_agent",
     "available_agents",

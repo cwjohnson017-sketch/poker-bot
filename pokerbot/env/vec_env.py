@@ -390,12 +390,19 @@ class VecNLHE:
 
     @torch.no_grad()
     def step_concrete(
-        self, kind: torch.Tensor, amount: torch.Tensor, validate: bool | None = None
+        self,
+        kind: torch.Tensor,
+        amount: torch.Tensor,
+        validate: bool | None = None,
+        record: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply concrete actions (``FOLD``/``CHECK_CALL``/``RAISE`` + raise-to amount).
 
         With ``validate`` an illegal action on a live slot raises
         ``ValueError``; without it illegal actions become check/call.
+        ``record`` (``[n]`` abstract indices, -1 = default) overrides the
+        history token of legal actions, e.g. with an off-tree translation; by
+        default the nearest abstract action is recorded.
         """
         validate = self.validate if validate is None else validate
         kind = kind.to(self.device).long().reshape(self.n)
@@ -426,6 +433,9 @@ class VecNLHE:
             legal=self._mask(info, targets),
             max_raise_to=info.max_raise_to,
         )
+        if record is not None:
+            rec = record.to(self.device).long().reshape(self.n)
+            a_idx = torch.where(legal & (rec >= 0), rec.clamp(0, self.num_actions - 1), a_idx)
         self._apply(kind, amount, a_idx, info)
         return self.payoffs.clone(), self.done.clone()
 

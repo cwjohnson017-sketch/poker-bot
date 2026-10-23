@@ -1,0 +1,34 @@
+# Local best response against the production bot: agent a of configs/match_search_vn.yaml
+# (the solved preflop table preflop_r15.pt, value-net search after it with
+# configs/search_value_net.yaml). Run from the main checkout (the nets and the table are
+# gitignored there). One configuration per run (pokerbot/eval/README.md, "LBR against the
+# search"):
+#   python scripts/run_lbr.py --config configs/lbr_search_vn.yaml --raises fcpa --preflop call \
+#       --out results/lbr_search_fcpa_call.json --log-dir runs/lbr/search_fcpa_call
+
+engine: auto
+
+game:
+  num_players: 2
+  stacks: [10000, 10000]
+  small_blind: 50
+  big_blind: 100
+  ante: 0
+
+lbr:
+  opponent: search:preflop:runs/preflop/preflop_r15.pt
+  hands: 2000
+  seed: 0
+  workers: 1              # one GPU: the bot's searches run there, one process
+  preflop: call           # call | fc | full
+  raises: fcpa            # fcpa | spec
+  runouts: 64
+  device: cpu             # LBR's own equity kernels
+  threads: 4
+  hypothetical_budget: 1.0  # time budget scale of the searches after LBR's candidate raises
+  out: results/lbr_search.json
+
+agents:
+  search:
+    config: configs/search_value_net.yaml
+    blueprint: {device: cuda}

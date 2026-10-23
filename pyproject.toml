@@ -28,6 +28,12 @@ dev = [
 logging = [
     "tensorboard>=2.14",
 ]
+# fused Triton kernel for the value nets' residual head (pokerbot/search/head_kernel.py).
+# Linux torch wheels ship Triton; on Windows the minor version must match torch's
+# (triton-windows 3.6 for torch 2.10-2.11, 3.7 for 2.12-2.13)
+gpu = [
+    "triton-windows>=3.6,<3.7; sys_platform == 'win32'",
+]
 
 [tool.setuptools.packages.find]
 include = ["pokerbot*"]

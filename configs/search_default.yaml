@@ -20,6 +20,9 @@ search:
     max_nodes: 20000        # budget; sizes are dropped deepest-first above it
     chance_cards: null      # null = every card at chance nodes; int = subsample
     min_chance_cards: 4
+    leaf_budget_cost: null  # nodes a depth-limit leaf counts for in max_nodes (null: 1 + k
+                            # with rollouts, 1 with value_net; 1 + k gives a value-net tree
+                            # the rollout tree's abstraction). tree.leaf_mode follows leaf.mode
 
   solver:
     algorithm: dcfr         # dcfr | cfr+
@@ -31,7 +34,11 @@ search:
     chunk_rows: 4096
     dtype: float32
 
-  leaf:                     # depth-limit leaves: Pluribus continuation strategies
+  leaf:                     # depth-limit leaves
+    mode: rollouts          # rollouts (Pluribus continuations below) | value_net (a river
+                            # value net at turn-end leaves; flop solves need depth_streets >= 1)
+    net: null               # value_net: checkpoint path (ValueNetPredictor.from_path)
+    net_every: 1            # value_net: re-run the net every n regret updates (1 = exact)
     strategies: [blueprint, fold, call, raise]
     bias: 5.0
     rollouts: 2             # per leaf

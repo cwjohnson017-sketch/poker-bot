@@ -39,8 +39,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from . import vec_rollouts
 from .abstract import CHECK_CALL, FOLD, RAISE, CardView, contributions, legal_options, to_action
-from .blueprint import policy_matrix
+from .blueprint import normalise_combos, policy_matrix
 from .combos import NUM_COMBOS, valid_mask
 from .showdown import ShowdownTables, fold_values
 from .tree import CONTINUATION, LEAF
@@ -56,6 +57,17 @@ class LeafConfig:
     max_total_rollouts: int = 8000  # per solve; rollouts per leaf shrink (to >= 1) above this
     explore: float = 0.25  # uniform mixing in the action proposal
     seed: int = 0
+    # "rollouts" (above) or "value_net": a value net at turn-end leaves
+    # (pokerbot.search.value_leaf); flop solves need depth_streets >= 1
+    mode: str = "rollouts"
+    # value_net: checkpoint path; a river net (48 rows per leaf) or a turn-end net
+    # (one row per leaf), by the checkpoint's meta kind (turn_net.load_leaf_predictor)
+    net: str | None = None
+    net_every: int = 1  # value_net: run the net every n regret updates per player (1 = exact)
+    # value_net: a second net for trees rooted on the turn (a turn-end or river net), loaded
+    # lazily; needed when leaf.net is a turn-start net (flop solves with depth_streets 0)
+    # and turn solves have leaves (tree.depth_streets_turn 0). None: leaf.net for every tree
+    turn_net: str | None = None
 
 
 def runout_scale(board_len: int) -> float:
@@ -182,15 +194,27 @@ def _rollout(
     s = state.clone()
     ok = valid_mask(full_board)
     A = bp.spec.num_actions
+    # Blueprints with per-combo own reach (neural SD-CFR) can carry it along the
+    # rollout instead of replaying the history at every decision: same values.
+    incremental = hasattr(bp, "policy_combos_nets")
+    log_reach: dict[int, Any] = {}
+    nets = None
     while not s.is_terminal:
         p = int(s.current_player)
         opts = legal_options(s, bp.spec)
-        P = policy_matrix(bp, CardView(s, full_board), p)  # [C|1, A]
         classes = torch.full((A,), -1, dtype=torch.long)
         legal = torch.zeros(A)
         for o in opts:
             classes[o.index] = o.kind
             legal[o.index] = 1.0
+        view = CardView(s, full_board)
+        if incremental:
+            if p not in log_reach:  # the first rollout decision of p: reach of the leaf
+                log_reach[p] = bp.log_reach_combos(view, p)
+            avg, nets = bp.policy_combos_nets(view, p, log_reach[p])
+            P = normalise_combos(avg, legal)
+        else:
+            P = policy_matrix(bp, view, p)  # [C|1, A]
         if p == chooser:
             Pk = _biased(P, classes, strategies, cfg.bias)  # [k, C|1, A]
             mix = Pk.mean(0)
@@ -207,6 +231,8 @@ def _rollout(
             w_ch = w_ch * (Pk[:, :, a] / q[a])
         else:
             w_nc = w_nc * (P[:, a] / q[a])
+        if incremental and log_reach[p] is not None:
+            log_reach[p] = log_reach[p] + torch.log(nets[:, :, a].clamp(min=0))
         opt = next(o for o in opts if o.index == a)
         s.apply(to_action(engine, opt.kind, opt.amount))
     c = contributions(s, game_config)
@@ -241,6 +267,41 @@ def build_leaf_rollouts(
     rng = np.random.default_rng(cfg.seed)
     shared = bool(getattr(bp, "card_independent", False))
     path_cache: dict[tuple, tuple] = {}
+    if vec_rollouts.supports(bp):  # every rollout at once on VecNLHE
+        specs, meta = [], []
+        for leaf in leaves:
+            state = tree.states[leaf]
+            board = list(tree.boards[int(tree.board_id[leaf])])
+            chooser = int(tree.actor[leaf])
+            first = int(tree.first_child[leaf])
+            if int(tree.num_children[leaf]) != k:
+                raise ValueError("tree continuations do not match the leaf config")
+            scale = runout_scale(len(board)) / R
+            avail = [c for c in range(52) if c not in board]
+            for _ in range(R):
+                runout = rng.choice(avail, size=5 - len(board), replace=False).tolist()
+                full = board + [int(c) for c in runout]
+                specs.append(vec_rollouts.Rollout(state, full, chooser))
+                meta.append((first, chooser, full, scale))
+        out = vec_rollouts.run_rollouts(
+            specs, bp, game_config, cfg.strategies, cfg.bias, cfg.explore, device, cfg.seed
+        )
+        for r, (first, chooser, full, scale) in enumerate(meta):
+            nc_id = rs.add_weight(out.w_nc[r])
+            ch_ids = [rs.add_weight(out.w_ch[r, j]) for j in range(k)]
+            for j in range(k):
+                w0, w1 = (ch_ids[j], nc_id) if chooser == 0 else (nc_id, ch_ids[j])
+                rs.add_row(
+                    cont_target[first + j],
+                    out.kind[r],
+                    out.folder[r],
+                    out.amount[r],
+                    full,
+                    w0,
+                    w1,
+                    scale,
+                )
+        return rs.finalise()
     for leaf in leaves:
         state = tree.states[leaf]
         board = list(tree.boards[int(tree.board_id[leaf])])
@@ -290,6 +351,26 @@ def build_root_rollouts(
     rng = np.random.default_rng(seed)
     avail = [c for c in range(52) if c not in board]
     scale = runout_scale(len(board)) / rollouts
+    if vec_rollouts.supports(bp):
+        fulls = [
+            list(board) + [int(c) for c in rng.choice(avail, size=5 - len(board), replace=False)]
+            for _ in range(rollouts)
+        ]
+        out = vec_rollouts.run_rollouts(
+            [vec_rollouts.Rollout(state, f, 0) for f in fulls],
+            bp,
+            game_config,
+            cfg.strategies,
+            cfg.bias,
+            cfg.explore,
+            device,
+            seed,
+        )
+        for r, full in enumerate(fulls):
+            i0 = rs.add_weight(out.w_ch[r, 0])
+            i1 = rs.add_weight(out.w_nc[r])
+            rs.add_row(0, out.kind[r], out.folder[r], out.amount[r], full, i0, i1, scale)
+        return rs.finalise()
     for _ in range(rollouts):
         runout = rng.choice(avail, size=5 - len(board), replace=False).tolist()
         full = list(board) + [int(c) for c in runout]

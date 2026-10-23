@@ -7,7 +7,7 @@ engine: auto
 
 game:
   num_players: 2
-  stacks: [20000, 20000]
+  stacks: [10000, 10000]  # 100bb: the game both blueprints are trained on
   small_blind: 50
   big_blind: 100
   ante: 0

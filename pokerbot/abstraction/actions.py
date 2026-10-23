@@ -11,6 +11,13 @@ convert between the two so that both sides give the **same abstract indices,
 the same legal sets and the same raise-to amounts** in every state
 (``tests/abstraction/test_actions.py`` checks this on random states).
 
+A sized raise may carry a condition as a third element:
+``("raise", 0.5, "open")`` is offered only as the street's first voluntary
+raise (an opening bet, or a preflop open or raise over a limp), and
+``("raise", 1.0, "reraise")`` only when facing a voluntary raise. This gives a
+street many opening sizes and few re-raise sizes. ``fold``, ``check_call`` and
+``allin`` take no condition. Both sides implement it (Rust ``When``).
+
 How the conversion keeps the two sides identical
 ------------------------------------------------
 
@@ -124,6 +131,16 @@ _ALIASES = {
 # ----------------------------------------------------------------------------- specs
 
 
+_WHEN = {"open": "open", "first": "open", "reraise": "reraise", "re-raise": "reraise"}
+
+
+def _when(a: Any, x: Any) -> str:
+    w = _WHEN.get(str(x).strip().lower())
+    if w is None:
+        raise ValueError(f"raise condition must be 'open' or 'reraise': {a!r}")
+    return w
+
+
 def _norm_action(a: Any) -> tuple:
     if isinstance(a, str):
         name, args = a, []
@@ -136,8 +153,10 @@ def _norm_action(a: Any) -> tuple:
     if kind is None:
         raise ValueError(f"unknown abstract action {a!r}")
     if kind in ("raise", "raise_x"):
-        if len(args) != 1:
-            raise ValueError(f"{kind} needs one size: {a!r}")
+        if len(args) not in (1, 2):
+            raise ValueError(f"{kind} needs one size and an optional condition: {a!r}")
+        if len(args) == 2:
+            return (kind, float(args[0]), _when(a, args[1]))
         return (kind, float(args[0]))
     if args:
         raise ValueError(f"{kind} takes no argument: {a!r}")
@@ -217,10 +236,11 @@ def to_rust(spec: ActionSpec | Any, config: Any = None) -> Any:
                     raise ValueError(f"raise_x multiple must exceed 1, got {a[1]}")
                 num, den = m - 1000, 2000  # (m - 1) / 2
             # Key on the exact rational num/den (in 1/2000 units).
-            key = num * (2000 // den)
+            key = (num * (2000 // den), a[2] if len(a) == 3 else "")
             rep = seen.get(key, 0)
             seen[key] = rep + 1
-            out.append(("raise", num / den + EPS * (1 + rep)))
+            f = num / den + EPS * (1 + rep)
+            out.append(("raise", f, a[2]) if len(a) == 3 else ("raise", f))
         streets.append(out)
     return pe.ActionAbstraction(streets, spec.max_raises)
 
@@ -233,7 +253,8 @@ def from_rust(abstraction: Any) -> ActionSpec:
         out = []
         for a in st:
             if a[0] == "raise":
-                out.append(("raise", _milli(a[1]) / 1000))
+                f = _milli(a[1]) / 1000
+                out.append(("raise", f, a[2]) if len(a) == 3 else ("raise", f))
             else:
                 out.append((a[0],))
         lists.append(out)

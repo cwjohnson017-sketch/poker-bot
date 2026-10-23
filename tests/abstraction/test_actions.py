@@ -39,6 +39,54 @@ ODD = as_spec(
     * 4,
     max_raises=3,
 )
+# Rich opening sizes, one re-raise size: conditions on sized raises.
+OPEN_RERAISE = as_spec(
+    {
+        "preflop": [
+            "fold",
+            "call",
+            ["raise_x", 2.0, "open"],
+            ["raise_x", 2.5, "open"],
+            ["raise_x", 3.0, "open"],
+            ["raise", 1.0, "reraise"],
+            "allin",
+        ],
+        "flop": [
+            "fold",
+            "call",
+            ["raise", 0.25, "open"],
+            ["raise", 0.33, "open"],
+            ["raise", 0.5, "open"],
+            ["raise", 0.75, "open"],
+            ["raise", 1.0, "open"],
+            ["raise", 1.5, "open"],
+            ["raise", 1.0, "reraise"],
+            "allin",
+        ],
+        "turn": [
+            "fold",
+            "call",
+            ["raise", 0.33, "open"],
+            ["raise", 0.66, "open"],
+            ["raise", 1.0, "open"],
+            ["raise", 2.0, "open"],
+            ["raise", 0.8, "reraise"],
+            "allin",
+        ],
+        "river": [
+            "fold",
+            "call",
+            ["raise", 0.25, "open"],
+            ["raise", 0.5, "open"],
+            ["raise", 1.0, "open"],
+            ["raise", 2.0, "open"],
+            ["raise", 1.0, "reraise"],
+            ["raise", 2.5, "reraise"],
+            "allin",
+        ],
+        "max_raises": 3,
+    }
+)
 
 
 def random_states(n: int, seed: int, blinds: bool = True, with_actions: bool = False):
@@ -69,8 +117,8 @@ def random_states(n: int, seed: int, blinds: bool = True, with_actions: bool = F
 
 @pytest.mark.parametrize(
     ("spec", "seed"),
-    [(DEFAULT_SPEC, 1), (MCCFR_SMALL, 2), (ODD, 3)],
-    ids=["default", "small", "odd"],
+    [(DEFAULT_SPEC, 1), (MCCFR_SMALL, 2), (ODD, 3), (OPEN_RERAISE, 4)],
+    ids=["default", "small", "odd", "open_reraise"],
 )
 def test_python_and_rust_give_same_legal_sets_and_amounts(spec, seed):
     states = random_states(400, seed=seed)
@@ -203,7 +251,9 @@ def _reference_state(cfg, deck, button, history):
     return s
 
 
-@pytest.mark.parametrize("spec", [DEFAULT_SPEC, ODD], ids=["default", "odd"])
+@pytest.mark.parametrize(
+    "spec", [DEFAULT_SPEC, ODD, OPEN_RERAISE], ids=["default", "odd", "open_reraise"]
+)
 def test_python_mirror_matches_rust_translate(spec):
     rng = np.random.default_rng(5)
     rust = to_rust(spec)
@@ -228,3 +278,47 @@ def test_python_mirror_matches_rust_translate(spec):
         if kind == CHECK_CALL:
             assert spec.streets[s.street][got] == ("check_call",)
     assert checked_ref >= 30
+
+
+@pytest.mark.parametrize(
+    ("spec", "seed"),
+    [(DEFAULT_SPEC, 21), (ODD, 22), (OPEN_RERAISE, 23)],
+    ids=["default", "odd", "open_reraise"],
+)
+def test_scalar_mirrors_match_the_tensor_legal_sets(spec, seed):
+    """agents.policy.abstract_actions and the Deep CFR scalar mirror give the
+    same legal sets and amounts as the tensor legal_mask."""
+    from pokerbot.agents.policy import abstract_actions
+    from pokerbot.blueprint.deepcfr import scalar
+
+    sp = scalar.ScalarSpec.build(spec)
+    # blinds both posted in full: abstract_actions treats a big blind that could
+    # not cover the blind differently (a pre-existing edge case, not tested here)
+    states = [
+        s for s in random_states(800, seed=seed) if min(s.config.stacks) > s.config.big_blind
+    ][:400]
+    for s, want in zip(states, legal_actions_batch(spec, states), strict=True):
+        got = [(c.index, c.kind, c.amount) for c in abstract_actions(s, spec)]
+        assert got == want, (s.street, s.street_bets, s.history)
+        info = scalar.decision_info(s, sp, s.num_raises_this_street)
+        legal = [i for i, ok in enumerate(info.legal) if ok]
+        assert legal == [i for i, _, _ in want]
+        assert [info.targets[i] for i, k, _ in want if k == RAISE] == [
+            a for _, k, a in want if k == RAISE
+        ]
+
+
+def test_open_and_reraise_conditions_split_the_sizes():
+    """First raise of a street: only the open sizes; facing a raise: only the
+    re-raise sizes (fold, call and all-in unconditioned)."""
+    states = random_states(600, seed=31)
+    seen = {0: False, 1: False}
+    for s, legal in zip(states, legal_actions_batch(OPEN_RERAISE, states), strict=True):
+        acts = OPEN_RERAISE.streets[s.street]
+        first = s.num_raises_this_street == 0
+        for i, kind, _ in legal:
+            if kind == RAISE and len(acts[i]) == 3:
+                assert acts[i][2] == ("open" if first else "reraise")
+                seen[int(not first)] = True
+    assert seen == {0: True, 1: True}
+    assert from_rust(to_rust(OPEN_RERAISE)).streets[1][8] == ("raise", 1.0, "reraise")

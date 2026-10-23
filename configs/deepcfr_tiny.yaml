@@ -43,10 +43,15 @@ traversal:
   max_steps: 64
   record_strategy: false
   infer_chunk: 4096
+  allin_equity: true
+  chance_cv: 1.0
+  preflop_equity_samples: 128
 
 memory:
   capacity: 20000
   save_every: 1
+  holdout: 0.1
+  holdout_capacity: 5000
 
 training:
   sgd_steps: 30
@@ -57,11 +62,15 @@ training:
   bf16: true               # ignored on the CPU
   prefetch: 0
   checkpoint_dtype: float32
+  fallback: argmax
 
 eval:
   every: 2
   deals: 10
   last_n: 4
+  seed: 0
+  sample_net: true
+  luck_adjust: true
   engine: auto
   equity:
     samples: 50

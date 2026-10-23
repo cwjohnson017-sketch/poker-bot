@@ -1,0 +1,14 @@
+# Production search (configs/search_value_net.yaml) with a fixed number of DCFR iterations
+# per street, for runs on GPUs other than the RTX 4070 Ti (cloud/aws/README.md). The time
+# budgets are only a safety net here: the caps decide, so the bot plays the same strength on
+# any GPU, just faster or slower. The caps are production's mean iterations per street on
+# the 4070 Ti within its 4 / 2 / 1 s budgets over the Round 4 head to head (13,151 flop,
+# 6,065 turn and 5,307 river decisions; docs/value_net_eval.md). scripts/calibrate_search.py
+# on 24 hands against always_call (2026-10-22) agrees: 65.6 / 283 / 999.5 iterations
+# budgeted, 6.5 s per hand; these caps take 7.0 s per hand there.
+#   --search-config configs/search_value_net_fixed.yaml
+base: configs/search_value_net.yaml
+
+search:
+  street_iterations: {flop: 68, turn: 278, river: 842}
+  time_budget: {flop: 120.0, turn: 120.0, river: 120.0}

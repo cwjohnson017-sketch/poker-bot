@@ -25,14 +25,24 @@ import torch
 from ...env.vec_env import VecNLHE
 from .features import features_from_obs, index_features
 from .policy import SDCFRPolicy
+from .strength import add_strength, load_strength
 
 
 def _on_device(pol: SDCFRPolicy, device: torch.device) -> SDCFRPolicy:
     if pol.device == device:
         return pol
     nets = [(t, copy.deepcopy(net)) for t, net in zip(pol.iterations, pol.nets, strict=True)]
+    preflop = None
+    if pol.preflop_tree is not None and pol.preflop_tables is not None:
+        tables = dict(zip(pol.iterations, pol.preflop_tables, strict=True))
+        preflop = (pol.preflop_tree, tables)
     return SDCFRPolicy(
-        nets, reach_weighted=pol.reach_weighted, fallback=pol.fallback, device=device
+        nets,
+        reach_weighted=pol.reach_weighted,
+        fallback=pol.fallback,
+        policy_head=pol.policy_head,
+        device=device,
+        preflop=preflop,
     )
 
 
@@ -57,6 +67,8 @@ class NeuralVecPolicy:
         self._obs_gen = torch.Generator(device=self.device).manual_seed(int(seed) + 1)
         self._log_reach: list[torch.Tensor] | None = None
         self._sig: torch.Tensor | None = None
+        path = getattr(features, "strength_tables", None)
+        self.strength = load_strength(path) if path else None
 
     def reseed(self, seed: int) -> None:
         self.generator.manual_seed(int(seed))
@@ -93,7 +105,10 @@ class NeuralVecPolicy:
             idx = (live & (env.actor == seat)).nonzero().squeeze(1)
             if idx.numel() == 0:
                 continue
-            f = {k: v.to(self.device) for k, v in index_features(feats, idx).items()}
+            f = index_features(feats, idx)
+            if self.strength is not None:
+                f = add_strength(f, self.strength)
+            f = {k: v.to(self.device) for k, v in f.items()}
             lr = self._log_reach[seat][:, idx.to(self.device)] if pol.reach_weighted else None
             avg, P = pol.average(f, lr)
             avg = avg.float() * f["legal"].float()

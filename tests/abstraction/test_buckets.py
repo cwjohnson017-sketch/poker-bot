@@ -152,6 +152,7 @@ def test_sample_mode_fits_on_a_subset_and_assigns_all(tmp_path):
     assert int(r.labels.max()) < 5
     table = np.load(r.table_path, mmap_mode="r")
     assert np.array_equal(table[r.indices], r.labels)
+    del table  # Windows cannot replace a file that is still memory-mapped
     # A second run reuses the cached features and gives the same table.
     logs: list[str] = []
     r2 = build_street("flop", bc, log=logs.append)
