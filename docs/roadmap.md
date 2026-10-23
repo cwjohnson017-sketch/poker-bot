@@ -13,17 +13,21 @@ and production changes only when a measurement says so. Each goal gets a
 definition that can be measured, the work that leads to it, and a gate. What the
 strongest poker AIs did, and what this plan takes from each, is in section 3.
 
-**Status (2026-10-22):** Phase 1 in progress. The tools of 1.1-1.5 are built
+**Status (2026-10-23):** Phase 1 in progress. The tools of 1.1-1.5 are built
 and on `main`: the play app (evaluation mode; review mode not yet), AIVAT
 action terms, archetype opponents, LBR against the search, the soak harness
-and the preflop audit. Gate 1's production runs (archetypes, LBR and soak,
-about 385 GPU hours) have not run. Update this line as gates pass.
+and the preflop audit. Gate 1's production runs (archetypes, LBR and a
+20,000-hand soak) started on 2026-10-22 on spot GPUs and the local GPU
+(`cloud/aws/fleet.py`); a quarter had finished after 30 hours. The first
+results (section 2) show the search leaving weak players' money on the table,
+so a safe exploitation layer (1.6) joins Phase 1. Update this line as gates
+pass.
 
 ## 1. Summary
 
 | phase | goal | main work | gate, short | rough length |
 |---|---|---|---|---|
-| 1 | 1 | play app; AIVAT with the bot's action terms; archetype opponents; full-game LBR; soak test | beats every archetype; LBR under +1,000 everywhere; clean soak | 2-3 weeks |
+| 1 | 1 | play app; AIVAT with the bot's action terms; archetype opponents; full-game LBR; soak test; safe exploitation layer | beats every archetype, not significantly less than the blueprint does; LBR under +1,000 everywhere; clean soak | 4-6 weeks |
 | 2 | 2 | sessions against the author; the preflop leak; 200bb nets and preflop; Slumbot and GTO Wizard Benchmark clients | the author loses over a fixed AIVAT sample; first outside scores at 200bb | 4-8 weeks |
 | 3 | 3, depths | nets for 10-250bb; preflop tables per depth; push/fold | 20-200bb within 25% of 100bb's exploitability | 3-5 weeks |
 | 4 | 3, six-max | N-player plumbing; a Pluribus-style blueprint; heads-up pots through the existing search; three-way search | search beats blueprint-only tables; archetype tables and people lose | 3-5 months |
@@ -34,12 +38,15 @@ with spot instances for batch jobs. They are guesses: each gate can send work ba
 
 **The main points:**
 
-* **The bot has never played anything outside its own lineage:** no person, no
-  outside bot, no full-game best response. Phase 1 builds those yardsticks, and
-  every later gate uses them.
-* **Goal 1 is probably met already** at heads-up 100bb. The median online
-  player loses about 20 bb/100 before rake (3.5), and equilibrium-style bots
-  beat that kind of play by wide margins. Gate 1 confirms it or finds the bug.
+* **The bot has never played anything outside its own lineage:** no person and
+  no outside bot; a full-game local best response (LBR) first played it on
+  2026-10-22. Phase 1 builds those yardsticks, and every later gate uses them.
+* **Goal 1 takes exploitation, not only strength.** The median online player
+  loses about 20 bb/100 before rake (3.5), but equilibrium play does not
+  collect it all: in the first Gate 1 results the search breaks even against
+  a calling station that its own blueprint beats by 2.7 bb/hand, because it
+  plays every opponent as a sound one (section 2). Phase 1 adds a safe
+  exploitation layer (1.6).
 * **200bb comes early.** Both public bot benchmarks, Slumbot and the GTO
   Wizard Benchmark, play only 200bb. It is also the first step of goal 3.
 * **The closest published relative is Supremus:** DeepStack with a GPU DCFR+
@@ -76,9 +83,65 @@ every hand.
 * **Never measured:**
   * any human opponent;
   * any bot outside its own lineage;
-  * the full-game exploitability of the production bot. LBR and ABR only ever
-    ran against blueprints (dcfr3: +2,720 mbb/hand by ABR);
+  * the full-game exploitability of the production bot by ABR, which only ever
+    ran against blueprints (dcfr3: +2,720 mbb/hand). LBR against production
+    started on 2026-10-22 (below);
   * any stack depth but 100bb, any table but heads-up.
+
+**First Gate 1 results (2026-10-23, about a quarter of the runs).** Production
+(the preflop table, then the search with fixed iterations per street,
+`configs/search_value_net_fixed.yaml`, so the result does not depend on the
+GPU) and the blueprint play the same duplicate deals against each archetype.
+Luck-adjusted mbb/hand with 95% CIs, 5,000 hands each:
+
+| archetype | production | blueprint | production - blueprint |
+|---|---:|---:|---:|
+| calling station | -46 [-428, +323] | +2,662 [+2,130, +3,231] | -2,708 [-3,248, -2,142] |
+| maniac | +233 [-212, +707] | +1,073 [+573, +1,529] | -840 [-1,363, -282] |
+| overbet bluffer | +3 [-221, +246] | +500 [+183, +812] | -497 [-843, -158] |
+| nit | +431 [+334, +523] | +575 [+460, +685] | -144 [-261, -31] |
+| fit-or-fold | +492 [+326, +666] | +468 [+248, +697] | +24 [-205, +250] |
+| min-raiser | +211 [+27, +374] | +173 [+1, +333] | +38 [-158, +234] |
+| population | +204 [+75, +343] | +131 [-40, +285] | +73 [-105, +258] |
+| loose-passive | +37 [-199, +251] | -62 [-338, +214] | +99 [-205, +415] |
+| regular | +337 [+202, +478] | +211 [+24, +382] | +126 [-43, +318] |
+
+* **LBR** (250-500 hands per configuration so far) finds no exploit. LBR
+  loses in the four `call` and `fc` configurations (-916 to -3,082 mbb/hand)
+  and is near zero in the two `full` ones (+251 and -88). All six are under
+  Gate 1's +1,000 bar; four CIs still reach above it until their samples fill.
+* **Soak:** 16,000 of 20,000 hands, no crashes, illegal actions or fallbacks,
+  p99 decision time 5.5 s.
+* **Why production trails the blueprint** against three archetypes. A third
+  player, the preflop table followed by the blueprint with no search, replayed
+  1,000 of the same deals and splits each gap:
+
+  | archetype | gap | from the preflop table | from the search |
+  |---|---:|---:|---:|
+  | calling station | -2,557 | -218 (not significant) | -2,339 |
+  | maniac | -1,512 | -641 | -871 |
+  | overbet bluffer | -936 | -476 | -460 |
+
+  * The search plays every opponent as a sound one: the opponent's range comes
+    from the blueprint's own policy (`range_reach`) and its responses from the
+    subgame equilibrium. Against the calling station, which calls any size and
+    never bluffs, it puts about three times as many chips into river bluffs as
+    the blueprint does, and bets strong hands about 1x the pot where the
+    blueprint shoves about 3.5x. Nearly all of the gap is in hands that reach
+    the river.
+    Against the maniac, which bluffs 70% of its bets, it calls down and then
+    folds the river: strong hands fold 32% of the time facing a bet, against
+    the blueprint's 1%.
+  * The preflop table is closer to equilibrium than the blueprint. In the small
+    blind it folds 15% of hands (the blueprint none) and limps 10% (the
+    blueprint 37%); in the big blind it defends more. That costs against loose,
+    aggressive players. The split above plays the blueprint after the table,
+    whose ranges it was not trained for, so the table's share is approximate.
+  * The blueprint is not the stronger player: the search beats it head to head,
+    and LBR finds nothing in the search. Its leaks (huge value bets, rarely
+    folding, limping) are what these archetypes pay for. Matching it there
+    takes exploitation (1.6); Gate 1's regression check (section 4) fails
+    without it.
 
 **What the code supports today:**
 
@@ -95,9 +158,11 @@ every hand.
 | human play | a terminal prompt over the socket protocol (`serve_match.py` + `play_client.py --agent human`) | through plain matches | yes |
 
 **Hardware:** i9-13900K (24 cores, 32 threads), 64 GB RAM, RTX 4070 Ti (12 GB),
-about 520 GB free disk. AWS spot `g5.xlarge` (one A10G, about as fast as the
-4070 Ti here) at about $0.42-0.50/h. The GPU quota was 8 vCPUs in each of
-us-east-1 and us-east-2 on 2026-10-13: two `g5.xlarge` per region.
+about 520 GB free disk. AWS spot `g5.xlarge` (one A10G, about 1.2x slower than
+the 4070 Ti here at the same iterations) at about $0.48-0.55/h. The GPU spot
+quota is 32 vCPUs in each of us-east-1 and us-east-2 since 2026-10-22, eight
+`g5.xlarge` per region; spot capacity, not quota, held Gate 1's runs to one or
+two instances at a time.
 
 ## 3. What the strongest poker AIs teach
 
@@ -313,7 +378,10 @@ for that player, no gross hole, and a bot that runs cleanly.
 
 1. **Archetypes:** beats each one over 20,000 duplicate hands with the CI above
    zero, and not by significantly less than the blueprint does against the same
-   archetype (a regression check).
+   archetype (a regression check). The blueprint's margins come partly from its
+   own leaks, so this takes the exploitation layer (1.6). The layer counts only
+   if item 2 holds with it on and its margins against `regular` and
+   `population` do not drop.
 2. **LBR:** under +1,000 mbb/hand in every configuration. ACPC-era bots gave
    LBR 3,300-4,700.
 3. **Soak:** 100,000 hands with 0 crashes and 0 illegal actions, fallbacks under
@@ -382,10 +450,11 @@ for that player, no gross hole, and a bot that runs cleanly.
 
 ## 5. Phase 1: yardsticks outside the lineage (goal 1)
 
-**Why first.** Every number so far compares the bot with itself or its
-blueprint. Goal 1 is about people, and goals 2-4 need the same yardsticks, so
-they come first. The bot is probably above an average player at heads-up 100bb
-already. This phase should confirm that, or find the bug that says otherwise.
+**Why first.** Every number before this phase compared the bot with itself or
+its blueprint. Goal 1 is about people, and goals 2-4 need the same yardsticks,
+so they come first. The first results (section 2) found no bug but a gap: the
+search plays sound poker and does not exploit weak play, so this phase also
+builds a safe exploitation layer (1.6).
 
 **1.1 A play app.** A local web table (a stdlib HTTP server with long polling,
 plain HTML and JavaScript), with the production `SearchAgent` on the GPU. Built
@@ -455,6 +524,29 @@ archetype, next to the blueprint's margin against the same archetype.
   bot's defence against each size. The search rebuilds both ranges from the
   preflop table through translation (`range_reach`), so odd preflop lines are
   the likely weak point.
+
+**1.6 A safe exploitation layer** (moved here from 5.1 on 2026-10-23). The
+first results show what equilibrium play leaves against weak players (section
+2), and Gate 1's regression check needs it back. Behind a flag:
+
+* **Opponent statistics** per session: fold to a bet by street and size, bet
+  and raise frequencies, the bluffs shown down, and preflop limps, opens and
+  3-bets. Shrink them toward equilibrium frequencies, so the bot moves away
+  from equilibrium only as the evidence grows.
+* **A modeled opponent in the search.** Fix the opponent's decision nodes in
+  each subgame to the model, or mix the model with the free equilibrium
+  response (restricted Nash response) to bound the worst case.
+  `RangeSolver(locked=...)` already fixes any node, the opponent's included.
+  Make the model depend on the cards where the statistics allow: a station
+  folds the bottom of its range, not a random part of it. The safe-resolving
+  gadget lets the opponent's weak hands drop out of a subgame, which would undo
+  the model, so it gives way while the layer exploits.
+* **Preflop:** the same statistics adjust the table against limp-heavy and
+  raise-heavy opponents.
+* **Measured on:** the archetypes, where section 2's gaps should close;
+  `regular` and `population`, with no significant loss; LBR with the layer on,
+  where Gate 1's bar must still hold; and a wrong model, such as a station
+  model against the regular profile, to price a misread opponent.
 
 **Gate 1:** see section 4.
 
@@ -651,10 +743,12 @@ size:
 * **A self-improver:** log the sizes opponents use most and add them to the
   trees and the preflop abstraction (Libratus did this between sessions of its
   2017 match).
-* **Exploitation, last and optional:** a safe exploitation layer that deviates
-  from equilibrium against weak opponents with a bounded worst case. Pros earn
-  most of their money from weak players, and an equilibrium bot leaves that
-  money on the table. Keep it behind a flag and measure its exploitability.
+* **Exploitation beyond 1.6:** opponent models that carry across sessions and
+  learn from hand histories, exploitation in multiway pots, and what the layer
+  wins against what it gives away, measured at each level of evidence. Pros
+  earn most of their money from weak players. This was the last and optional
+  item here until the first archetype results (2026-10-23) showed Gate 1 needs
+  a first version (1.6).
 
 **5.2 Six-max strength:** a larger blueprint (cloud), finer abstraction where
 it pays (preflop sizes by position), more search iterations in multiway pots,
@@ -726,9 +820,9 @@ a person or by LBR, and the spot suites run on every production change.
 * `r7i.16xlarge` cost about $1.0-1.3/h on spot in July 2026 ($4.23 on demand),
   with a 15-20% interruption rate. The blueprint run must checkpoint and
   resume.
-* The account's spot quota covers 8 vCPUs of GPU instances. The six-max run
-  needs a standard-instance spot quota of 64 vCPUs: request it a few weeks
-  ahead.
+* The account's GPU spot quota is 32 vCPUs in each of us-east-1 and us-east-2
+  (2026-10-22). The six-max run needs a standard-instance spot quota of 64
+  vCPUs: request it a few weeks ahead.
 * Check prices again before each large run.
 
 ## 12. Where the bot may play
@@ -765,6 +859,7 @@ not agree to play one.
 |---|---|---|
 | Human samples too small to conclude anything | Gates 2-4 | AIVAT with action terms first (1.2); fixed samples; several short sessions; more players |
 | People find off-tree lines the bot handles badly | Phases 1-2, 5 | the translation audit (1.5), nested re-solving (2.2, 5.1), every found line in the regression suite |
+| The exploitation layer gets exploited: an opponent plays like a station to draw it out, then changes | Phases 1-2, 5 | statistics shrunk toward equilibrium and weighted to recent hands; a bounded worst case (restricted Nash response); LBR and the regular profile with the layer on (1.6) |
 | Slumbot's API changes or closes | Gate 2 stretch, Gate 4 | the archetypes, LBR and people still stand; ACPC logs in the PHH dataset can train imitation opponents of old ACPC bots |
 | One GPU for the play app, data generation and evaluation | all | batch jobs on spot GPUs; the play app gets the local GPU while someone plays |
 | A six-max blueprint does not fit 64 GB | Phase 4 | a coarse local run first; the average strategy kept for preflop only; a high-memory cloud instance for the full run |
@@ -775,16 +870,20 @@ not agree to play one.
 
 ## 14. The next two weeks
 
-1. **Play app, evaluation mode, with full logging** (1.1). This unblocks
-   everything with a person in it.
-2. **AIVAT action terms** (1.2), validated on archetype matches; measure the
-   per-hand standard deviation the human samples will have.
-3. **Archetypes** (1.3) and the **soak test** (1.5), the soak on spot GPUs.
-4. **LBR against the search** (1.4): the `PolicyAgent` adapter, then an
-   overnight run per configuration.
-5. **A first session against the author**, 300-500 hands, to shake out the app.
+Updated 2026-10-23. The tools of 1.1-1.5 are built (see the status line).
+
+1. **Finish Gate 1's runs:** the archetypes, LBR and a 20,000-hand soak, on
+   spot GPUs and the local GPU. About 3-4 more days at the spot capacity of
+   2026-10-23.
+2. **The exploitation layer** (1.6): a prototype against the calling station
+   and the maniac first, then the archetype suite and LBR with it on.
+3. **The preflop table against loose, aggressive players:** the table against
+   the blueprint's preflop, both followed by the search, on the maniac and the
+   overbet bluffer. Section 2's split put the blueprint after the table, which
+   was not trained for the table's ranges.
+4. **A first session against the author**, 300-500 hands, to shake out the app.
    Reported, not gated.
-6. **In parallel on spot instances:** start the 200bb river data (2.3).
+5. **In parallel on spot instances:** start the 200bb river data (2.3).
 
 **Decisions for the author along the way:**
 
